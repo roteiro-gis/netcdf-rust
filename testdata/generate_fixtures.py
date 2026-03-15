@@ -141,6 +141,49 @@ def generate_hdf5_fixtures(base_dir):
         data = np.eye(4, dtype=np.float32)
         f.create_dataset("checked", data=data, fletcher32=True)
 
+    # ---- 13. dense_groups.h5 ----
+    # Tests: dense link storage (fractal heap + B-tree v2), triggered by 20+ children.
+    path = os.path.join(hdf5_dir, "dense_groups.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        for i in range(25):
+            f.create_dataset(f"ds_{i:03d}", data=np.array([i], dtype=np.int32))
+
+    # ---- 14. vlen_strings.h5 ----
+    # Tests: variable-length string attributes and datasets.
+    path = os.path.join(hdf5_dir, "vlen_strings.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        dt = h5py.string_dtype()
+        ds = f.create_dataset("labels", data=np.array(["alpha", "beta", "gamma"], dtype=object), dtype=dt)
+        ds.attrs.create("title", "vlen test", dtype=dt)
+
+    # ---- 15. v4_layout.h5 ----
+    # Tests: v4 data layout (libver='latest' forces new-style object headers and chunk indexing).
+    path = os.path.join(hdf5_dir, "v4_layout.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(100, dtype=np.float32).reshape(10, 10)
+        f.create_dataset("data", data=data, chunks=(5, 5), compression="gzip")
+
+    # ---- 16. single_chunk.h5 ----
+    # Tests: single-chunk layout (entire dataset is one chunk).
+    path = os.path.join(hdf5_dir, "single_chunk.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        data = np.arange(20, dtype=np.float64).reshape(4, 5)
+        f.create_dataset("data", data=data, chunks=(4, 5))
+
+    # ---- 17. committed_dtype.h5 ----
+    # Tests: committed (shared) datatype — a named datatype that is shared across datasets.
+    path = os.path.join(hdf5_dir, "committed_dtype.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        dt = np.dtype(np.float64)
+        f["my_type"] = dt  # commit the type
+        # Reference the committed type
+        ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
+
 
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
