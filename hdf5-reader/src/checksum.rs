@@ -115,14 +115,15 @@ fn final_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
 }
 
 /// Fletcher-32 checksum used by the HDF5 filter pipeline.
-/// Operates on 16-bit words (little-endian). Pads with zero if odd number of bytes.
+/// Operates on 16-bit big-endian words per the HDF5 specification.
+/// Pads with zero if odd number of bytes.
 pub fn fletcher32(data: &[u8]) -> u32 {
     let mut sum1: u32 = 0;
     let mut sum2: u32 = 0;
 
     let mut i = 0;
     while i + 1 < data.len() {
-        let word = u16::from_le_bytes([data[i], data[i + 1]]) as u32;
+        let word = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
         sum1 = (sum1 + word) % 65535;
         sum2 = (sum2 + sum1) % 65535;
         i += 2;
@@ -167,5 +168,28 @@ mod tests {
         let checksum = fletcher32(&data);
         // Verify it's deterministic
         assert_eq!(checksum, fletcher32(&data));
+    }
+
+    #[test]
+    fn test_fletcher32_known_reference() {
+        // Known reference: 4 bytes [0x00, 0x01, 0x00, 0x02] interpreted as
+        // big-endian u16 words: 0x0001 and 0x0002.
+        // sum1 = (0 + 1) % 65535 = 1; sum2 = (0 + 1) % 65535 = 1
+        // sum1 = (1 + 2) % 65535 = 3; sum2 = (1 + 3) % 65535 = 4
+        // result = (4 << 16) | 3 = 0x0004_0003
+        let data = [0x00, 0x01, 0x00, 0x02];
+        assert_eq!(fletcher32(&data), 0x0004_0003);
+    }
+
+    #[test]
+    fn test_fletcher32_roundtrip_with_filter() {
+        // Build a payload + checksum and verify the filter can strip it
+        let payload = vec![0x00u8, 0x80, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00];
+        let ck = fletcher32(&payload);
+        let mut data = payload.clone();
+        data.extend_from_slice(&ck.to_be_bytes());
+        // The filter stores checksum in big-endian
+        let stripped = crate::filters::fletcher32::verify_and_strip(&data).unwrap();
+        assert_eq!(stripped, payload);
     }
 }
