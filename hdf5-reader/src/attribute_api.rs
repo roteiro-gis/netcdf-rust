@@ -1,4 +1,6 @@
 use crate::error::{Error, Result};
+use crate::global_heap::GlobalHeapCollection;
+use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::DataspaceType;
 use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringSize};
@@ -63,6 +65,9 @@ impl Attribute {
     }
 
     /// Read the attribute as a string (for string-typed attributes).
+    ///
+    /// For variable-length strings, use `read_vlen_string()` with the file data
+    /// and offset_size — this method will return an error directing you there.
     pub fn read_string(&self) -> Result<String> {
         match &self.datatype {
             Datatype::String {
@@ -81,11 +86,91 @@ impl Attribute {
                 }
                 StringSize::Variable => {
                     // For inline vlen strings in attributes, try direct decode.
+                    // If it looks like a global heap reference (>= 12 bytes for
+                    // seq_len + addr + index), suggest read_vlen_string instead.
+                    if self.raw_data.len() >= 12 {
+                        // Try to decode directly first — some files inline the string
+                        let trimmed = match padding {
+                            StringPadding::NullTerminate => {
+                                let end = self.raw_data.iter().position(|&b| b == 0).unwrap_or(self.raw_data.len());
+                                &self.raw_data[..end]
+                            }
+                            _ => &self.raw_data,
+                        };
+                        if let Ok(s) = String::from_utf8(trimmed.to_vec()) {
+                            if s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
+                                return Ok(s);
+                            }
+                        }
+                    }
                     decode_string(&self.raw_data, *padding, *encoding)
                 }
             },
             _ => Err(Error::TypeMismatch {
                 expected: "String".into(),
+                actual: format!("{:?}", self.datatype),
+            }),
+        }
+    }
+
+    /// Read a variable-length string attribute from the global heap.
+    ///
+    /// Variable-length strings in HDF5 are stored as references into a global
+    /// heap collection. Each reference is: `seq_len(u32) + heap_addr(offset_size) + index(u32)`.
+    pub fn read_vlen_string(&self, file_data: &[u8], offset_size: u8) -> Result<String> {
+        match &self.datatype {
+            Datatype::String {
+                size: StringSize::Variable,
+                encoding,
+                padding,
+            } => {
+                let ref_size = 4 + offset_size as usize + 4; // seq_len + addr + index
+                if self.raw_data.len() < ref_size {
+                    // Fallback: try direct decode
+                    return decode_string(&self.raw_data, *padding, *encoding);
+                }
+                let bytes = read_one_vlen_string(&self.raw_data, 0, file_data, offset_size, *padding, *encoding)?;
+                Ok(bytes)
+            }
+            Datatype::String {
+                size: StringSize::Fixed(_),
+                ..
+            } => self.read_string(),
+            _ => Err(Error::TypeMismatch {
+                expected: "String".into(),
+                actual: format!("{:?}", self.datatype),
+            }),
+        }
+    }
+
+    /// Read an array of variable-length strings from the global heap.
+    pub fn read_vlen_strings(&self, file_data: &[u8], offset_size: u8) -> Result<Vec<String>> {
+        match &self.datatype {
+            Datatype::String {
+                size: StringSize::Variable,
+                encoding,
+                padding,
+            } => {
+                let ref_size = 4 + offset_size as usize + 4;
+                let n = self.num_elements() as usize;
+                let mut result = Vec::with_capacity(n);
+                for i in 0..n {
+                    let offset = i * ref_size;
+                    if offset + ref_size > self.raw_data.len() {
+                        break;
+                    }
+                    result.push(read_one_vlen_string(
+                        &self.raw_data, offset, file_data, offset_size, *padding, *encoding,
+                    )?);
+                }
+                Ok(result)
+            }
+            Datatype::String {
+                size: StringSize::Fixed(_),
+                ..
+            } => self.read_strings(),
+            _ => Err(Error::TypeMismatch {
+                expected: "String array".into(),
                 actual: format!("{:?}", self.datatype),
             }),
         }
@@ -166,6 +251,34 @@ impl Attribute {
                 actual: format!("{:?}", self.datatype),
             }),
         }
+    }
+}
+
+/// Read one variable-length string from a vlen reference in raw_data.
+fn read_one_vlen_string(
+    raw_data: &[u8],
+    offset: usize,
+    file_data: &[u8],
+    offset_size: u8,
+    padding: StringPadding,
+    encoding: StringEncoding,
+) -> Result<String> {
+    let mut cursor = Cursor::new(&raw_data[offset..]);
+    let _seq_len = cursor.read_u32_le()?;
+    let heap_addr = cursor.read_offset(offset_size)?;
+    let obj_index = cursor.read_u32_le()?;
+
+    if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
+        return Ok(String::new());
+    }
+
+    let mut heap_cursor = Cursor::new(file_data);
+    heap_cursor.set_position(heap_addr);
+    let collection = GlobalHeapCollection::parse(&mut heap_cursor, offset_size, offset_size)?;
+
+    match collection.get_object(obj_index as u16) {
+        Some(obj) => decode_string(&obj.data, padding, encoding),
+        None => Ok(String::new()),
     }
 }
 
