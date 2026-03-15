@@ -1,0 +1,31 @@
+[package]
+name = "hdf5-reader"
+description = "Pure-Rust, read-only HDF5 file decoder with no C dependencies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ndarray = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+lru = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+lz4 = ["dep:lz4_flex"]
+rayon = ["dep:rayon"]
+
+[dependencies.lz4_flex]
+version = "0.11"
+optional = true
+
+[dependencies.rayon]
+version = "1"
+optional = true

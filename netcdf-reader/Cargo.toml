@@ -1,0 +1,26 @@
+[package]
+name = "netcdf-reader"
+description = "Pure-Rust NetCDF-3 classic and NetCDF-4 (HDF5-backed) file reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ndarray = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+hdf5-reader = { path = "../hdf5-reader", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["netcdf4"]
+netcdf4 = ["dep:hdf5-reader"]
+cf = ["dep:chrono"]
+
+[dependencies.chrono]
+version = "0.4"
+optional = true
