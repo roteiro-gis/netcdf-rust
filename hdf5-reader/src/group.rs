@@ -1,13 +1,16 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use crate::attribute_api::Attribute;
 use crate::btree_v1;
+use crate::btree_v2;
 use crate::cache::ChunkCache;
 use crate::dataset::Dataset;
 use crate::error::{Error, Result};
+use crate::fractal_heap::FractalHeap;
 use crate::io::Cursor;
 use crate::local_heap::LocalHeap;
-use crate::messages::link::{LinkMessage, LinkTarget};
+use crate::messages::link::{self, LinkMessage, LinkTarget};
 use crate::messages::link_info::LinkInfoMessage;
 use crate::messages::symbol_table_msg::SymbolTableMessage;
 use crate::messages::HdfMessage;
@@ -22,8 +25,7 @@ pub struct Group<'f> {
     pub(crate) name: String,
     pub(crate) address: u64,
     pub(crate) chunk_cache: Arc<ChunkCache>,
-    /// Cached children: (name, object_header_address, is_group)
-    children: Option<Vec<ChildEntry>>,
+    pub(crate) header_cache: Arc<Mutex<HashMap<u64, Arc<ObjectHeader>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,7 @@ impl<'f> Group<'f> {
         offset_size: u8,
         length_size: u8,
         chunk_cache: Arc<ChunkCache>,
+        header_cache: Arc<Mutex<HashMap<u64, Arc<ObjectHeader>>>>,
     ) -> Self {
         Group {
             file_data,
@@ -49,13 +52,33 @@ impl<'f> Group<'f> {
             name,
             address,
             chunk_cache,
-            children: None,
+            header_cache,
         }
     }
 
     /// Group name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Parse (or retrieve from cache) the object header at the given address.
+    fn cached_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
+        {
+            let cache = self.header_cache.lock().unwrap();
+            if let Some(hdr) = cache.get(&addr) {
+                return Ok(Arc::clone(hdr));
+            }
+        }
+        let hdr = ObjectHeader::parse_at(
+            self.file_data,
+            addr,
+            self.offset_size,
+            self.length_size,
+        )?;
+        let arc = Arc::new(hdr);
+        let mut cache = self.header_cache.lock().unwrap();
+        cache.insert(addr, Arc::clone(&arc));
+        Ok(arc)
     }
 
     /// List all child groups.
@@ -71,6 +94,7 @@ impl<'f> Group<'f> {
                     self.offset_size,
                     self.length_size,
                     self.chunk_cache.clone(),
+                    self.header_cache.clone(),
                 ));
             }
         }
@@ -90,6 +114,7 @@ impl<'f> Group<'f> {
                         self.offset_size,
                         self.length_size,
                         self.chunk_cache.clone(),
+                        self.header_cache.clone(),
                     ));
                 } else {
                     return Err(Error::GroupNotFound(format!(
@@ -141,16 +166,11 @@ impl<'f> Group<'f> {
 
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
-        let header = ObjectHeader::parse_at(
-            self.file_data,
-            self.address,
-            self.offset_size,
-            self.length_size,
-        )?;
+        let header = self.cached_header(self.address)?;
         let mut attrs = Vec::new();
-        for msg in header.messages {
+        for msg in &header.messages {
             if let HdfMessage::Attribute(attr) = msg {
-                attrs.push(Attribute::from_message(attr));
+                attrs.push(Attribute::from_message(attr.clone()));
             }
         }
         Ok(attrs)
@@ -168,16 +188,7 @@ impl<'f> Group<'f> {
     /// Resolve children from the object header.
     /// Handles both old-style (symbol table) and new-style (link messages) groups.
     fn resolve_children(&self) -> Result<Vec<ChildEntry>> {
-        if let Some(ref children) = self.children {
-            return Ok(children.clone());
-        }
-
-        let header = ObjectHeader::parse_at(
-            self.file_data,
-            self.address,
-            self.offset_size,
-            self.length_size,
-        )?;
+        let header = self.cached_header(self.address)?;
 
         let mut children = Vec::new();
 
@@ -268,18 +279,69 @@ impl<'f> Group<'f> {
     }
 
     /// Resolve dense links from a fractal heap + B-tree v2.
-    /// This is the Phase 2 path — requires fractal heap implementation.
-    fn resolve_dense_links(&self, _link_info: &LinkInfoMessage) -> Result<Vec<ChildEntry>> {
-        // TODO: Phase 2 — implement fractal heap traversal for dense links
-        Ok(Vec::new())
+    fn resolve_dense_links(&self, link_info: &LinkInfoMessage) -> Result<Vec<ChildEntry>> {
+        // Parse the fractal heap at the link_info address.
+        let mut heap_cursor = Cursor::new(self.file_data);
+        heap_cursor.set_position(link_info.fractal_heap_address);
+        let heap = FractalHeap::parse(&mut heap_cursor, self.offset_size, self.length_size)?;
+
+        // Parse the B-tree v2 header at the name index address.
+        let mut btree_cursor = Cursor::new(self.file_data);
+        btree_cursor.set_position(link_info.btree_name_index_address);
+        let btree_header =
+            btree_v2::BTreeV2Header::parse(&mut btree_cursor, self.offset_size, self.length_size)?;
+
+        // Collect all records from the B-tree.
+        let records = btree_v2::collect_btree_v2_records(
+            self.file_data,
+            &btree_header,
+            self.offset_size,
+            self.length_size,
+            None,
+        )?;
+
+        let mut children = Vec::new();
+        for record in &records {
+            let heap_id = match record {
+                btree_v2::BTreeV2Record::LinkNameHash { heap_id, .. } => heap_id,
+                btree_v2::BTreeV2Record::CreationOrder { heap_id, .. } => heap_id,
+                _ => continue,
+            };
+
+            // Extract the link message bytes from the fractal heap.
+            let managed_bytes =
+                heap.get_managed_object(heap_id, self.file_data, self.offset_size, self.length_size)?;
+
+            // Parse the managed bytes as a link message.
+            let mut link_cursor = Cursor::new(&managed_bytes);
+            let link_msg = link::parse(
+                &mut link_cursor,
+                self.offset_size,
+                self.length_size,
+                managed_bytes.len(),
+            )?;
+
+            match &link_msg.target {
+                LinkTarget::Hard { address } => {
+                    children.push(ChildEntry {
+                        name: link_msg.name.clone(),
+                        address: *address,
+                    });
+                }
+                LinkTarget::Soft { .. } | LinkTarget::External { .. } => {
+                    // Skip soft and external links for now
+                }
+            }
+        }
+
+        Ok(children)
     }
 
     /// Check if the object at the given address is a group (vs a dataset).
     /// A group has either a symbol table message, link messages, or link info.
     /// A dataset has a dataspace + datatype + layout.
     fn is_group_at(&self, address: u64) -> Result<bool> {
-        let header =
-            ObjectHeader::parse_at(self.file_data, address, self.offset_size, self.length_size)?;
+        let header = self.cached_header(address)?;
         for msg in &header.messages {
             match msg {
                 // Group indicators
