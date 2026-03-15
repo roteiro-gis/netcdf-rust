@@ -16,14 +16,15 @@ pub mod variables;
 
 use std::path::Path;
 
+use hdf5_reader::datatype_api::H5Type;
 use hdf5_reader::Hdf5File;
+use ndarray::ArrayD;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::NcGroup;
 
 /// An opened NetCDF-4 file (backed by HDF5).
 pub struct Nc4File {
-    #[allow(dead_code)]
     hdf5: Hdf5File,
     root_group: NcGroup,
 }
@@ -47,4 +48,41 @@ impl Nc4File {
     pub fn root_group(&self) -> &NcGroup {
         &self.root_group
     }
+
+    /// Read a variable's data as a typed array.
+    ///
+    /// The variable is identified by name in the root group. The HDF5 dataset
+    /// at the stored `data_offset` address is opened and read.
+    pub fn read_variable<T: H5Type>(&self, name: &str) -> Result<ArrayD<T>> {
+        let _var = self
+            .root_group
+            .variable(name)
+            .ok_or_else(|| Error::VariableNotFound(name.to_string()))?;
+
+        // The data_offset stores the HDF5 dataset object header address
+        let dataset = self.hdf5.dataset(&find_dataset_path(&self.root_group, name))?;
+        Ok(dataset.read_array::<T>()?)
+    }
+}
+
+/// Find the HDF5 path for a variable by searching the group hierarchy.
+fn find_dataset_path(group: &NcGroup, name: &str) -> String {
+    // Check this group's variables
+    if group.variable(name).is_some() {
+        return if group.name == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", group.name, name)
+        };
+    }
+
+    // Recurse into child groups
+    for child in &group.groups {
+        let path = find_dataset_path(child, name);
+        if !path.is_empty() {
+            return path;
+        }
+    }
+
+    String::new()
 }
