@@ -56,9 +56,7 @@ pub fn extract_group_attributes(group: &Group<'_>) -> Result<Vec<NcAttribute>> {
 
 /// Extract user-visible attributes from an HDF5 dataset, filtering out
 /// internal attributes.
-pub fn extract_variable_attributes(
-    dataset: &hdf5_reader::Dataset<'_>,
-) -> Result<Vec<NcAttribute>> {
+pub fn extract_variable_attributes(dataset: &hdf5_reader::Dataset<'_>) -> Result<Vec<NcAttribute>> {
     let hdf5_attrs = dataset.attributes();
     let mut nc_attrs = Vec::new();
     for attr in &hdf5_attrs {
@@ -84,9 +82,7 @@ fn convert_attribute(attr: &hdf5_reader::Attribute) -> Option<NcAttribute> {
 /// Convert an HDF5 attribute's value to an NcAttrValue.
 fn convert_attribute_value(attr: &hdf5_reader::Attribute) -> Option<NcAttrValue> {
     match &attr.datatype {
-        Datatype::FixedPoint {
-            size, signed, ..
-        } => match (size, signed) {
+        Datatype::FixedPoint { size, signed, .. } => match (size, signed) {
             (1, true) => attr.read_1d::<i8>().ok().map(NcAttrValue::Bytes),
             (1, false) => attr.read_1d::<u8>().ok().map(NcAttrValue::UBytes),
             (2, true) => attr.read_1d::<i16>().ok().map(NcAttrValue::Shorts),
@@ -105,13 +101,9 @@ fn convert_attribute_value(attr: &hdf5_reader::Attribute) -> Option<NcAttrValue>
         Datatype::String { .. } => {
             // Try reading as a single string first, then as array
             if attr.num_elements() == 1 {
-                attr.read_string()
-                    .ok()
-                    .map(NcAttrValue::Chars)
+                attr.read_string().ok().map(NcAttrValue::Chars)
             } else {
-                attr.read_strings()
-                    .ok()
-                    .map(NcAttrValue::Strings)
+                attr.read_strings().ok().map(NcAttrValue::Strings)
             }
         }
         _ => None,

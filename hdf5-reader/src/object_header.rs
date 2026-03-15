@@ -69,12 +69,7 @@ impl ObjectHeader {
     ///
     /// For `SharedInOhdr`, the referenced object header is parsed and the first
     /// matching message type is extracted. `SharedInSohm` returns an error (rare).
-    pub fn resolve_shared_messages(
-        &mut self,
-        data: &[u8],
-        offset_size: u8,
-        length_size: u8,
-    ) {
+    pub fn resolve_shared_messages(&mut self, data: &[u8], offset_size: u8, length_size: u8) {
         let mut resolved = Vec::with_capacity(self.messages.len());
         for msg in self.messages.drain(..) {
             match msg {
@@ -98,9 +93,8 @@ impl ObjectHeader {
                         }
                         Err(_) => {
                             // If we can't parse the target, keep the shared ref
-                            resolved.push(HdfMessage::Shared(SharedMessage::SharedInOhdr {
-                                address,
-                            }));
+                            resolved
+                                .push(HdfMessage::Shared(SharedMessage::SharedInOhdr { address }));
                         }
                     }
                 }

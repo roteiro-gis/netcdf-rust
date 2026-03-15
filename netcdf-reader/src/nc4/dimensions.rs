@@ -62,9 +62,9 @@ pub fn extract_dimensions(group: &Group<'_>) -> Result<Vec<NcDimension>> {
         let size = if shape.is_empty() { 0 } else { shape[0] };
 
         // Check max dims for unlimited
-        let is_unlimited = ds.max_dims().is_some_and(|md| {
-            !md.is_empty() && md[0] == u64::MAX
-        });
+        let is_unlimited = ds
+            .max_dims()
+            .is_some_and(|md| !md.is_empty() && md[0] == u64::MAX);
 
         // Get stable ordering from _Netcdf4Dimid
         let dimid = ds

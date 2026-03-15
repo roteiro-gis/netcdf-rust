@@ -34,7 +34,10 @@ impl FilterRegistry {
         let mut registry = FilterRegistry {
             filters: HashMap::new(),
         };
-        registry.register(FILTER_DEFLATE, Box::new(|data, _| deflate::decompress(data)));
+        registry.register(
+            FILTER_DEFLATE,
+            Box::new(|data, _| deflate::decompress(data)),
+        );
         registry.register(
             FILTER_SHUFFLE,
             Box::new(|data, elem_size| Ok(shuffle::unshuffle(data, elem_size))),
@@ -80,22 +83,41 @@ pub fn apply_pipeline(
     filter_mask: u32,
     element_size: usize,
 ) -> Result<Vec<u8>> {
+    apply_pipeline_with_registry(data, filters, filter_mask, element_size, None)
+}
+
+/// Apply the filter pipeline using an optional custom registry.
+///
+/// If `registry` is `None`, the built-in filter set is used.
+pub fn apply_pipeline_with_registry(
+    data: &[u8],
+    filters: &[FilterDescription],
+    filter_mask: u32,
+    element_size: usize,
+    registry: Option<&FilterRegistry>,
+) -> Result<Vec<u8>> {
     let mut buf = data.to_vec();
 
-    // Apply filters in reverse order
     for (i, filter) in filters.iter().enumerate().rev() {
-        // Check if this filter is masked out
         if filter_mask & (1 << i) != 0 {
             continue;
         }
 
-        buf = apply_filter(filter, &buf, element_size)?;
+        buf = if let Some(reg) = registry {
+            reg.apply(filter.id, &buf, element_size)?
+        } else {
+            apply_builtin_filter(filter, &buf, element_size)?
+        };
     }
 
     Ok(buf)
 }
 
-fn apply_filter(filter: &FilterDescription, data: &[u8], element_size: usize) -> Result<Vec<u8>> {
+fn apply_builtin_filter(
+    filter: &FilterDescription,
+    data: &[u8],
+    element_size: usize,
+) -> Result<Vec<u8>> {
     match filter.id {
         FILTER_DEFLATE => deflate::decompress(data),
         FILTER_SHUFFLE => Ok(shuffle::unshuffle(data, element_size)),

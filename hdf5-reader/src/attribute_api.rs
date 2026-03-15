@@ -92,13 +92,19 @@ impl Attribute {
                         // Try to decode directly first — some files inline the string
                         let trimmed = match padding {
                             StringPadding::NullTerminate => {
-                                let end = self.raw_data.iter().position(|&b| b == 0).unwrap_or(self.raw_data.len());
+                                let end = self
+                                    .raw_data
+                                    .iter()
+                                    .position(|&b| b == 0)
+                                    .unwrap_or(self.raw_data.len());
                                 &self.raw_data[..end]
                             }
                             _ => &self.raw_data,
                         };
                         if let Ok(s) = String::from_utf8(trimmed.to_vec()) {
-                            if s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
+                            if s.chars()
+                                .all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t')
+                            {
                                 return Ok(s);
                             }
                         }
@@ -129,7 +135,14 @@ impl Attribute {
                     // Fallback: try direct decode
                     return decode_string(&self.raw_data, *padding, *encoding);
                 }
-                let bytes = read_one_vlen_string(&self.raw_data, 0, file_data, offset_size, *padding, *encoding)?;
+                let bytes = read_one_vlen_string(
+                    &self.raw_data,
+                    0,
+                    file_data,
+                    offset_size,
+                    *padding,
+                    *encoding,
+                )?;
                 Ok(bytes)
             }
             Datatype::String {
@@ -160,7 +173,12 @@ impl Attribute {
                         break;
                     }
                     result.push(read_one_vlen_string(
-                        &self.raw_data, offset, file_data, offset_size, *padding, *encoding,
+                        &self.raw_data,
+                        offset,
+                        file_data,
+                        offset_size,
+                        *padding,
+                        *encoding,
                     )?);
                 }
                 Ok(result)
@@ -283,6 +301,9 @@ fn read_one_vlen_string(
 }
 
 /// Decode a byte slice into a String, handling padding and encoding.
+///
+/// HDF5 supports ASCII and UTF-8 string encodings. Both are valid UTF-8
+/// (ASCII is a strict subset), so we decode uniformly via `from_utf8`.
 fn decode_string(
     bytes: &[u8],
     padding: StringPadding,
@@ -303,7 +324,6 @@ fn decode_string(
         }
     };
 
-    // Both ASCII and UTF-8 are valid UTF-8 (ASCII is a subset)
     String::from_utf8(trimmed.to_vec())
         .map_err(|e| Error::InvalidData(format!("invalid string data: {e}")))
 }

@@ -39,6 +39,7 @@ use memmap2::Mmap;
 
 use cache::ChunkCache;
 use error::{Error, Result};
+use filters::FilterRegistry;
 use group::Group;
 use io::Cursor;
 use object_header::ObjectHeader;
@@ -60,6 +61,8 @@ pub struct OpenOptions {
     pub chunk_cache_bytes: usize,
     /// Maximum number of chunk cache slots. Default: 521.
     pub chunk_cache_slots: usize,
+    /// Custom filter registry. If `None`, the default built-in filters are used.
+    pub filter_registry: Option<FilterRegistry>,
 }
 
 impl Default for OpenOptions {
@@ -67,6 +70,7 @@ impl Default for OpenOptions {
         OpenOptions {
             chunk_cache_bytes: 64 * 1024 * 1024,
             chunk_cache_slots: 521,
+            filter_registry: None,
         }
     }
 }
@@ -87,6 +91,8 @@ pub struct Hdf5File {
     chunk_cache: Arc<ChunkCache>,
     /// Object header cache — avoids re-parsing the same header.
     header_cache: HeaderCache,
+    /// Filter registry for decompression — users can register custom filters.
+    filter_registry: Arc<FilterRegistry>,
 }
 
 enum FileData {
@@ -125,11 +131,14 @@ impl Hdf5File {
             options.chunk_cache_slots,
         ));
 
+        let registry = options.filter_registry.unwrap_or_default();
+
         Ok(Hdf5File {
             data: FileData::Mmap(mmap),
             superblock,
             chunk_cache: cache,
             header_cache: Arc::new(Mutex::new(HashMap::new())),
+            filter_registry: Arc::new(registry),
         })
     }
 
@@ -150,6 +159,7 @@ impl Hdf5File {
             superblock,
             chunk_cache: Arc::new(ChunkCache::default()),
             header_cache: Arc::new(Mutex::new(HashMap::new())),
+            filter_registry: Arc::new(FilterRegistry::default()),
         })
     }
 
@@ -194,6 +204,7 @@ impl Hdf5File {
             self.superblock.length_size,
             self.chunk_cache.clone(),
             self.header_cache.clone(),
+            self.filter_registry.clone(),
         ))
     }
 

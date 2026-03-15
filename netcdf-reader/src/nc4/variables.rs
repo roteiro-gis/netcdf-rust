@@ -16,10 +16,7 @@ use super::types::hdf5_to_nc_type;
 ///
 /// Datasets with `CLASS=DIMENSION_SCALE` are dimensions, not variables.
 /// All other datasets become NcVariables.
-pub fn extract_variables(
-    group: &Group<'_>,
-    dimensions: &[NcDimension],
-) -> Result<Vec<NcVariable>> {
+pub fn extract_variables(group: &Group<'_>, dimensions: &[NcDimension]) -> Result<Vec<NcVariable>> {
     let datasets = match group.datasets() {
         Ok(ds) => ds,
         Err(_) => return Ok(Vec::new()),
@@ -55,7 +52,11 @@ pub fn extract_variables(
         // Compute data size
         let shape = ds.shape();
         let elem_size = nc_type.size() as u64;
-        let total_elements: u64 = if shape.is_empty() { 1 } else { shape.iter().product() };
+        let total_elements: u64 = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product()
+        };
         let data_size = total_elements * elem_size;
 
         // Compute record size (size per element along the first dim)

@@ -7,7 +7,7 @@ use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
 use crate::error::{Error, Result};
-use crate::filters;
+use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
@@ -58,12 +58,12 @@ pub struct Dataset<'f> {
     pub(crate) data_address: u64,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: Datatype,
-    pub(crate) _datatype_size: u32,
     pub(crate) layout: DataLayout,
     pub(crate) fill_value: Option<FillValueMessage>,
     pub(crate) filters: Option<FilterPipelineMessage>,
     pub(crate) attributes: Vec<AttributeMessage>,
     pub(crate) chunk_cache: Arc<ChunkCache>,
+    pub(crate) filter_registry: Arc<FilterRegistry>,
 }
 
 impl<'f> Dataset<'f> {
@@ -75,12 +75,13 @@ impl<'f> Dataset<'f> {
         offset_size: u8,
         length_size: u8,
         chunk_cache: Arc<ChunkCache>,
+        filter_registry: Arc<FilterRegistry>,
     ) -> Result<Self> {
         let mut header = ObjectHeader::parse_at(file_data, address, offset_size, length_size)?;
         header.resolve_shared_messages(file_data, offset_size, length_size);
 
         let mut dataspace: Option<DataspaceMessage> = None;
-        let mut datatype: Option<(Datatype, u32)> = None;
+        let mut datatype: Option<Datatype> = None;
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
@@ -89,7 +90,7 @@ impl<'f> Dataset<'f> {
         for msg in header.messages {
             match msg {
                 HdfMessage::Dataspace(ds) => dataspace = Some(ds),
-                HdfMessage::Datatype(dt) => datatype = Some((dt.datatype, dt.size)),
+                HdfMessage::Datatype(dt) => datatype = Some(dt.datatype),
                 HdfMessage::DataLayout(dl) => layout = Some(dl.layout),
                 HdfMessage::FillValue(fv) => fill_value = Some(fv),
                 HdfMessage::FilterPipeline(fp) => filter_pipeline = Some(fp),
@@ -100,8 +101,7 @@ impl<'f> Dataset<'f> {
 
         let dataspace =
             dataspace.ok_or_else(|| Error::InvalidData("dataset missing dataspace".into()))?;
-        let (dt, dt_size) =
-            datatype.ok_or_else(|| Error::InvalidData("dataset missing datatype".into()))?;
+        let dt = datatype.ok_or_else(|| Error::InvalidData("dataset missing datatype".into()))?;
         let layout =
             layout.ok_or_else(|| Error::InvalidData("dataset missing data layout".into()))?;
 
@@ -113,12 +113,12 @@ impl<'f> Dataset<'f> {
             data_address: address,
             dataspace,
             datatype: dt,
-            _datatype_size: dt_size,
             layout,
             fill_value,
             filters: filter_pipeline,
             attributes,
             chunk_cache,
+            filter_registry,
         })
     }
 
@@ -230,15 +230,13 @@ impl<'f> Dataset<'f> {
                 dims,
                 element_size,
                 chunk_indexing,
-            } => {
-                self.read_chunked_slice::<T>(
-                    *address,
-                    dims,
-                    *element_size,
-                    chunk_indexing.as_ref(),
-                    selection,
-                )
-            }
+            } => self.read_chunked_slice::<T>(
+                *address,
+                dims,
+                *element_size,
+                chunk_indexing.as_ref(),
+                selection,
+            ),
         }
     }
 
@@ -314,12 +312,8 @@ impl<'f> Dataset<'f> {
                 filtered_size,
                 filters,
             }) => {
-                let entry = chunk_index::single_chunk_entry(
-                    index_address,
-                    *filtered_size,
-                    *filters,
-                    ndim,
-                );
+                let entry =
+                    chunk_index::single_chunk_entry(index_address, *filtered_size, *filters, ndim);
                 self.assemble_chunk(
                     &entry,
                     index_address,
@@ -465,7 +459,13 @@ impl<'f> Dataset<'f> {
             let raw = &self.file_data[addr..addr + size];
 
             let decoded = if let Some(ref pipeline) = self.filters {
-                filters::apply_pipeline(raw, &pipeline.filters, entry.filter_mask, elem_size)?
+                filters::apply_pipeline_with_registry(
+                    raw,
+                    &pipeline.filters,
+                    entry.filter_mask,
+                    elem_size,
+                    Some(&self.filter_registry),
+                )?
             } else {
                 raw.to_vec()
             };
@@ -473,11 +473,23 @@ impl<'f> Dataset<'f> {
             self.chunk_cache.insert(cache_key, decoded)
         };
 
-        copy_chunk_to_flat(&chunk_data, flat_data, &entry.offsets, chunk_shape, shape, elem_size);
+        copy_chunk_to_flat(
+            &chunk_data,
+            flat_data,
+            &entry.offsets,
+            chunk_shape,
+            shape,
+            elem_size,
+        );
         Ok(())
     }
 
-    /// Optimized chunked slice: only read chunks that overlap the selection.
+    /// Chunked slice: read the full array then apply the selection.
+    ///
+    /// A future optimization could compute which chunks overlap the selection
+    /// and skip reading non-overlapping ones, but in practice the chunk cache
+    /// makes repeated reads fast and the complexity of partial-chunk assembly
+    /// with arbitrary step/index selections is substantial.
     fn read_chunked_slice<T: H5Type>(
         &self,
         index_address: u64,
@@ -486,9 +498,8 @@ impl<'f> Dataset<'f> {
         chunk_indexing: Option<&ChunkIndexing>,
         selection: &SliceInfo,
     ) -> Result<ArrayD<T>> {
-        // For simplicity in the first pass: read the full array then slice.
-        // A full optimization would compute overlapping chunks and only read those.
-        let full = self.read_chunked::<T>(index_address, chunk_dims, element_size, chunk_indexing)?;
+        let full =
+            self.read_chunked::<T>(index_address, chunk_dims, element_size, chunk_indexing)?;
         slice_array(&full, selection, &self.dataspace.dims)
     }
 

@@ -3,8 +3,6 @@
 //! Each HDF5 group becomes an `NcGroup`. The root group is special: it may
 //! contain `_NCProperties` and other internal attributes that should be filtered.
 //! Sub-groups are traversed recursively.
-//!
-//! TODO: Phase 5 — Full recursive group traversal.
 
 use hdf5_reader::Hdf5File;
 

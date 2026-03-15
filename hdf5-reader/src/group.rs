@@ -7,6 +7,7 @@ use crate::btree_v2;
 use crate::cache::ChunkCache;
 use crate::dataset::Dataset;
 use crate::error::{Error, Result};
+use crate::filters::FilterRegistry;
 use crate::fractal_heap::FractalHeap;
 use crate::io::Cursor;
 use crate::local_heap::LocalHeap;
@@ -26,6 +27,7 @@ pub struct Group<'f> {
     pub(crate) address: u64,
     pub(crate) chunk_cache: Arc<ChunkCache>,
     pub(crate) header_cache: Arc<Mutex<HashMap<u64, Arc<ObjectHeader>>>>,
+    pub(crate) filter_registry: Arc<FilterRegistry>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,7 @@ struct ChildEntry {
 
 impl<'f> Group<'f> {
     /// Create a group from a known object header address.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         file_data: &'f [u8],
         address: u64,
@@ -44,6 +47,7 @@ impl<'f> Group<'f> {
         length_size: u8,
         chunk_cache: Arc<ChunkCache>,
         header_cache: Arc<Mutex<HashMap<u64, Arc<ObjectHeader>>>>,
+        filter_registry: Arc<FilterRegistry>,
     ) -> Self {
         Group {
             file_data,
@@ -53,6 +57,7 @@ impl<'f> Group<'f> {
             address,
             chunk_cache,
             header_cache,
+            filter_registry,
         }
     }
 
@@ -69,12 +74,7 @@ impl<'f> Group<'f> {
                 return Ok(Arc::clone(hdr));
             }
         }
-        let hdr = ObjectHeader::parse_at(
-            self.file_data,
-            addr,
-            self.offset_size,
-            self.length_size,
-        )?;
+        let hdr = ObjectHeader::parse_at(self.file_data, addr, self.offset_size, self.length_size)?;
         let arc = Arc::new(hdr);
         let mut cache = self.header_cache.lock().unwrap();
         cache.insert(addr, Arc::clone(&arc));
@@ -95,6 +95,7 @@ impl<'f> Group<'f> {
                     self.length_size,
                     self.chunk_cache.clone(),
                     self.header_cache.clone(),
+                    self.filter_registry.clone(),
                 ));
             }
         }
@@ -115,6 +116,7 @@ impl<'f> Group<'f> {
                         self.length_size,
                         self.chunk_cache.clone(),
                         self.header_cache.clone(),
+                        self.filter_registry.clone(),
                     ));
                 } else {
                     return Err(Error::GroupNotFound(format!(
@@ -140,6 +142,7 @@ impl<'f> Group<'f> {
                     self.offset_size,
                     self.length_size,
                     self.chunk_cache.clone(),
+                    self.filter_registry.clone(),
                 )?);
             }
         }
@@ -158,6 +161,7 @@ impl<'f> Group<'f> {
                     self.offset_size,
                     self.length_size,
                     self.chunk_cache.clone(),
+                    self.filter_registry.clone(),
                 );
             }
         }
@@ -309,8 +313,12 @@ impl<'f> Group<'f> {
             };
 
             // Extract the link message bytes from the fractal heap.
-            let managed_bytes =
-                heap.get_managed_object(heap_id, self.file_data, self.offset_size, self.length_size)?;
+            let managed_bytes = heap.get_managed_object(
+                heap_id,
+                self.file_data,
+                self.offset_size,
+                self.length_size,
+            )?;
 
             // Parse the managed bytes as a link message.
             let mut link_cursor = Cursor::new(&managed_bytes);

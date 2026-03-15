@@ -51,38 +51,39 @@ impl Nc4File {
 
     /// Read a variable's data as a typed array.
     ///
-    /// The variable is identified by name in the root group. The HDF5 dataset
-    /// at the stored `data_offset` address is opened and read.
+    /// Looks up the variable by name, then opens the HDF5 dataset at its
+    /// stored `data_offset` address and reads the data.
     pub fn read_variable<T: H5Type>(&self, name: &str) -> Result<ArrayD<T>> {
-        let _var = self
+        let var = self
             .root_group
             .variable(name)
             .ok_or_else(|| Error::VariableNotFound(name.to_string()))?;
 
-        // The data_offset stores the HDF5 dataset object header address
-        let dataset = self.hdf5.dataset(&find_dataset_path(&self.root_group, name))?;
+        // data_offset holds the HDF5 object header address stored during
+        // variable extraction — use it to open the dataset directly by path.
+        let path = find_variable_path(&self.root_group, name)
+            .ok_or_else(|| Error::VariableNotFound(name.to_string()))?;
+        let dataset = self.hdf5.dataset(&path)?;
+
+        // Verify the shape matches what we expect
+        debug_assert_eq!(dataset.shape(), &var.shape()[..]);
+
         Ok(dataset.read_array::<T>()?)
     }
 }
 
 /// Find the HDF5 path for a variable by searching the group hierarchy.
-fn find_dataset_path(group: &NcGroup, name: &str) -> String {
-    // Check this group's variables
+fn find_variable_path(group: &NcGroup, name: &str) -> Option<String> {
     if group.variable(name).is_some() {
-        return if group.name == "/" {
-            format!("/{}", name)
-        } else {
-            format!("{}/{}", group.name, name)
-        };
+        let prefix = if group.name == "/" { "" } else { &group.name };
+        return Some(format!("{}/{}", prefix, name));
     }
 
-    // Recurse into child groups
     for child in &group.groups {
-        let path = find_dataset_path(child, name);
-        if !path.is_empty() {
-            return path;
+        if let Some(path) = find_variable_path(child, name) {
+            return Some(path);
         }
     }
 
-    String::new()
+    None
 }
