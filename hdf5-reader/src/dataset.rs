@@ -4,6 +4,7 @@ use ndarray::{ArrayD, IxDyn};
 
 use crate::attribute_api::Attribute;
 use crate::cache::{ChunkCache, ChunkKey};
+use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
 use crate::error::{Error, Result};
 use crate::filters;
@@ -13,7 +14,7 @@ use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
 use crate::messages::datatype::Datatype;
 use crate::messages::fill_value::FillValueMessage;
 use crate::messages::filter_pipeline::FilterPipelineMessage;
-use crate::messages::layout::DataLayout;
+use crate::messages::layout::{ChunkIndexing, DataLayout};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
 
@@ -54,6 +55,7 @@ pub struct Dataset<'f> {
     offset_size: u8,
     length_size: u8,
     pub(crate) name: String,
+    pub(crate) data_address: u64,
     pub(crate) dataspace: DataspaceMessage,
     pub(crate) datatype: Datatype,
     pub(crate) _datatype_size: u32,
@@ -74,7 +76,8 @@ impl<'f> Dataset<'f> {
         length_size: u8,
         chunk_cache: Arc<ChunkCache>,
     ) -> Result<Self> {
-        let header = ObjectHeader::parse_at(file_data, address, offset_size, length_size)?;
+        let mut header = ObjectHeader::parse_at(file_data, address, offset_size, length_size)?;
+        header.resolve_shared_messages(file_data, offset_size, length_size);
 
         let mut dataspace: Option<DataspaceMessage> = None;
         let mut datatype: Option<(Datatype, u32)> = None;
@@ -107,6 +110,7 @@ impl<'f> Dataset<'f> {
             offset_size,
             length_size,
             name,
+            data_address: address,
             dataspace,
             datatype: dt,
             _datatype_size: dt_size,
@@ -123,6 +127,12 @@ impl<'f> Dataset<'f> {
         &self.name
     }
 
+    /// The object header address used to parse this dataset.
+    /// Useful as an opaque identifier or for NC4 data_offset.
+    pub fn address(&self) -> u64 {
+        self.data_address
+    }
+
     /// Shape of the dataset (dimensions).
     pub fn shape(&self) -> &[u64] {
         &self.dataspace.dims
@@ -136,6 +146,11 @@ impl<'f> Dataset<'f> {
     /// Number of dimensions.
     pub fn ndim(&self) -> usize {
         self.dataspace.dims.len()
+    }
+
+    /// Maximum dimension sizes, if defined. `u64::MAX` indicates unlimited.
+    pub fn max_dims(&self) -> Option<&[u64]> {
+        self.dataspace.max_dims.as_deref()
     }
 
     /// Chunk dimensions, if the dataset is chunked.
@@ -190,8 +205,8 @@ impl<'f> Dataset<'f> {
                 address,
                 dims,
                 element_size,
-                ..
-            } => self.read_chunked::<T>(*address, dims, *element_size),
+                chunk_indexing,
+            } => self.read_chunked::<T>(*address, dims, *element_size, chunk_indexing.as_ref()),
         }
     }
 
@@ -210,11 +225,19 @@ impl<'f> Dataset<'f> {
                 self.read_contiguous_slice::<T>(*address, *size, selection)
             }
             DataLayout::Compact { data } => self.read_compact_slice::<T>(data, selection),
-            DataLayout::Chunked { .. } => {
-                // For now, read the full array then slice
-                // TODO: optimize to only read required chunks
-                let full = self.read_array::<T>()?;
-                slice_array(&full, selection, &self.dataspace.dims)
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            } => {
+                self.read_chunked_slice::<T>(
+                    *address,
+                    dims,
+                    *element_size,
+                    chunk_indexing.as_ref(),
+                    selection,
+                )
             }
         }
     }
@@ -241,11 +264,12 @@ impl<'f> Dataset<'f> {
 
     fn read_chunked<T: H5Type>(
         &self,
-        btree_address: u64,
+        index_address: u64,
         chunk_dims: &[u32],
         _element_size: u32,
+        chunk_indexing: Option<&ChunkIndexing>,
     ) -> Result<ArrayD<T>> {
-        if Cursor::is_undefined_offset(btree_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size) {
             return self.make_fill_array::<T>();
         }
 
@@ -254,11 +278,119 @@ impl<'f> Dataset<'f> {
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
 
-        // Compute the total number of elements and allocate the output
+        // Allocate output initialized from the dataset's fill value.
         let total_elements = self.num_elements() as usize;
-        let mut flat_data = vec![0u8; total_elements * elem_size];
+        let total_bytes = total_elements * elem_size;
+        let mut flat_data = if let Some(ref fv) = self.fill_value {
+            if let Some(ref fill_bytes) = fv.value {
+                let mut buf = vec![0u8; total_bytes];
+                if !fill_bytes.is_empty() {
+                    for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
+                        chunk.copy_from_slice(fill_bytes);
+                    }
+                }
+                buf
+            } else {
+                vec![0u8; total_bytes]
+            }
+        } else {
+            vec![0u8; total_bytes]
+        };
 
-        // Collect chunk entries from the B-tree
+        // Dispatch on chunk indexing type to collect chunk entries.
+        match chunk_indexing {
+            None => {
+                // V1-V3: B-tree v1 chunk indexing
+                self.read_btree_v1_chunks(
+                    index_address,
+                    ndim,
+                    &chunk_shape,
+                    shape,
+                    elem_size,
+                    &mut flat_data,
+                )?;
+            }
+            Some(ChunkIndexing::SingleChunk {
+                filtered_size,
+                filters,
+            }) => {
+                let entry = chunk_index::single_chunk_entry(
+                    index_address,
+                    *filtered_size,
+                    *filters,
+                    ndim,
+                );
+                self.assemble_chunk(
+                    &entry,
+                    index_address,
+                    &chunk_shape,
+                    shape,
+                    elem_size,
+                    &mut flat_data,
+                )?;
+            }
+            Some(ChunkIndexing::BTreeV2) => {
+                let entries = chunk_index::collect_v2_chunk_entries(
+                    self.file_data,
+                    index_address,
+                    self.offset_size,
+                    self.length_size,
+                    ndim as u32,
+                )?;
+                for entry in &entries {
+                    self.assemble_chunk(
+                        entry,
+                        index_address,
+                        &chunk_shape,
+                        shape,
+                        elem_size,
+                        &mut flat_data,
+                    )?;
+                }
+            }
+            Some(ChunkIndexing::Implicit) => {
+                let entries = chunk_index::collect_implicit_chunk_entries(
+                    index_address,
+                    shape,
+                    chunk_dims,
+                    elem_size,
+                );
+                for entry in &entries {
+                    self.assemble_chunk(
+                        entry,
+                        index_address,
+                        &chunk_shape,
+                        shape,
+                        elem_size,
+                        &mut flat_data,
+                    )?;
+                }
+            }
+            Some(ChunkIndexing::FixedArray { .. }) => {
+                return Err(Error::Other(
+                    "fixed array chunk indexing not yet implemented".into(),
+                ));
+            }
+            Some(ChunkIndexing::ExtensibleArray { .. }) => {
+                return Err(Error::Other(
+                    "extensible array chunk indexing not yet implemented".into(),
+                ));
+            }
+        }
+
+        self.decode_raw_data::<T>(&flat_data)
+    }
+
+    /// Read chunks from a B-tree v1 index (v1-v3 layout).
+    fn read_btree_v1_chunks(
+        &self,
+        btree_address: u64,
+        ndim: usize,
+        chunk_shape: &[u64],
+        shape: &[u64],
+        elem_size: usize,
+        flat_data: &mut [u8],
+    ) -> Result<()> {
         let leaves = crate::btree_v1::collect_btree_v1_leaves(
             self.file_data,
             btree_address,
@@ -274,50 +406,21 @@ impl<'f> Dataset<'f> {
                     filter_mask,
                     offsets,
                 } => {
-                    // The offsets array has ndim+1 elements, last one is 0
                     let chunk_offsets: Vec<u64> = offsets[..ndim].to_vec();
-
-                    // Cache lookup
-                    let cache_key = ChunkKey {
-                        dataset_addr: btree_address,
-                        chunk_offsets: chunk_offsets.clone(),
+                    let entry = chunk_index::ChunkEntry {
+                        address: *chunk_addr,
+                        size: *chunk_size as u64,
+                        filter_mask: *filter_mask,
+                        offsets: chunk_offsets,
                     };
-
-                    let chunk_data = if let Some(cached) = self.chunk_cache.get(&cache_key) {
-                        cached
-                    } else {
-                        // Read raw chunk data from file
-                        let addr = *chunk_addr as usize;
-                        let size = *chunk_size as usize;
-                        if addr + size > self.file_data.len() {
-                            return Err(Error::OffsetOutOfBounds(*chunk_addr));
-                        }
-                        let raw = &self.file_data[addr..addr + size];
-
-                        // Apply filter pipeline
-                        let decoded = if let Some(ref pipeline) = self.filters {
-                            filters::apply_pipeline(
-                                raw,
-                                &pipeline.filters,
-                                *filter_mask,
-                                elem_size,
-                            )?
-                        } else {
-                            raw.to_vec()
-                        };
-
-                        self.chunk_cache.insert(cache_key, decoded)
-                    };
-
-                    // Copy chunk data into the flat output
-                    copy_chunk_to_flat(
-                        &chunk_data,
-                        &mut flat_data,
-                        &chunk_offsets,
-                        &chunk_shape,
+                    self.assemble_chunk(
+                        &entry,
+                        btree_address,
+                        chunk_shape,
                         shape,
                         elem_size,
-                    );
+                        flat_data,
+                    )?;
                 }
                 _ => {
                     return Err(Error::InvalidData(
@@ -327,8 +430,66 @@ impl<'f> Dataset<'f> {
             }
         }
 
-        // Decode the flat buffer into the array
-        self.decode_raw_data::<T>(&flat_data)
+        Ok(())
+    }
+
+    /// Read, decompress, and copy a single chunk into the flat output buffer.
+    fn assemble_chunk(
+        &self,
+        entry: &chunk_index::ChunkEntry,
+        dataset_addr: u64,
+        chunk_shape: &[u64],
+        shape: &[u64],
+        elem_size: usize,
+        flat_data: &mut [u8],
+    ) -> Result<()> {
+        let cache_key = ChunkKey {
+            dataset_addr,
+            chunk_offsets: entry.offsets.clone(),
+        };
+
+        let chunk_data = if let Some(cached) = self.chunk_cache.get(&cache_key) {
+            cached
+        } else {
+            let addr = entry.address as usize;
+            // Determine on-disk size: use entry.size if nonzero, otherwise
+            // compute from uncompressed chunk volume.
+            let size = if entry.size > 0 {
+                entry.size as usize
+            } else {
+                chunk_shape.iter().product::<u64>() as usize * elem_size
+            };
+            if addr + size > self.file_data.len() {
+                return Err(Error::OffsetOutOfBounds(entry.address));
+            }
+            let raw = &self.file_data[addr..addr + size];
+
+            let decoded = if let Some(ref pipeline) = self.filters {
+                filters::apply_pipeline(raw, &pipeline.filters, entry.filter_mask, elem_size)?
+            } else {
+                raw.to_vec()
+            };
+
+            self.chunk_cache.insert(cache_key, decoded)
+        };
+
+        copy_chunk_to_flat(&chunk_data, flat_data, &entry.offsets, chunk_shape, shape, elem_size);
+        Ok(())
+    }
+
+    /// Optimized chunked slice: only read chunks that overlap the selection.
+    fn read_chunked_slice<T: H5Type>(
+        &self,
+        index_address: u64,
+        chunk_dims: &[u32],
+        element_size: u32,
+        chunk_indexing: Option<&ChunkIndexing>,
+        selection: &SliceInfo,
+    ) -> Result<ArrayD<T>> {
+        // For simplicity in the first pass: read the full array then slice.
+        // A full optimization would compute overlapping chunks and only read those.
+        let full = self.read_chunked::<T>(index_address, chunk_dims, element_size, chunk_indexing)?;
+        slice_array(&full, selection, &self.dataspace.dims)
     }
 
     fn read_contiguous_slice<T: H5Type>(
