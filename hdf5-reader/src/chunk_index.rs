@@ -34,8 +34,7 @@ pub fn collect_v2_chunk_entries(
 ) -> Result<Vec<ChunkEntry>> {
     let mut cursor = crate::io::Cursor::new(data);
     cursor.set_position(btree_address);
-    let header =
-        crate::btree_v2::BTreeV2Header::parse(&mut cursor, offset_size, length_size)?;
+    let header = crate::btree_v2::BTreeV2Header::parse(&mut cursor, offset_size, length_size)?;
 
     let records = crate::btree_v2::collect_btree_v2_records(
         data,
@@ -155,12 +154,7 @@ mod tests {
 
     #[test]
     fn test_implicit_chunk_entries() {
-        let entries = collect_implicit_chunk_entries(
-            1000,
-            &[10, 20],
-            &[5, 10],
-            4,
-        );
+        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4);
         // 2 chunks along dim 0, 2 chunks along dim 1 = 4 total
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].address, 1000);

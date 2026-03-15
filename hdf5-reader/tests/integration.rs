@@ -162,7 +162,11 @@ fn test_dense_groups() {
 
     let root = file.root_group().unwrap();
     let datasets = root.datasets().unwrap();
-    assert!(datasets.len() >= 20, "expected at least 20 datasets, got {}", datasets.len());
+    assert!(
+        datasets.len() >= 20,
+        "expected at least 20 datasets, got {}",
+        datasets.len()
+    );
 
     // Read one of them
     let ds = root.dataset("ds_000").unwrap();
