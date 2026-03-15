@@ -17,6 +17,7 @@
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::messages::shared::SharedMessage;
 use crate::messages::{parse_message, HdfMessage};
 
 /// Magic signature for v2 object headers.
@@ -32,7 +33,7 @@ const MSG_TYPE_CONTINUATION: u16 = 0x0010;
 const MSG_TYPE_NIL: u16 = 0x0000;
 
 /// Parsed object header with all its messages.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjectHeader {
     /// Object header format version (1 or 2).
     pub version: u8,
@@ -62,6 +63,55 @@ impl ObjectHeader {
         } else {
             Self::parse_v1(&cursor, address, offset_size, length_size)
         }
+    }
+
+    /// Resolve shared messages by following references to other object headers.
+    ///
+    /// For `SharedInOhdr`, the referenced object header is parsed and the first
+    /// matching message type is extracted. `SharedInSohm` returns an error (rare).
+    pub fn resolve_shared_messages(
+        &mut self,
+        data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) {
+        let mut resolved = Vec::with_capacity(self.messages.len());
+        for msg in self.messages.drain(..) {
+            match msg {
+                HdfMessage::Shared(SharedMessage::SharedInOhdr { address }) => {
+                    match Self::parse_at(data, address, offset_size, length_size) {
+                        Ok(target_header) => {
+                            // Extract the actual message(s) from the target header.
+                            // Typically there is exactly one "real" message (the
+                            // committed datatype, fill value, etc.).
+                            for target_msg in target_header.messages {
+                                match target_msg {
+                                    HdfMessage::Nil
+                                    | HdfMessage::ObjectHeaderContinuation
+                                    | HdfMessage::Shared(_) => continue,
+                                    other => {
+                                        resolved.push(other);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // If we can't parse the target, keep the shared ref
+                            resolved.push(HdfMessage::Shared(SharedMessage::SharedInOhdr {
+                                address,
+                            }));
+                        }
+                    }
+                }
+                HdfMessage::Shared(SharedMessage::SharedInSohm { heap_id }) => {
+                    // SOHM resolution not supported — keep the wrapper
+                    resolved.push(HdfMessage::Shared(SharedMessage::SharedInSohm { heap_id }));
+                }
+                other => resolved.push(other),
+            }
+        }
+        self.messages = resolved;
     }
 
     // ------------------------------------------------------------------
