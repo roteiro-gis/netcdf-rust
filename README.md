@@ -120,6 +120,65 @@ python testdata/generate_fixtures.py
 cargo test
 ```
 
+## Benchmarks
+
+`netcdf-reader` includes a Criterion benchmark that compares this implementation
+against the C-backed [`netcdf`](https://github.com/georust/netcdf) crate on the
+checked-in fixtures plus larger generated benchmark fixtures.
+
+```sh
+# Full benchmark matrix
+cargo bench -p netcdf-reader --bench compare_georust
+
+# Contention-focused scaling run that makes cross-thread serialization visible
+BENCH_THREAD_LIST=1,2,4,8 BENCH_HOT_OPS_PER_THREAD=256 \
+  cargo bench -p netcdf-reader --bench compare_georust \
+  'parallel_metadata_batch/.*/(nc4_basic|nested_nc4_groups)|parallel_slice_batch/.*/(nc4_basic|nc4_compressed|large_nc4_compressed)'
+
+# Restrict thread scaling cases
+BENCH_THREAD_LIST=1,2,4 cargo bench -p netcdf-reader --bench compare_georust
+
+# Summarize the latest Criterion results as a markdown table
+python3 scripts/criterion_summary.py
+
+# Include x1-relative speedup for threaded workloads
+python3 scripts/criterion_summary.py --speedup \
+  --group parallel_metadata_batch \
+  --group parallel_slice_batch \
+  --group read_full_internal_parallel \
+  --group parallel_open_and_read
+```
+
+Notes:
+- The benchmark uses `netcdf` with its `static` feature, so it builds a bundled
+  `netcdf-c` stack instead of depending on a specific system HDF5 install.
+- The suite separates `open_only`, `metadata_reuse_handle`,
+  `read_full_reuse_handle`, `open_and_read_full`,
+  `read_full_internal_parallel`, `slice_reuse_handle_hdf5_backend`, and
+  parallel throughput workloads so setup costs and steady-state read costs are
+  visible independently.
+- The suite also includes `parallel_metadata_batch` and
+  `parallel_slice_batch`, which keep one open handle per worker, synchronize
+  start with a barrier, and then execute many small operations. Those runs are
+  intended to show how `netcdf-rust` and the C-backed `georust/netcdf`
+  baseline behave under the same concurrent call pattern.
+- Larger benchmark-only fixtures are generated at runtime, so the suite covers
+  both small checked-in files and more realistic compressed datasets.
+- Parallel cases include both independent `open + read` scaling against the
+  C-backed baseline and a `parallel_read_shared_cairn` case that measures our
+  shared-open-handle throughput directly.
+- `read_full_internal_parallel` measures one large chunked read with internal
+  chunk-level Rayon parallelism, which is distinct from the independent-read
+  throughput cases.
+- In the local `netcdf 0.12.0` baseline source used for these runs, libnetcdf
+  entry points are wrapped through `with_lock` / `checked_with_lock`, which
+  take `netcdf_sys::libnetcdf_lock` before entering the C API. In practice,
+  that means a shared process-global mutex around FFI calls into `netcdf-c`.
+  The contention benchmarks are intended to make the effect of that design
+  visible.
+- The slice workload is NetCDF-4 only and uses the native HDF5 dataset API on
+  our side, because `netcdf-reader` does not yet expose high-level sliced reads.
+
 ## Known limitations
 
 - Soft and external HDF5 links are skipped

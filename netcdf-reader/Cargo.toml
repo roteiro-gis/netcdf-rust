@@ -12,15 +12,23 @@ ndarray = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = { workspace = true }
 hdf5-reader = { path = "../hdf5-reader", optional = true }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+netcdf = { version = "0.12", features = ["static"] }
 
 [features]
-default = ["netcdf4"]
+default = ["netcdf4", "rayon"]
 netcdf4 = ["dep:hdf5-reader"]
+rayon = ["dep:rayon", "netcdf4", "hdf5-reader/rayon"]
 cf = ["dep:chrono"]
 
 [dependencies.chrono]
 version = "0.4"
 optional = true
+
+[[bench]]
+name = "compare_georust"
+harness = false

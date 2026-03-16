@@ -15,9 +15,13 @@ pub struct ChunkKey {
 /// Thread-safe via `Mutex`. Values are `Arc<Vec<u8>>` so multiple readers
 /// can share the same decompressed chunk data.
 pub struct ChunkCache {
-    inner: Mutex<LruCache<ChunkKey, Arc<Vec<u8>>>>,
+    inner: Mutex<ChunkCacheState>,
     max_bytes: usize,
-    current_bytes: Mutex<usize>,
+}
+
+struct ChunkCacheState {
+    cache: LruCache<ChunkKey, Arc<Vec<u8>>>,
+    current_bytes: usize,
 }
 
 impl ChunkCache {
@@ -28,16 +32,18 @@ impl ChunkCache {
     pub fn new(max_bytes: usize, max_slots: usize) -> Self {
         let slots = NonZeroUsize::new(max_slots).unwrap_or(NonZeroUsize::new(521).unwrap());
         ChunkCache {
-            inner: Mutex::new(LruCache::new(slots)),
+            inner: Mutex::new(ChunkCacheState {
+                cache: LruCache::new(slots),
+                current_bytes: 0,
+            }),
             max_bytes,
-            current_bytes: Mutex::new(0),
         }
     }
 
     /// Get a cached chunk, if present.
     pub fn get(&self, key: &ChunkKey) -> Option<Arc<Vec<u8>>> {
-        let mut cache = self.inner.lock().unwrap();
-        cache.get(key).cloned()
+        let cache = self.inner.lock().unwrap();
+        cache.cache.peek(key).cloned()
     }
 
     /// Insert a chunk into the cache. Evicts LRU entries if over capacity.
@@ -45,18 +51,20 @@ impl ChunkCache {
         let data_len = data.len();
         let arc = Arc::new(data);
 
-        let mut cache = self.inner.lock().unwrap();
-        let mut current = self.current_bytes.lock().unwrap();
+        if self.max_bytes == 0 || data_len > self.max_bytes {
+            return arc;
+        }
 
+        let mut state = self.inner.lock().unwrap();
         // Evict until we have room
-        while *current + data_len > self.max_bytes && !cache.is_empty() {
-            if let Some((_, evicted)) = cache.pop_lru() {
-                *current = current.saturating_sub(evicted.len());
+        while state.current_bytes + data_len > self.max_bytes && !state.cache.is_empty() {
+            if let Some((_, evicted)) = state.cache.pop_lru() {
+                state.current_bytes = state.current_bytes.saturating_sub(evicted.len());
             }
         }
 
-        *current += data_len;
-        cache.put(key, arc.clone());
+        state.current_bytes += data_len;
+        state.cache.put(key, arc.clone());
 
         arc
     }
@@ -101,5 +109,16 @@ mod tests {
             chunk_offsets: vec![0],
         };
         assert!(cache.get(&first_key).is_none()); // should be evicted
+    }
+
+    #[test]
+    fn test_cache_disabled_bypasses_storage() {
+        let cache = ChunkCache::new(0, 10);
+        let key = ChunkKey {
+            dataset_addr: 100,
+            chunk_offsets: vec![0],
+        };
+        cache.insert(key.clone(), vec![1, 2, 3]);
+        assert!(cache.get(&key).is_none());
     }
 }

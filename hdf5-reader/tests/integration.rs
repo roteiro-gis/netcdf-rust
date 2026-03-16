@@ -65,6 +65,22 @@ fn test_simple_chunked_deflate() {
 }
 
 #[test]
+fn test_simple_chunked_deflate_parallel_matches_serial() {
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/temperature").unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+
+    let serial: ndarray::ArrayD<f32> = ds.read_array().unwrap();
+    let parallel: ndarray::ArrayD<f32> = ds.read_array_in_pool(&pool).unwrap();
+
+    assert_eq!(serial, parallel);
+}
+
+#[test]
 fn test_nested_groups() {
     let path = skip_if_missing!("nested_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

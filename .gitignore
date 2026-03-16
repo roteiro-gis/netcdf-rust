@@ -1,1 +1,16 @@
 target/
+
+# Local editor settings
+.idea/
+
+# Local Python environments used for fixture generation and analysis
+.venv/
+.venv312/
+
+# Generated fixture outputs that are useful locally but not part of the
+# checked-in canonical fixture set.
+testdata/netcdf3/
+testdata/netcdf4/nc4_string_var.nc
+
+# macOS Finder metadata
+.DS_Store
