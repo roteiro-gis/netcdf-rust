@@ -194,3 +194,120 @@ fn test_header_cache_reuse() {
     let g1b = file.group("/group1").unwrap();
     assert_eq!(g1a.name(), g1b.name());
 }
+
+#[test]
+fn test_fixed_array_chunked() {
+    let path = skip_if_missing!("fixed_array_chunked.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[6, 10]);
+
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[6, 10]);
+    // Verify data: arange(60).reshape(6,10)
+    for r in 0..6 {
+        for c in 0..10 {
+            let expected = (r * 10 + c) as f64;
+            assert!(
+                (data[[r, c]] - expected).abs() < 1e-10,
+                "mismatch at [{},{}]: got {}, expected {}",
+                r,
+                c,
+                data[[r, c]],
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn test_extensible_array_chunked() {
+    let path = skip_if_missing!("extensible_array_chunked.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[5, 8]);
+
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[5, 8]);
+    // Verify data: arange(40).reshape(5,8)
+    for r in 0..5 {
+        for c in 0..8 {
+            let expected = (r * 8 + c) as f64;
+            assert!(
+                (data[[r, c]] - expected).abs() < 1e-10,
+                "mismatch at [{},{}]: got {}, expected {}",
+                r,
+                c,
+                data[[r, c]],
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn test_chunked_slice_single_index() {
+    let path = skip_if_missing!("fixed_array_chunked.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+
+    // Select row 2 (should give [20, 21, 22, ..., 29])
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Index(2),
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: u64::MAX,
+                step: 1,
+            },
+        ],
+    };
+    let sliced: ndarray::ArrayD<f64> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.shape(), &[10]);
+    for c in 0..10 {
+        let expected = (2 * 10 + c) as f64;
+        assert!(
+            (sliced[[c]] - expected).abs() < 1e-10,
+            "mismatch at [{}]: got {}, expected {}",
+            c,
+            sliced[[c]],
+            expected
+        );
+    }
+}
+
+#[test]
+fn test_chunked_slice_range_with_step() {
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/temperature").unwrap();
+    // Shape: [10, 20], select rows 0,2,4,6,8 and cols 0..10
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 10,
+                step: 2,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 10,
+                step: 1,
+            },
+        ],
+    };
+    let sliced: ndarray::ArrayD<f32> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.shape(), &[5, 10]);
+    // Row 0 of result = dataset row 0: [0, 1, 2, ..., 9]
+    for c in 0..10 {
+        assert!((sliced[[0, c]] - c as f32).abs() < 1e-6);
+    }
+    // Row 1 of result = dataset row 2: [40, 41, 42, ..., 49]
+    for c in 0..10 {
+        assert!((sliced[[1, c]] - (40 + c) as f32).abs() < 1e-6);
+    }
+}

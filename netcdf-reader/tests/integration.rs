@@ -125,3 +125,45 @@ fn test_nc4_classic_model() {
     // NETCDF4_CLASSIC should be detected as Nc4Classic
     assert_eq!(file.format(), netcdf_reader::NcFormat::Nc4Classic);
 }
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_same_size_dims() {
+    let path = skip_if_missing!("netcdf4", "same_size_dims.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    // Both dimensions are size 10 — DIMENSION_LIST should resolve them correctly
+    let var = file.variable("temperature").unwrap();
+    assert_eq!(var.dimensions().len(), 2);
+
+    // With DIMENSION_LIST parsing, dimensions should be named "lat" and "lon"
+    // (not both matched to the first size-10 dim)
+    let dim_names: Vec<&str> = var.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(dim_names, vec!["lat", "lon"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_read_variable_unified() {
+    let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    // Use the unified read_variable method
+    let data: ndarray::ArrayD<f64> = file.read_variable("data").unwrap();
+    assert_eq!(data.shape(), &[5, 10]);
+    // First element should be 0.0
+    assert!((data[[0, 0]] - 0.0).abs() < 1e-10);
+    // Last element should be 49.0
+    assert!((data[[4, 9]] - 49.0).abs() < 1e-10);
+}
+
+#[test]
+fn test_classic_read_variable_unified() {
+    let path = skip_if_missing!("netcdf3", "cdf1_simple.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    // Use the unified read_variable method on classic format
+    let data: ndarray::ArrayD<f32> = file.read_variable("temp").unwrap();
+    assert_eq!(data.shape(), &[5, 10]);
+    assert!((data[[0, 0]] - 0.0).abs() < 1e-6);
+}

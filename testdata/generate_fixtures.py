@@ -184,6 +184,26 @@ def generate_hdf5_fixtures(base_dir):
         # Reference the committed type
         ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
 
+    # ---- 18. fixed_array_chunked.h5 ----
+    # Tests: Fixed Array chunk indexing (libver='latest', fixed-size chunked).
+    path = os.path.join(hdf5_dir, "fixed_array_chunked.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.arange(60, dtype=np.float64).reshape(6, 10)
+        f.create_dataset("data", data=data, chunks=(3, 5), compression="gzip")
+
+    # ---- 19. extensible_array_chunked.h5 ----
+    # Tests: Extensible Array chunk indexing (libver='latest', one unlimited dim).
+    path = os.path.join(hdf5_dir, "extensible_array_chunked.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset(
+            "data", shape=(5, 8), maxshape=(None, 8), dtype=np.float64,
+            chunks=(2, 4), compression="gzip"
+        )
+        data = np.arange(40, dtype=np.float64).reshape(5, 8)
+        ds[:] = data
+
 
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
@@ -376,6 +396,18 @@ def generate_netcdf4_fixtures(base_dir):
     ds.createDimension("y", 10)
     data = ds.createVariable("data", "f8", ("x", "y"))
     data[:] = np.arange(50, dtype=np.float64).reshape(5, 10)
+    ds.close()
+
+    # ---- 7. same_size_dims.nc ----
+    # Tests: Two dimensions with identical sizes — verifies DIMENSION_LIST
+    # resolves by reference, not by size matching.
+    path = os.path.join(nc4_dir, "same_size_dims.nc")
+    print(f"  Generating {path}")
+    ds = netCDF4.Dataset(path, "w", format="NETCDF4")
+    ds.createDimension("lat", 10)
+    ds.createDimension("lon", 10)
+    temp = ds.createVariable("temperature", "f4", ("lat", "lon"))
+    temp[:] = np.arange(100, dtype=np.float32).reshape(10, 10)
     ds.close()
 
 
