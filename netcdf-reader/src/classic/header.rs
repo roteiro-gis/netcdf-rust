@@ -209,13 +209,17 @@ pub fn parse_header(data: &[u8], format: NcFormat) -> Result<ClassicHeader> {
     };
 
     // dim_list
-    let dimensions = parse_dim_list(&mut cur, format)?;
+    let mut dimensions = parse_dim_list(&mut cur, format)?;
 
     // att_list (global attributes)
     let global_attributes = parse_att_list(&mut cur, format)?;
 
     // var_list
-    let variables = parse_var_list(&mut cur, format, &dimensions)?;
+    let mut variables = parse_var_list(&mut cur, format, &dimensions)?;
+
+    if numrecs > 0 {
+        apply_unlimited_dimension_size(&mut dimensions, &mut variables, numrecs);
+    }
 
     Ok(ClassicHeader {
         dimensions,
@@ -417,14 +421,13 @@ fn parse_var_list(
         let name = cur.read_name(format)?;
 
         // Number of dimensions for this variable.
-        // CDF-1/2: 4-byte NON_NEG. CDF-5: 4-byte INT (remains 4 bytes per spec).
-        let ndims = cur.read_u32_be()? as usize;
+        let ndims = cur.read_count(format)? as usize;
 
-        // Dimension IDs: 4 bytes each (INT32) in all formats.
+        // Dimension IDs are NON_NEG values and widen to 64 bits in CDF-5.
         let mut var_dims = Vec::with_capacity(ndims);
         let mut is_record_var = false;
         for _ in 0..ndims {
-            let dimid = cur.read_u32_be()? as usize;
+            let dimid = cur.read_count(format)? as usize;
             if dimid >= dims.len() {
                 return Err(Error::InvalidData(format!(
                     "variable '{}' references dimension index {} but only {} dimensions exist",
@@ -478,6 +481,26 @@ fn parse_var_list(
     }
 
     Ok(vars)
+}
+
+fn apply_unlimited_dimension_size(
+    dimensions: &mut [NcDimension],
+    variables: &mut [NcVariable],
+    numrecs: u64,
+) {
+    for dim in dimensions.iter_mut().filter(|dim| dim.is_unlimited) {
+        dim.size = numrecs;
+    }
+
+    for variable in variables {
+        for dim in variable
+            .dimensions
+            .iter_mut()
+            .filter(|dim| dim.is_unlimited)
+        {
+            dim.size = numrecs;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +612,67 @@ mod tests {
         }
     }
 
+    fn write_count_cdf5(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_name_cdf5(buf: &mut Vec<u8>, name: &str) {
+        let name_bytes = name.as_bytes();
+        write_count_cdf5(buf, name_bytes.len() as u64);
+        buf.extend_from_slice(name_bytes);
+        let pad = pad_to_4(name_bytes.len()) - name_bytes.len();
+        for _ in 0..pad {
+            buf.push(0);
+        }
+    }
+
+    fn build_cdf5_header(
+        dims: &[(&str, u64)],
+        vars: &[(&str, &[u64], u32, u64, u64)],
+        numrecs: u64,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x05");
+        write_count_cdf5(&mut buf, numrecs);
+
+        if dims.is_empty() {
+            buf.extend_from_slice(&ABSENT.to_be_bytes());
+            write_count_cdf5(&mut buf, 0);
+        } else {
+            buf.extend_from_slice(&NC_DIMENSION.to_be_bytes());
+            write_count_cdf5(&mut buf, dims.len() as u64);
+            for (name, size) in dims {
+                write_name_cdf5(&mut buf, name);
+                write_count_cdf5(&mut buf, *size);
+            }
+        }
+
+        buf.extend_from_slice(&ABSENT.to_be_bytes());
+        write_count_cdf5(&mut buf, 0);
+
+        if vars.is_empty() {
+            buf.extend_from_slice(&ABSENT.to_be_bytes());
+            write_count_cdf5(&mut buf, 0);
+        } else {
+            buf.extend_from_slice(&NC_VARIABLE.to_be_bytes());
+            write_count_cdf5(&mut buf, vars.len() as u64);
+            for (name, dimids, nc_type, vsize, offset) in vars {
+                write_name_cdf5(&mut buf, name);
+                write_count_cdf5(&mut buf, dimids.len() as u64);
+                for dimid in *dimids {
+                    write_count_cdf5(&mut buf, *dimid);
+                }
+                buf.extend_from_slice(&ABSENT.to_be_bytes());
+                write_count_cdf5(&mut buf, 0);
+                buf.extend_from_slice(&nc_type.to_be_bytes());
+                write_count_cdf5(&mut buf, *vsize);
+                buf.extend_from_slice(&offset.to_be_bytes());
+            }
+        }
+
+        buf
+    }
+
     #[test]
     fn test_empty_header() {
         let data = build_cdf1_header(&[], &[], &[], 0);
@@ -619,7 +703,7 @@ mod tests {
         assert!(!header.dimensions[1].is_unlimited);
 
         assert_eq!(header.dimensions[2].name, "time");
-        assert_eq!(header.dimensions[2].size, 0);
+        assert_eq!(header.dimensions[2].size, 5);
         assert!(header.dimensions[2].is_unlimited);
 
         assert_eq!(header.numrecs, 5);
@@ -715,6 +799,7 @@ mod tests {
         assert!(var.is_record_var);
         assert_eq!(var.record_size, 20);
         assert_eq!(var._data_size, 0); // data_size=0 for record vars (computed at read time)
+        assert_eq!(var.shape(), vec![10, 5]);
     }
 
     #[test]
@@ -754,6 +839,41 @@ mod tests {
         assert_eq!(header.variables.len(), 1);
         assert_eq!(header.variables[0].data_offset, 0x1_0000_0000);
         assert_eq!(header.variables[0]._data_size, 400);
+    }
+
+    #[test]
+    fn test_cdf5_uses_64_bit_counts_for_var_metadata() {
+        let data = build_cdf5_header(
+            &[("n", 4)],
+            &[
+                ("ubyte_var", &[0], 7, 4, 128),
+                ("int64_var", &[0], 10, 32, 256),
+            ],
+            0,
+        );
+
+        let header = parse_header(&data, NcFormat::Cdf5).unwrap();
+        assert_eq!(header.variables.len(), 2);
+        assert_eq!(header.variables[0].name, "ubyte_var");
+        assert_eq!(header.variables[0].dtype, NcType::UByte);
+        assert_eq!(header.variables[0].dimensions[0].name, "n");
+        assert_eq!(header.variables[1].name, "int64_var");
+        assert_eq!(header.variables[1].dtype, NcType::Int64);
+        assert_eq!(header.variables[1].data_offset, 256);
+    }
+
+    #[test]
+    fn test_unlimited_dimension_size_tracks_numrecs() {
+        let data = build_cdf1_header(
+            &[("time", 0), ("x", 5)],
+            &[],
+            &[("series", &[0, 1], 6, 40, 128)],
+            3,
+        );
+
+        let header = parse_header(&data, NcFormat::Classic).unwrap();
+        assert_eq!(header.dimensions[0].size, 3);
+        assert_eq!(header.variables[0].shape(), vec![3, 5]);
     }
 
     #[test]

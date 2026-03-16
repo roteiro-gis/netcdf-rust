@@ -101,7 +101,7 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut groups = Vec::new();
         for child in &children {
-            if self.is_group_at(child.address)? {
+            if matches!(self.is_group_at(child.address), Ok(true)) {
                 groups.push(Group::new(
                     self.file_data,
                     child.address,
@@ -149,8 +149,8 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut datasets = Vec::new();
         for child in &children {
-            if !self.is_group_at(child.address)? {
-                datasets.push(Dataset::from_object_header(
+            if matches!(self.is_group_at(child.address), Ok(false)) {
+                if let Ok(dataset) = Dataset::from_object_header(
                     self.file_data,
                     child.address,
                     child.name.clone(),
@@ -158,7 +158,9 @@ impl<'f> Group<'f> {
                     self.length_size,
                     self.chunk_cache.clone(),
                     self.filter_registry.clone(),
-                )?);
+                ) {
+                    datasets.push(dataset);
+                }
             }
         }
         Ok(datasets)
@@ -185,7 +187,8 @@ impl<'f> Group<'f> {
 
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
-        let header = self.cached_header(self.address)?;
+        let mut header = (*self.cached_header(self.address)?).clone();
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
         let mut attrs = Vec::new();
         for msg in &header.messages {
             if let HdfMessage::Attribute(attr) = msg {
@@ -373,7 +376,8 @@ impl<'f> Group<'f> {
     /// A group has either a symbol table message, link messages, or link info.
     /// A dataset has a dataspace + datatype + layout.
     fn is_group_at(&self, address: u64) -> Result<bool> {
-        let header = self.cached_header(address)?;
+        let mut header = (*self.cached_header(address)?).clone();
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
         for msg in &header.messages {
             match msg {
                 // Group indicators
