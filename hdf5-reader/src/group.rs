@@ -101,7 +101,7 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut groups = Vec::new();
         for child in &children {
-            if matches!(self.is_group_at(child.address), Ok(true)) {
+            if self.child_is_group(child)? {
                 groups.push(Group::new(
                     self.file_data,
                     child.address,
@@ -149,16 +149,8 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut datasets = Vec::new();
         for child in &children {
-            if matches!(self.is_group_at(child.address), Ok(false)) {
-                if let Ok(dataset) = Dataset::from_object_header(
-                    self.file_data,
-                    child.address,
-                    child.name.clone(),
-                    self.offset_size,
-                    self.length_size,
-                    self.chunk_cache.clone(),
-                    self.filter_registry.clone(),
-                ) {
+            if !self.child_is_group(child)? {
+                if let Some(dataset) = self.try_open_child_dataset(child) {
                     datasets.push(dataset);
                 }
             }
@@ -171,15 +163,10 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         for child in &children {
             if child.name == name {
-                return Dataset::from_object_header(
-                    self.file_data,
-                    child.address,
-                    child.name.clone(),
-                    self.offset_size,
-                    self.length_size,
-                    self.chunk_cache.clone(),
-                    self.filter_registry.clone(),
-                );
+                if let Some(dataset) = self.try_open_child_dataset(child) {
+                    return Ok(dataset);
+                }
+                return Err(Error::DatasetNotFound(name.to_string()));
             }
         }
         Err(Error::DatasetNotFound(name.to_string()))
@@ -394,5 +381,25 @@ impl<'f> Group<'f> {
         }
         // Default: if it has neither, treat as group (root groups can be empty)
         Ok(true)
+    }
+
+    fn try_open_child_dataset(&self, child: &ChildEntry) -> Option<Dataset<'f>> {
+        Dataset::from_object_header(
+            self.file_data,
+            child.address,
+            child.name.clone(),
+            self.offset_size,
+            self.length_size,
+            self.chunk_cache.clone(),
+            self.filter_registry.clone(),
+        )
+        .ok()
+    }
+
+    fn child_is_group(&self, child: &ChildEntry) -> Result<bool> {
+        match self.is_group_at(child.address) {
+            Ok(is_group) => Ok(is_group),
+            Err(_) => Ok(self.try_open_child_dataset(child).is_none()),
+        }
     }
 }
