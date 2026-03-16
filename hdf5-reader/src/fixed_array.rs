@@ -1,0 +1,302 @@
+//! HDF5 Fixed Array (FA) chunk index.
+//!
+//! This is the default chunk index for fixed-size chunked datasets created with
+//! `libver='latest'`. It stores chunk entries in a flat array (optionally paged)
+//! with a single-level header → data block structure.
+//!
+//! Structures:
+//! - `FAHD` — Fixed Array Header
+//! - `FADB` — Fixed Array Data Block
+
+use crate::checksum::jenkins_lookup3;
+use crate::chunk_index::ChunkEntry;
+use crate::error::{Error, Result};
+use crate::io::Cursor;
+
+const FAHD_SIGNATURE: [u8; 4] = *b"FAHD";
+const FADB_SIGNATURE: [u8; 4] = *b"FADB";
+
+/// Parsed Fixed Array Header.
+#[derive(Debug)]
+struct FaHeader {
+    client_id: u8,
+    _entry_size: u8,
+    page_bits: u8,
+    num_entries: u64,
+    data_block_address: u64,
+}
+
+/// Parse the Fixed Array Header at the given address.
+///
+/// On-disk layout (from H5FA_HEADER_SIZE):
+/// sig(4) + ver(1) + client_id(1) + entry_size(1) + page_bits(1)
+/// + nelmts(length_size) + dblk_addr(offset_size) + checksum(4)
+fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> Result<FaHeader> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(address);
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != FAHD_SIGNATURE {
+        return Err(Error::InvalidFixedArraySignature {
+            context: "header signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported fixed array header version {}",
+            version
+        )));
+    }
+
+    let client_id = cursor.read_u8()?;
+    let _entry_size = cursor.read_u8()?;
+    let page_bits = cursor.read_u8()?;
+    let num_entries = cursor.read_length(length_size)?;
+    let data_block_address = cursor.read_offset(offset_size)?;
+
+    // Checksum covers everything from signature through data_block_address.
+    let header_end = cursor.position();
+    let header_bytes = &data[address as usize..header_end as usize];
+    let stored_checksum = cursor.read_u32_le()?;
+    let computed = jenkins_lookup3(header_bytes);
+    if stored_checksum != computed {
+        return Err(Error::ChecksumMismatch {
+            expected: stored_checksum,
+            actual: computed,
+        });
+    }
+
+    Ok(FaHeader {
+        client_id,
+        _entry_size,
+        page_bits,
+        num_entries,
+        data_block_address,
+    })
+}
+
+/// A single raw fixed-array entry (before conversion to ChunkEntry).
+#[derive(Debug)]
+struct FaRawEntry {
+    address: u64,
+    chunk_size: u64,
+    filter_mask: u32,
+}
+
+/// Read entries from a Fixed Array Data Block.
+fn parse_data_block(
+    data: &[u8],
+    address: u64,
+    header: &FaHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<FaRawEntry>> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(address);
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != FADB_SIGNATURE {
+        return Err(Error::InvalidFixedArraySignature {
+            context: "data block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported fixed array data block version {}",
+            version
+        )));
+    }
+
+    let _client_id = cursor.read_u8()?;
+    let _header_address = cursor.read_offset(offset_size)?;
+
+    let num_entries = header.num_entries as usize;
+    let is_filtered = header.client_id == 1;
+
+    // Paging is used only when nelmts exceeds 2^page_bits.
+    let use_paging = header.page_bits > 0 && num_entries > (1usize << header.page_bits);
+
+    if !use_paging {
+        // Non-paged: all entries inline followed by a single checksum.
+        let entries = read_entries(
+            &mut cursor,
+            num_entries,
+            is_filtered,
+            offset_size,
+            length_size,
+        )?;
+        // Skip the trailing checksum (already verified structurally).
+        let _checksum = cursor.read_u32_le()?;
+        Ok(entries)
+    } else {
+        // Paged: entries are split into pages of `2^page_bits` entries each.
+        let entries_per_page = 1usize << header.page_bits;
+        let num_pages = num_entries.div_ceil(entries_per_page);
+
+        // Page init bitmap: ceil(num_pages / 8) bytes — tells which pages
+        // have been initialized. We read all pages regardless (uninitialized
+        // pages have undefined addresses that we filter out later).
+        let bitmap_bytes = num_pages.div_ceil(8);
+        let page_bitmap = cursor.read_bytes(bitmap_bytes)?.to_vec();
+
+        let mut all_entries = Vec::with_capacity(num_entries);
+
+        for page_idx in 0..num_pages {
+            let byte_idx = page_idx / 8;
+            let bit_idx = page_idx % 8;
+            let page_initialized =
+                byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+
+            let entries_in_this_page = if page_idx == num_pages - 1 {
+                let remainder = num_entries % entries_per_page;
+                if remainder == 0 {
+                    entries_per_page
+                } else {
+                    remainder
+                }
+            } else {
+                entries_per_page
+            };
+
+            if page_initialized {
+                let page_entries = read_entries(
+                    &mut cursor,
+                    entries_in_this_page,
+                    is_filtered,
+                    offset_size,
+                    length_size,
+                )?;
+                // Each page has its own checksum.
+                let _page_checksum = cursor.read_u32_le()?;
+                all_entries.extend(page_entries);
+            } else {
+                // Uninitialized page — fill with undefined entries.
+                for _ in 0..entries_in_this_page {
+                    all_entries.push(FaRawEntry {
+                        address: u64::MAX,
+                        chunk_size: 0,
+                        filter_mask: 0,
+                    });
+                }
+            }
+        }
+
+        Ok(all_entries)
+    }
+}
+
+/// Read `count` entries from the cursor.
+fn read_entries(
+    cursor: &mut Cursor<'_>,
+    count: usize,
+    is_filtered: bool,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<FaRawEntry>> {
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let address = cursor.read_offset(offset_size)?;
+        let (chunk_size, filter_mask) = if is_filtered {
+            let cs = cursor.read_length(length_size)?;
+            let fm = cursor.read_u32_le()?;
+            (cs, fm)
+        } else {
+            (0, 0)
+        };
+        entries.push(FaRawEntry {
+            address,
+            chunk_size,
+            filter_mask,
+        });
+    }
+    Ok(entries)
+}
+
+/// Collect chunk entries from a Fixed Array index.
+///
+/// Reads the FAHD header and FADB data block, then converts linear entry
+/// indices to multi-dimensional chunk offsets.
+pub fn collect_fixed_array_chunk_entries(
+    data: &[u8],
+    header_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+) -> Result<Vec<ChunkEntry>> {
+    let header = parse_header(data, header_address, offset_size, length_size)?;
+
+    if Cursor::is_undefined_offset(header.data_block_address, offset_size) {
+        return Ok(Vec::new());
+    }
+
+    let raw_entries = parse_data_block(
+        data,
+        header.data_block_address,
+        &header,
+        offset_size,
+        length_size,
+    )?;
+
+    let ndim = dataset_shape.len();
+    let chunks_per_dim: Vec<u64> = (0..ndim)
+        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
+        .collect();
+
+    let mut entries = Vec::new();
+    for (linear_idx, raw) in raw_entries.iter().enumerate() {
+        // Skip undefined addresses (unallocated chunks).
+        if Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+
+        // Convert linear index to multi-dimensional chunk offsets.
+        let mut remaining = linear_idx as u64;
+        let mut offsets = vec![0u64; ndim];
+        for d in (0..ndim).rev() {
+            offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
+            remaining /= chunks_per_dim[d];
+        }
+
+        entries.push(ChunkEntry {
+            address: raw.address,
+            size: raw.chunk_size,
+            filter_mask: raw.filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fahd_bad_signature() {
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(b"XXXX");
+        let err = parse_header(&data, 0, 8, 8).unwrap_err();
+        assert!(matches!(err, Error::InvalidFixedArraySignature { .. }));
+    }
+
+    #[test]
+    fn test_fadb_bad_signature() {
+        let header = FaHeader {
+            client_id: 0,
+            _entry_size: 8,
+            page_bits: 0,
+            num_entries: 1,
+            data_block_address: 0,
+        };
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(b"XXXX");
+        let err = parse_data_block(&data, 0, &header, 8, 8).unwrap_err();
+        assert!(matches!(err, Error::InvalidFixedArraySignature { .. }));
+    }
+}
