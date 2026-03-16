@@ -838,12 +838,12 @@ impl<'f> Dataset<'f> {
         if let Some(elements) = T::decode_vec(raw, &self.datatype, n) {
             let elements = elements?;
             if shape.is_empty() {
-                return Ok(ArrayD::from_shape_vec(IxDyn(&[]), elements)
-                    .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?);
+                return ArrayD::from_shape_vec(IxDyn(&[]), elements)
+                    .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
 
-            return Ok(ArrayD::from_shape_vec(IxDyn(&shape), elements)
-                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?);
+            return ArrayD::from_shape_vec(IxDyn(&shape), elements)
+                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
         }
 
         let mut elements = Vec::with_capacity(n);
