@@ -66,7 +66,7 @@ pub fn parse(
     let layout = match version {
         1 | 2 => parse_v1_v2(cursor, offset_size, length_size, version)?,
         3 => parse_v3(cursor, offset_size, length_size)?,
-        4 => parse_v4(cursor, offset_size)?,
+        4 | 5 => parse_v4_v5(cursor, offset_size, version)?,
         v => return Err(Error::UnsupportedLayoutVersion(v)),
     };
 
@@ -206,7 +206,18 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
 // Version 4
 // ---------------------------------------------------------------------------
 
-fn parse_v4(cursor: &mut Cursor<'_>, offset_size: u8) -> Result<DataLayout> {
+/// Parse v4/v5 layout messages.
+///
+/// v4 (HDF5 1.10+): dimensionality = number of chunk dimensions. Element
+///   size is a separate field after the dimension values.
+///   Index types: 0=SingleChunk, 1=Implicit, 2=FixedArray, 3=ExtensibleArray, 4=BTreeV2
+///
+/// v5 (HDF5 2.0+): dimensionality = chunk dims + 1 (last value is element size,
+///   matching the internal `ndims+1` convention). Element size is NOT a
+///   separate field.
+///   Index types (H5D_chunk_index_t on-disk): 0=BTREE, 1=NONE/Implicit,
+///     2=SINGLE, 3=FARRAY, 4=EARRAY, 5=BT2
+fn parse_v4_v5(cursor: &mut Cursor<'_>, offset_size: u8, version: u8) -> Result<DataLayout> {
     let layout_class = cursor.read_u8()?;
 
     match layout_class {
@@ -223,64 +234,50 @@ fn parse_v4(cursor: &mut Cursor<'_>, offset_size: u8) -> Result<DataLayout> {
             Ok(DataLayout::Contiguous { address, size })
         }
         2 => {
-            // Chunked (v4 specific)
+            // Chunked
             let flags = cursor.read_u8()?;
-            let dimensionality = cursor.read_u8()? as usize;
+            let ndims_raw = cursor.read_u8()? as usize;
 
-            // Encoded dimension size (number of bytes per dim element minus 1)
+            // Encoded dimension size.
+            // v4: stored as (bytes_per_dim - 1), so dim_bytes = enc + 1.
+            // v5: stored as bytes_per_dim directly.
             let dim_size_enc = cursor.read_u8()?;
-            let dim_bytes = (dim_size_enc + 1) as usize;
+            let dim_bytes = if version >= 5 {
+                dim_size_enc as usize
+            } else {
+                (dim_size_enc + 1) as usize
+            };
 
-            // Read chunk dimensions
-            let mut dims = Vec::with_capacity(dimensionality);
-            for _ in 0..dimensionality {
-                dims.push(cursor.read_uvar(dim_bytes)? as u32);
-            }
-
-            // Encoded chunk size (type-size encoded in variable-width)
-            let element_size = cursor.read_uvar(dim_bytes)? as u32;
+            let (dims, element_size) = if version >= 5 {
+                // v5: ndims_raw includes element_size as the last "dimension".
+                // Read ndims_raw values; the last is element_size.
+                let actual_ndims = ndims_raw.saturating_sub(1);
+                let mut dims = Vec::with_capacity(actual_ndims);
+                for _ in 0..actual_ndims {
+                    dims.push(cursor.read_uvar(dim_bytes)? as u32);
+                }
+                let element_size = cursor.read_uvar(dim_bytes)? as u32;
+                (dims, element_size)
+            } else {
+                // v4: ndims_raw is the actual number of chunk dimensions.
+                // Element size is a separate field after the dims.
+                let mut dims = Vec::with_capacity(ndims_raw);
+                for _ in 0..ndims_raw {
+                    dims.push(cursor.read_uvar(dim_bytes)? as u32);
+                }
+                let element_size = cursor.read_uvar(dim_bytes)? as u32;
+                (dims, element_size)
+            };
 
             // Chunk indexing type
             let index_type = cursor.read_u8()?;
 
-            let chunk_indexing = match index_type {
-                0 => {
-                    // Single chunk
-                    let _idx_flags = if (flags & 0x01) != 0 {
-                        // Filters present — read filtered size + filter mask
-                        let filtered_size = cursor.read_u64_le()?;
-                        let filter_mask = cursor.read_u32_le()?;
-                        Some((filtered_size, filter_mask))
-                    } else {
-                        None
-                    };
-                    let (fs, fm) = _idx_flags.unwrap_or((0, 0));
-                    ChunkIndexing::SingleChunk {
-                        filtered_size: fs,
-                        filters: fm,
-                    }
-                }
-                1 => ChunkIndexing::Implicit,
-                2 => {
-                    // Fixed array
-                    let page_bits = cursor.read_u8()?;
-                    ChunkIndexing::FixedArray { page_bits }
-                }
-                3 => {
-                    // Extensible array
-                    let max_bits = cursor.read_u8()?;
-                    let index_bits = cursor.read_u8()?;
-                    let min_pointers = cursor.read_u8()?;
-                    let min_elements = cursor.read_u8()?;
-                    ChunkIndexing::ExtensibleArray {
-                        max_bits,
-                        index_bits,
-                        min_pointers,
-                        min_elements,
-                    }
-                }
-                4 => ChunkIndexing::BTreeV2,
-                t => return Err(Error::UnsupportedChunkIndexType(t)),
+            let chunk_indexing = if version >= 5 {
+                // v5 on-disk H5D_chunk_index_t values
+                parse_chunk_indexing_v5(cursor, flags, index_type)?
+            } else {
+                // v4 on-disk values
+                parse_chunk_indexing_v4(cursor, flags, index_type)?
             };
 
             // Address of the chunk index
@@ -294,6 +291,103 @@ fn parse_v4(cursor: &mut Cursor<'_>, offset_size: u8) -> Result<DataLayout> {
             })
         }
         c => Err(Error::UnsupportedLayoutClass(c)),
+    }
+}
+
+/// Parse chunk indexing for v4 layout.
+/// On-disk values: 0=SingleChunk, 1=Implicit, 2=FixedArray, 3=ExtensibleArray, 4=BTreeV2
+fn parse_chunk_indexing_v4(
+    cursor: &mut Cursor<'_>,
+    flags: u8,
+    index_type: u8,
+) -> Result<ChunkIndexing> {
+    match index_type {
+        0 => {
+            // Single chunk
+            let idx_flags = if (flags & 0x01) != 0 {
+                let filtered_size = cursor.read_u64_le()?;
+                let filter_mask = cursor.read_u32_le()?;
+                Some((filtered_size, filter_mask))
+            } else {
+                None
+            };
+            let (fs, fm) = idx_flags.unwrap_or((0, 0));
+            Ok(ChunkIndexing::SingleChunk {
+                filtered_size: fs,
+                filters: fm,
+            })
+        }
+        1 => Ok(ChunkIndexing::Implicit),
+        2 => {
+            let page_bits = cursor.read_u8()?;
+            Ok(ChunkIndexing::FixedArray { page_bits })
+        }
+        3 => {
+            let max_bits = cursor.read_u8()?;
+            let index_bits = cursor.read_u8()?;
+            let min_pointers = cursor.read_u8()?;
+            let min_elements = cursor.read_u8()?;
+            Ok(ChunkIndexing::ExtensibleArray {
+                max_bits,
+                index_bits,
+                min_pointers,
+                min_elements,
+            })
+        }
+        4 => Ok(ChunkIndexing::BTreeV2),
+        t => Err(Error::UnsupportedChunkIndexType(t)),
+    }
+}
+
+/// Parse chunk indexing for v5 layout (HDF5 2.0).
+/// On-disk H5D_chunk_index_t: 0=BTREE, 1=NONE, 2=SINGLE, 3=FARRAY, 4=EARRAY, 5=BT2
+fn parse_chunk_indexing_v5(
+    cursor: &mut Cursor<'_>,
+    flags: u8,
+    index_type: u8,
+) -> Result<ChunkIndexing> {
+    match index_type {
+        0 => Err(Error::InvalidData(
+            "v1 B-tree index type should not appear in v5 layout".into(),
+        )),
+        1 => Ok(ChunkIndexing::Implicit),
+        2 => {
+            // SINGLE
+            let idx_flags = if (flags & 0x01) != 0 {
+                let filtered_size = cursor.read_u64_le()?;
+                let filter_mask = cursor.read_u32_le()?;
+                Some((filtered_size, filter_mask))
+            } else {
+                None
+            };
+            let (fs, fm) = idx_flags.unwrap_or((0, 0));
+            Ok(ChunkIndexing::SingleChunk {
+                filtered_size: fs,
+                filters: fm,
+            })
+        }
+        3 => {
+            // FARRAY — Fixed Array
+            let page_bits = cursor.read_u8()?;
+            Ok(ChunkIndexing::FixedArray { page_bits })
+        }
+        4 => {
+            // EARRAY — Extensible Array
+            // v5 adds max_dblk_page_nelmts_bits as a 5th parameter.
+            let max_bits = cursor.read_u8()?;
+            let index_bits = cursor.read_u8()?;
+            let min_pointers = cursor.read_u8()?;
+            let min_elements = cursor.read_u8()?;
+            let _max_dblk_page_bits = cursor.read_u8()?;
+            Ok(ChunkIndexing::ExtensibleArray {
+                max_bits,
+                index_bits,
+                min_pointers,
+                min_elements,
+            })
+        }
+        5 => Ok(ChunkIndexing::BTreeV2),
+        t => Err(Error::UnsupportedChunkIndexType(t)),
     }
 }
 
