@@ -52,6 +52,7 @@ pub fn parse(
 }
 
 fn parse_v1(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result<AttributeMessage> {
+    let _reserved = cursor.read_u8()?;
     let name_size = cursor.read_u16_le()? as usize;
     let datatype_size = cursor.read_u16_le()? as usize;
     let dataspace_size = cursor.read_u16_le()? as usize;
@@ -192,6 +193,7 @@ mod tests {
 
         let mut data = vec![
             0x01, // version 1
+            0x00, // reserved
         ];
         // name size = 5 ("temp\0")
         data.extend_from_slice(&5u16.to_le_bytes());

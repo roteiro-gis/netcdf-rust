@@ -11,7 +11,7 @@ pub fn verify_and_strip(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     let payload = &data[..data.len() - 4];
-    let stored = u32::from_be_bytes([
+    let stored = u32::from_le_bytes([
         data[data.len() - 4],
         data[data.len() - 3],
         data[data.len() - 2],
@@ -38,7 +38,7 @@ mod tests {
         let payload = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let checksum = crate::checksum::fletcher32(&payload);
         let mut data = payload.clone();
-        data.extend_from_slice(&checksum.to_be_bytes());
+        data.extend_from_slice(&checksum.to_le_bytes());
         let result = verify_and_strip(&data).unwrap();
         assert_eq!(result, payload);
     }

@@ -76,20 +76,10 @@ impl Default for FilterRegistry {
 /// HDF5 stores filters in the order they were applied during writing.
 /// On read, we apply them in reverse order.
 ///
+/// If `registry` is `None`, the built-in filter set is used.
+///
 /// `filter_mask` is a bitmask where bit N being set means filter N should be skipped.
 pub fn apply_pipeline(
-    data: &[u8],
-    filters: &[FilterDescription],
-    filter_mask: u32,
-    element_size: usize,
-) -> Result<Vec<u8>> {
-    apply_pipeline_with_registry(data, filters, filter_mask, element_size, None)
-}
-
-/// Apply the filter pipeline using an optional custom registry.
-///
-/// If `registry` is `None`, the built-in filter set is used.
-pub fn apply_pipeline_with_registry(
     data: &[u8],
     filters: &[FilterDescription],
     filter_mask: u32,

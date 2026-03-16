@@ -35,6 +35,22 @@ use std::fs::File;
 use std::path::Path;
 
 use memmap2::Mmap;
+use ndarray::ArrayD;
+
+/// Trait alias for types readable from both classic and NetCDF-4 files.
+///
+/// This unifies `classic::data::NcReadType` (for CDF-1/2/5) and
+/// `hdf5_reader::H5Type` (for NetCDF-4/HDF5) so that `NcFile::read_variable`
+/// works across all formats with a single type parameter.
+#[cfg(feature = "netcdf4")]
+pub trait NcReadable: classic::data::NcReadType + hdf5_reader::H5Type {}
+#[cfg(feature = "netcdf4")]
+impl<T: classic::data::NcReadType + hdf5_reader::H5Type> NcReadable for T {}
+
+#[cfg(not(feature = "netcdf4"))]
+pub trait NcReadable: classic::data::NcReadType {}
+#[cfg(not(feature = "netcdf4"))]
+impl<T: classic::data::NcReadType> NcReadable for T {}
 
 /// NetCDF file format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +132,7 @@ impl NcFile {
                 #[cfg(feature = "netcdf4")]
                 {
                     let nc4 = nc4::Nc4File::open(path)?;
-                    // Check if it's classic model by looking for _nc3_strict attribute.
-                    let actual_format = if nc4.root_group().attribute("_nc3_strict").is_some() {
+                    let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
                         NcFormat::Nc4
@@ -153,7 +168,7 @@ impl NcFile {
                 #[cfg(feature = "netcdf4")]
                 {
                     let nc4 = nc4::Nc4File::from_bytes(data)?;
-                    let actual_format = if nc4.root_group().attribute("_nc3_strict").is_some() {
+                    let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
                         NcFormat::Nc4
@@ -223,6 +238,19 @@ impl NcFile {
         self.root_group()
             .attribute(name)
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
+    }
+
+    /// Read a variable's data as a typed array.
+    ///
+    /// Works for both classic (CDF-1/2/5) and NetCDF-4 files. The type
+    /// parameter `T` must implement `NcReadable`, which is satisfied by:
+    /// `i8, u8, i16, u16, i32, u32, i64, u64, f32, f64`.
+    pub fn read_variable<T: NcReadable>(&self, name: &str) -> Result<ArrayD<T>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable::<T>(name)?),
+        }
     }
 
     /// Access the underlying classic file (for reading data).

@@ -90,6 +90,12 @@ pub enum Error {
     #[error("invalid B-tree v2 signature: {context}")]
     InvalidBTreeV2Signature { context: &'static str },
 
+    #[error("invalid fixed array signature: {context}")]
+    InvalidFixedArraySignature { context: &'static str },
+
+    #[error("invalid extensible array signature: {context}")]
+    InvalidExtensibleArraySignature { context: &'static str },
+
     #[error("checksum mismatch: expected {expected:#010x}, got {actual:#010x}")]
     ChecksumMismatch { expected: u32, actual: u32 },
 

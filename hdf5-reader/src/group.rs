@@ -66,6 +66,21 @@ impl<'f> Group<'f> {
         &self.name
     }
 
+    /// Access the raw file data backing this group.
+    pub fn file_data(&self) -> &'f [u8] {
+        self.file_data
+    }
+
+    /// Size of file offsets in bytes.
+    pub fn offset_size(&self) -> u8 {
+        self.offset_size
+    }
+
+    /// Size of file lengths in bytes.
+    pub fn length_size(&self) -> u8 {
+        self.length_size
+    }
+
     /// Parse (or retrieve from cache) the object header at the given address.
     fn cached_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
         {

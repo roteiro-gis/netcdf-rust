@@ -9,6 +9,8 @@ pub mod superblock;
 pub mod btree_v1;
 pub mod btree_v2;
 pub mod chunk_index;
+pub mod extensible_array;
+pub mod fixed_array;
 pub mod fractal_heap;
 pub mod global_heap;
 pub mod local_heap;

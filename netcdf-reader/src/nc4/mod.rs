@@ -49,6 +49,18 @@ impl Nc4File {
         &self.root_group
     }
 
+    /// Check if this file uses the classic data model (`_nc3_strict`).
+    ///
+    /// This checks the raw HDF5 root group attributes (before the internal
+    /// attribute filter removes `_nc3_strict`).
+    pub fn is_classic_model(&self) -> bool {
+        self.hdf5
+            .root_group()
+            .ok()
+            .and_then(|g| g.attribute("_nc3_strict").ok())
+            .is_some()
+    }
+
     /// Read a variable's data as a typed array.
     ///
     /// Looks up the variable by name, then opens the HDF5 dataset at its
