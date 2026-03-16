@@ -22,7 +22,7 @@ const EASB_SIGNATURE: [u8; 4] = *b"EASB";
 #[derive(Debug)]
 struct EaHeader {
     client_id: u8,
-    _element_size: u8,
+    element_size: u8,
     _max_nelmts_bits: u8,
     idx_blk_elmts: u8,
     data_blk_min_elmts: u8,
@@ -91,7 +91,7 @@ fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> 
 
     Ok(EaHeader {
         client_id,
-        _element_size: element_size,
+        element_size,
         _max_nelmts_bits: max_nelmts_bits,
         idx_blk_elmts,
         data_blk_min_elmts,
@@ -134,12 +134,16 @@ fn read_entries(
     count: usize,
     is_filtered: bool,
     offset_size: u8,
-    chunk_size_len: u8,
+    entry_size: u8,
 ) -> Result<Vec<EaRawEntry>> {
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let address = cursor.read_offset(offset_size)?;
         let (chunk_size, filter_mask) = if is_filtered {
+            let chunk_size_len = entry_size
+                .checked_sub(offset_size)
+                .and_then(|remaining| remaining.checked_sub(4))
+                .ok_or_else(|| Error::InvalidData("invalid extensible array entry size".into()))?;
             let cs = cursor.read_length(chunk_size_len)?;
             let fm = cursor.read_u32_le()?;
             (cs, fm)
@@ -166,7 +170,7 @@ fn parse_data_block(
     is_filtered: bool,
     max_page_bits: u8,
     offset_size: u8,
-    chunk_size_len: u8,
+    entry_size: u8,
     sizeof_nelmts: usize,
 ) -> Result<Vec<EaRawEntry>> {
     let mut cursor = Cursor::new(data);
@@ -230,7 +234,7 @@ fn parse_data_block(
                     entries_in_page,
                     is_filtered,
                     offset_size,
-                    chunk_size_len,
+                    entry_size,
                 )?;
                 let _page_checksum = cursor.read_u32_le()?;
                 all_entries.extend(page_entries);
@@ -252,7 +256,7 @@ fn parse_data_block(
             num_entries,
             is_filtered,
             offset_size,
-            chunk_size_len,
+            entry_size,
         )?;
         let _checksum = cursor.read_u32_le()?;
         Ok(entries)
@@ -314,7 +318,6 @@ pub fn collect_extensible_array_chunk_entries(
     header_address: u64,
     offset_size: u8,
     length_size: u8,
-    chunk_size_len: u8,
     dataset_shape: &[u64],
     chunk_dims: &[u32],
 ) -> Result<Vec<ChunkEntry>> {
@@ -357,7 +360,7 @@ pub fn collect_extensible_array_chunk_entries(
         num_inline,
         is_filtered,
         offset_size,
-        chunk_size_len,
+        header.element_size,
     )?;
 
     // 2. Data block addresses stored directly in the index block.
@@ -431,7 +434,7 @@ pub fn collect_extensible_array_chunk_entries(
                     is_filtered,
                     header.max_dblk_page_nelmts_bits,
                     offset_size,
-                    chunk_size_len,
+                    header.element_size,
                     sizeof_nelmts,
                 )?;
                 all_entries.extend(dblk_entries);
@@ -493,7 +496,7 @@ pub fn collect_extensible_array_chunk_entries(
                     is_filtered,
                     header.max_dblk_page_nelmts_bits,
                     offset_size,
-                    chunk_size_len,
+                    header.element_size,
                     sizeof_nelmts,
                 )?;
                 all_entries.extend(dblk_entries);
@@ -547,7 +550,7 @@ mod tests {
     fn test_compute_super_block_layout() {
         let header = EaHeader {
             client_id: 0,
-            _element_size: 8,
+            element_size: 8,
             _max_nelmts_bits: 32,
             idx_blk_elmts: 2,
             data_blk_min_elmts: 2,

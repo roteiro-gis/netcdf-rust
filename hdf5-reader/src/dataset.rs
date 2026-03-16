@@ -171,7 +171,13 @@ impl<'f> Dataset<'f> {
     pub fn attributes(&self) -> Vec<Attribute> {
         self.attributes
             .iter()
-            .map(|a| Attribute::from_message(a.clone()))
+            .map(|a| {
+                Attribute::from_message_with_context(
+                    a.clone(),
+                    Some(self.file_data),
+                    self.offset_size,
+                )
+            })
             .collect()
     }
 
@@ -180,7 +186,13 @@ impl<'f> Dataset<'f> {
         self.attributes
             .iter()
             .find(|a| a.name == name)
-            .map(|a| Attribute::from_message(a.clone()))
+            .map(|a| {
+                Attribute::from_message_with_context(
+                    a.clone(),
+                    Some(self.file_data),
+                    self.offset_size,
+                )
+            })
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
     }
 
@@ -358,24 +370,22 @@ impl<'f> Dataset<'f> {
                 chunk_dims,
                 elem_size,
             )),
-            Some(ChunkIndexing::FixedArray { chunk_size_len, .. }) => {
+            Some(ChunkIndexing::FixedArray { .. }) => {
                 crate::fixed_array::collect_fixed_array_chunk_entries(
                     self.file_data,
                     index_address,
                     self.offset_size,
                     self.length_size,
-                    *chunk_size_len,
                     shape,
                     chunk_dims,
                 )
             }
-            Some(ChunkIndexing::ExtensibleArray { chunk_size_len, .. }) => {
+            Some(ChunkIndexing::ExtensibleArray { .. }) => {
                 crate::extensible_array::collect_extensible_array_chunk_entries(
                     self.file_data,
                     index_address,
                     self.offset_size,
                     self.length_size,
-                    *chunk_size_len,
                     shape,
                     chunk_dims,
                 )

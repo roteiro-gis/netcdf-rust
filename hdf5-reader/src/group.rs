@@ -189,7 +189,11 @@ impl<'f> Group<'f> {
         let mut attrs = Vec::new();
         for msg in &header.messages {
             if let HdfMessage::Attribute(attr) = msg {
-                attrs.push(Attribute::from_message(attr.clone()));
+                attrs.push(Attribute::from_message_with_context(
+                    attr.clone(),
+                    Some(self.file_data),
+                    self.offset_size,
+                ));
             }
         }
         Ok(attrs)

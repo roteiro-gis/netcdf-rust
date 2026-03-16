@@ -17,16 +17,37 @@ pub struct Attribute {
 impl Attribute {
     /// Create from a parsed attribute message.
     pub fn from_message(msg: AttributeMessage) -> Self {
+        Self::from_message_with_context(msg, None, 0)
+    }
+
+    /// Create from a parsed attribute message with optional file context for
+    /// resolving variable-length byte attributes stored in the global heap.
+    pub fn from_message_with_context(
+        msg: AttributeMessage,
+        file_data: Option<&[u8]>,
+        offset_size: u8,
+    ) -> Self {
         let shape = match msg.dataspace.dataspace_type {
             DataspaceType::Scalar => vec![],
             DataspaceType::Null => vec![0],
             DataspaceType::Simple => msg.dataspace.dims.clone(),
         };
+        let raw_data =
+            if let (Some(file_data), Datatype::VarLen { base }) = (file_data, &msg.datatype) {
+                if is_byte_vlen(base) && shape.is_empty() {
+                    resolve_vlen_bytes(&msg.raw_data, file_data, offset_size)
+                        .unwrap_or_else(|| msg.raw_data.clone())
+                } else {
+                    msg.raw_data.clone()
+                }
+            } else {
+                msg.raw_data.clone()
+            };
         Attribute {
             name: msg.name,
             datatype: msg.datatype,
             shape,
-            raw_data: msg.raw_data,
+            raw_data,
         }
     }
 
@@ -339,6 +360,28 @@ fn decode_varlen_byte_string(bytes: &[u8]) -> Result<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8(bytes[..end].to_vec())
         .map_err(|e| Error::InvalidData(format!("invalid string data: {e}")))
+}
+
+fn resolve_vlen_bytes(raw_data: &[u8], file_data: &[u8], offset_size: u8) -> Option<Vec<u8>> {
+    if raw_data.len() < 4 + offset_size as usize + 4 {
+        return None;
+    }
+
+    let mut cursor = Cursor::new(raw_data);
+    let seq_len = cursor.read_u32_le().ok()? as usize;
+    let heap_addr = cursor.read_offset(offset_size).ok()?;
+    let obj_index = cursor.read_u32_le().ok()? as u16;
+
+    if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut heap_cursor = Cursor::new(file_data);
+    heap_cursor.set_position(heap_addr);
+    let collection =
+        GlobalHeapCollection::parse(&mut heap_cursor, offset_size, offset_size).ok()?;
+    let object = collection.get_object(obj_index)?;
+    Some(object.data[..object.data.len().min(seq_len)].to_vec())
 }
 
 #[cfg(test)]
