@@ -249,11 +249,16 @@ impl<'f> Group<'f> {
                 }
             }
 
-            // If there's a link_info pointing to a fractal heap, resolve dense links
-            if children.is_empty() {
-                if let Some(ref li) = link_info {
-                    if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size) {
-                        children = self.resolve_dense_links(li)?;
+            // Dense-link storage can coexist with compact links, so merge both.
+            if let Some(ref li) = link_info {
+                if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size) {
+                    for child in self.resolve_dense_links(li)? {
+                        let is_duplicate = children.iter().any(|existing| {
+                            existing.name == child.name && existing.address == child.address
+                        });
+                        if !is_duplicate {
+                            children.push(child);
+                        }
                     }
                 }
             }
