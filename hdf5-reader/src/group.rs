@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::attribute_api::Attribute;
+use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::btree_v1;
 use crate::btree_v2;
 use crate::cache::ChunkCache;
@@ -189,17 +189,19 @@ impl<'f> Group<'f> {
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
         let mut header = (*self.cached_header(self.address)?).clone();
         header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
-        let mut attrs = Vec::new();
-        for msg in &header.messages {
-            if let HdfMessage::Attribute(attr) = msg {
-                attrs.push(Attribute::from_message_with_context(
-                    attr.clone(),
-                    Some(self.file_data),
-                    self.offset_size,
-                ));
-            }
-        }
-        Ok(attrs)
+        Ok(
+            collect_attribute_messages(
+                &header,
+                self.file_data,
+                self.offset_size,
+                self.length_size,
+            )?
+            .into_iter()
+            .map(|attr| {
+                Attribute::from_message_with_context(attr, Some(self.file_data), self.offset_size)
+            })
+            .collect(),
+        )
     }
 
     /// Find an attribute by name.

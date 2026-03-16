@@ -1,9 +1,14 @@
 use crate::error::{Error, Result};
+use crate::fractal_heap::FractalHeap;
 use crate::global_heap::GlobalHeapCollection;
 use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
+use crate::messages::attribute_info::AttributeInfoMessage;
 use crate::messages::dataspace::DataspaceType;
 use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringSize};
+use crate::messages::HdfMessage;
+use crate::object_header::ObjectHeader;
+use crate::{btree_v2, messages};
 
 /// A parsed, high-level HDF5 attribute.
 #[derive(Debug, Clone)]
@@ -294,6 +299,114 @@ impl Attribute {
             }),
         }
     }
+}
+
+pub(crate) fn collect_attribute_messages(
+    header: &ObjectHeader,
+    file_data: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>> {
+    let mut attributes = Vec::new();
+    let mut attribute_info = None;
+
+    for msg in &header.messages {
+        match msg {
+            HdfMessage::Attribute(attr) => attributes.push(attr.clone()),
+            HdfMessage::AttributeInfo(info) => attribute_info = Some(info.clone()),
+            _ => {}
+        }
+    }
+
+    if let Some(info) = attribute_info {
+        attributes.extend(load_dense_attribute_messages(
+            &info,
+            file_data,
+            offset_size,
+            length_size,
+        )?);
+    }
+
+    Ok(attributes)
+}
+
+fn load_dense_attribute_messages(
+    info: &AttributeInfoMessage,
+    file_data: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>> {
+    if Cursor::is_undefined_offset(info.fractal_heap_address, offset_size) {
+        return Ok(Vec::new());
+    }
+
+    let mut heap_cursor = Cursor::new(file_data);
+    heap_cursor.set_position(info.fractal_heap_address);
+    let heap = FractalHeap::parse(&mut heap_cursor, offset_size, length_size)?;
+
+    let records =
+        load_dense_attribute_records(info, file_data, offset_size, length_size).unwrap_or_default();
+
+    let mut attributes = Vec::new();
+    for record in records {
+        let heap_id = match record {
+            btree_v2::BTreeV2Record::AttributeNameHash { heap_id, .. }
+            | btree_v2::BTreeV2Record::AttributeCreationOrder { heap_id, .. } => heap_id,
+            _ => continue,
+        };
+
+        let managed_bytes =
+            match heap.get_managed_object(&heap_id, file_data, offset_size, length_size) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+
+        let mut attr_cursor = Cursor::new(&managed_bytes);
+        if let Ok(attr) = messages::attribute::parse(
+            &mut attr_cursor,
+            offset_size,
+            length_size,
+            managed_bytes.len(),
+        ) {
+            attributes.push(attr);
+        }
+    }
+
+    Ok(attributes)
+}
+
+fn load_dense_attribute_records(
+    info: &AttributeInfoMessage,
+    file_data: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<btree_v2::BTreeV2Record>> {
+    let mut addrs = vec![info.btree_name_index_address];
+    if let Some(creation_order_addr) = info.btree_creation_order_address {
+        addrs.push(creation_order_addr);
+    }
+
+    for addr in addrs {
+        if Cursor::is_undefined_offset(addr, offset_size) {
+            continue;
+        }
+
+        let mut btree_cursor = Cursor::new(file_data);
+        btree_cursor.set_position(addr);
+        let header =
+            match btree_v2::BTreeV2Header::parse(&mut btree_cursor, offset_size, length_size) {
+                Ok(header) => header,
+                Err(_) => continue,
+            };
+
+        if let Ok(records) =
+            btree_v2::collect_btree_v2_records(file_data, &header, offset_size, length_size, None)
+        {
+            return Ok(records);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 /// Read one variable-length string from a vlen reference in raw_data.

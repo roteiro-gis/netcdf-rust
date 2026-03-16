@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ndarray::{ArrayD, IxDyn};
 
-use crate::attribute_api::Attribute;
+use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
@@ -85,7 +85,7 @@ impl<'f> Dataset<'f> {
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
-        let mut attributes = Vec::new();
+        let attributes = collect_attribute_messages(&header, file_data, offset_size, length_size)?;
 
         for msg in header.messages {
             match msg {
@@ -94,7 +94,6 @@ impl<'f> Dataset<'f> {
                 HdfMessage::DataLayout(dl) => layout = Some(dl.layout),
                 HdfMessage::FillValue(fv) => fill_value = Some(fv),
                 HdfMessage::FilterPipeline(fp) => filter_pipeline = Some(fp),
-                HdfMessage::Attribute(attr) => attributes.push(attr),
                 _ => {}
             }
         }
