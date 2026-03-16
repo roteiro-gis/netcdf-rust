@@ -124,21 +124,33 @@ cargo test
 
 `netcdf-reader` includes a Criterion benchmark that compares this implementation
 against the C-backed [`netcdf`](https://github.com/georust/netcdf) crate on the
-generated NetCDF fixture set.
+checked-in fixtures plus larger generated benchmark fixtures.
 
 ```sh
-# Single-threaded metadata + full-read comparisons
+# Full benchmark matrix
 cargo bench -p netcdf-reader --bench compare_georust
 
-# Override the parallel read benchmark thread count
-BENCH_THREADS=4 cargo bench -p netcdf-reader --bench compare_georust
+# Restrict thread scaling cases
+BENCH_THREAD_LIST=1,2,4 cargo bench -p netcdf-reader --bench compare_georust
+
+# Summarize the latest Criterion results as a markdown table
+python3 scripts/criterion_summary.py
 ```
 
 Notes:
 - The benchmark uses `netcdf` with its `static` feature, so it builds a bundled
   `netcdf-c` stack instead of depending on a specific system HDF5 install.
-- Parallel cases are included to compare our native Rust implementation against
-  the C-backed baseline under concurrent read workloads.
+- The suite separates `open_only`, `metadata_reuse_handle`,
+  `read_full_reuse_handle`, `open_and_read_full`,
+  `slice_reuse_handle_hdf5_backend`, and parallel throughput workloads so setup
+  costs and steady-state read costs are visible independently.
+- Larger benchmark-only fixtures are generated at runtime, so the suite covers
+  both small checked-in files and more realistic compressed datasets.
+- Parallel cases include both independent `open + read` scaling against the
+  C-backed baseline and a `parallel_read_shared_cairn` case that measures our
+  shared-open-handle throughput directly.
+- The slice workload is NetCDF-4 only and uses the native HDF5 dataset API on
+  our side, because `netcdf-reader` does not yet expose high-level sliced reads.
 
 ## Known limitations
 
