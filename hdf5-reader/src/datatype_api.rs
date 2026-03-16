@@ -107,7 +107,9 @@ macro_rules! impl_h5type_int {
 
             fn decode_vec(raw: &[u8], dtype: &Datatype, count: usize) -> Option<Result<Vec<Self>>> {
                 match dtype {
-                    Datatype::FixedPoint { size, byte_order, .. } if *size as usize == $size => {
+                    Datatype::FixedPoint {
+                        size, byte_order, ..
+                    } if *size as usize == $size => {
                         let total_bytes = count.checked_mul($size)?;
                         if raw.len() < total_bytes {
                             return None;

@@ -284,10 +284,7 @@ impl<'f> Dataset<'f> {
     ///
     /// Non-chunked datasets fall back to `read_array`.
     #[cfg(feature = "rayon")]
-    pub fn read_array_in_pool<T: H5Type>(
-        &self,
-        pool: &rayon::ThreadPool,
-    ) -> Result<ArrayD<T>> {
+    pub fn read_array_in_pool<T: H5Type>(&self, pool: &rayon::ThreadPool) -> Result<ArrayD<T>> {
         match &self.layout {
             DataLayout::Chunked {
                 address,
@@ -439,16 +436,8 @@ impl<'f> Dataset<'f> {
             .par_iter()
             .map(|entry| {
                 self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                    .map(|data| {
-                        unsafe {
-                            flat.copy_chunk(
-                                &data,
-                                &entry.offsets,
-                                &chunk_shape,
-                                shape,
-                                elem_size,
-                            );
-                        }
+                    .map(|data| unsafe {
+                        flat.copy_chunk(&data, &entry.offsets, &chunk_shape, shape, elem_size);
                     })
             })
             .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -931,7 +920,6 @@ impl<'f> Dataset<'f> {
             vec![0u8; total_bytes]
         }
     }
-
 }
 
 fn normalize_layout(layout: DataLayout, dataspace: &DataspaceMessage) -> DataLayout {
@@ -1257,14 +1245,6 @@ mod tests {
             1,
         );
 
-        assert_eq!(
-            flat,
-            vec![
-                0, 0, 0, 0,
-                0, 1, 2, 3,
-                0, 4, 5, 6,
-                0, 0, 0, 0,
-            ]
-        );
+        assert_eq!(flat, vec![0, 0, 0, 0, 0, 1, 2, 3, 0, 4, 5, 6, 0, 0, 0, 0,]);
     }
 }
