@@ -18,7 +18,7 @@ lru = "0.12"
 tempfile = "3"
 
 [features]
-default = []
+default = ["rayon"]
 lz4 = ["dep:lz4_flex"]
 rayon = ["dep:rayon"]
 

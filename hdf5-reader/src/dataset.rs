@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use ndarray::{ArrayD, IxDyn};
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 
 use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::cache::{ChunkCache, ChunkKey};
@@ -17,6 +19,12 @@ use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::messages::layout::{ChunkIndexing, DataLayout};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
+
+#[cfg(feature = "rayon")]
+struct DecodedChunk {
+    offsets: Vec<u64>,
+    data: Arc<Vec<u8>>,
+}
 
 /// Hyperslab selection for reading slices of datasets.
 #[derive(Debug, Clone)]
@@ -222,6 +230,53 @@ impl<'f> Dataset<'f> {
         }
     }
 
+    /// Read the entire dataset using internal chunk-level parallelism when possible.
+    ///
+    /// Non-chunked datasets fall back to `read_array`.
+    #[cfg(feature = "rayon")]
+    pub fn read_array_parallel<T: H5Type>(&self) -> Result<ArrayD<T>> {
+        match &self.layout {
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            } => self.read_chunked_parallel::<T>(
+                *address,
+                dims,
+                *element_size,
+                chunk_indexing.as_ref(),
+            ),
+            _ => self.read_array::<T>(),
+        }
+    }
+
+    /// Read the entire dataset using the provided Rayon thread pool.
+    ///
+    /// Non-chunked datasets fall back to `read_array`.
+    #[cfg(feature = "rayon")]
+    pub fn read_array_in_pool<T: H5Type>(
+        &self,
+        pool: &rayon::ThreadPool,
+    ) -> Result<ArrayD<T>> {
+        match &self.layout {
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            } => pool.install(|| {
+                self.read_chunked_parallel::<T>(
+                    *address,
+                    dims,
+                    *element_size,
+                    chunk_indexing.as_ref(),
+                )
+            }),
+            _ => self.read_array::<T>(),
+        }
+    }
+
     /// Read a hyperslab of the dataset.
     pub fn read_slice<T: H5Type>(&self, selection: &SliceInfo) -> Result<ArrayD<T>> {
         if selection.selections.len() != self.ndim() {
@@ -291,21 +346,7 @@ impl<'f> Dataset<'f> {
         // Allocate output initialized from the dataset's fill value.
         let total_elements = self.num_elements() as usize;
         let total_bytes = total_elements * elem_size;
-        let mut flat_data = if let Some(ref fv) = self.fill_value {
-            if let Some(ref fill_bytes) = fv.value {
-                let mut buf = vec![0u8; total_bytes];
-                if !fill_bytes.is_empty() {
-                    for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
-                        chunk.copy_from_slice(fill_bytes);
-                    }
-                }
-                buf
-            } else {
-                vec![0u8; total_bytes]
-            }
-        } else {
-            vec![0u8; total_bytes]
-        };
+        let mut flat_data = self.make_output_buffer(total_bytes);
 
         let entries = self.collect_all_chunk_entries(
             index_address,
@@ -317,14 +358,69 @@ impl<'f> Dataset<'f> {
         )?;
 
         for entry in &entries {
-            self.assemble_chunk(
-                entry,
-                index_address,
+            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+            copy_chunk_to_flat(
+                &chunk_data,
+                &mut flat_data,
+                &entry.offsets,
                 &chunk_shape,
                 shape,
                 elem_size,
+            );
+        }
+
+        self.decode_raw_data::<T>(&flat_data)
+    }
+
+    #[cfg(feature = "rayon")]
+    fn read_chunked_parallel<T: H5Type>(
+        &self,
+        index_address: u64,
+        chunk_dims: &[u32],
+        _element_size: u32,
+        chunk_indexing: Option<&ChunkIndexing>,
+    ) -> Result<ArrayD<T>> {
+        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+            return self.make_fill_array::<T>();
+        }
+
+        let ndim = self.ndim();
+        let shape = &self.dataspace.dims;
+        let elem_size = dtype_element_size(&self.datatype);
+        let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        let total_elements = self.num_elements() as usize;
+        let total_bytes = total_elements * elem_size;
+        let mut flat_data = self.make_output_buffer(total_bytes);
+
+        let entries = self.collect_all_chunk_entries(
+            index_address,
+            chunk_dims,
+            chunk_indexing,
+            shape,
+            ndim,
+            elem_size,
+        )?;
+
+        let decoded_chunks: Vec<DecodedChunk> = entries
+            .par_iter()
+            .map(|entry| {
+                self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)
+                    .map(|data| DecodedChunk {
+                        offsets: entry.offsets.clone(),
+                        data,
+                    })
+            })
+            .collect::<std::result::Result<Vec<_>, Error>>()?;
+
+        for chunk in decoded_chunks {
+            copy_chunk_to_flat(
+                &chunk.data,
                 &mut flat_data,
-            )?;
+                &chunk.offsets,
+                &chunk_shape,
+                shape,
+                elem_size,
+            );
         }
 
         self.decode_raw_data::<T>(&flat_data)
@@ -431,61 +527,46 @@ impl<'f> Dataset<'f> {
         Ok(entries)
     }
 
-    /// Read, decompress, and copy a single chunk into the flat output buffer.
-    fn assemble_chunk(
+    fn load_chunk_data(
         &self,
         entry: &chunk_index::ChunkEntry,
         dataset_addr: u64,
         chunk_shape: &[u64],
-        shape: &[u64],
         elem_size: usize,
-        flat_data: &mut [u8],
-    ) -> Result<()> {
+    ) -> Result<Arc<Vec<u8>>> {
         let cache_key = ChunkKey {
             dataset_addr,
             chunk_offsets: entry.offsets.clone(),
         };
 
-        let chunk_data = if let Some(cached) = self.chunk_cache.get(&cache_key) {
-            cached
+        if let Some(cached) = self.chunk_cache.get(&cache_key) {
+            return Ok(cached);
+        }
+
+        let addr = entry.address as usize;
+        let size = if entry.size > 0 {
+            entry.size as usize
         } else {
-            let addr = entry.address as usize;
-            // Determine on-disk size: use entry.size if nonzero, otherwise
-            // compute from uncompressed chunk volume.
-            let size = if entry.size > 0 {
-                entry.size as usize
-            } else {
-                chunk_shape.iter().product::<u64>() as usize * elem_size
-            };
-            if addr + size > self.file_data.len() {
-                return Err(Error::OffsetOutOfBounds(entry.address));
-            }
-            let raw = &self.file_data[addr..addr + size];
+            chunk_shape.iter().product::<u64>() as usize * elem_size
+        };
+        if addr + size > self.file_data.len() {
+            return Err(Error::OffsetOutOfBounds(entry.address));
+        }
+        let raw = &self.file_data[addr..addr + size];
 
-            let decoded = if let Some(ref pipeline) = self.filters {
-                filters::apply_pipeline(
-                    raw,
-                    &pipeline.filters,
-                    entry.filter_mask,
-                    elem_size,
-                    Some(&self.filter_registry),
-                )?
-            } else {
-                raw.to_vec()
-            };
-
-            self.chunk_cache.insert(cache_key, decoded)
+        let decoded = if let Some(ref pipeline) = self.filters {
+            filters::apply_pipeline(
+                raw,
+                &pipeline.filters,
+                entry.filter_mask,
+                elem_size,
+                Some(&self.filter_registry),
+            )?
+        } else {
+            raw.to_vec()
         };
 
-        copy_chunk_to_flat(
-            &chunk_data,
-            flat_data,
-            &entry.offsets,
-            chunk_shape,
-            shape,
-            elem_size,
-        );
-        Ok(())
+        Ok(self.chunk_cache.insert(cache_key, decoded))
     }
 
     /// Chunked slice: only read chunks that overlap the selection.
@@ -800,6 +881,24 @@ impl<'f> Dataset<'f> {
         } else {
             Ok(ArrayD::from_shape_vec(IxDyn(&shape), elements)
                 .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
+        }
+    }
+
+    fn make_output_buffer(&self, total_bytes: usize) -> Vec<u8> {
+        if let Some(ref fv) = self.fill_value {
+            if let Some(ref fill_bytes) = fv.value {
+                let mut buf = vec![0u8; total_bytes];
+                if !fill_bytes.is_empty() {
+                    for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
+                        chunk.copy_from_slice(fill_bytes);
+                    }
+                }
+                buf
+            } else {
+                vec![0u8; total_bytes]
+            }
+        } else {
+            vec![0u8; total_bytes]
         }
     }
 }

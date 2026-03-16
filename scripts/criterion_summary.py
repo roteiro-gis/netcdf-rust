@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 
 
@@ -27,7 +28,15 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Benchmark group(s) to include; repeat to include multiple",
     )
+    parser.add_argument(
+        "--speedup",
+        action="store_true",
+        help="Include speedup vs the x1 baseline for threaded benchmark names like impl_x4",
+    )
     return parser.parse_args()
+
+
+THREAD_SUFFIX_RE = re.compile(r"^(?P<family>.+)_x(?P<threads>\d+)$")
 
 
 def iter_results(root: Path):
@@ -72,11 +81,15 @@ def format_bytes_per_second(bytes_per_second: float) -> str:
     return f"{value:.2f} {unit}"
 
 
-def render_markdown(rows):
-    print("| Workload | Implementation | Case | Median | Throughput |")
-    print("| --- | --- | --- | ---: | ---: |")
+def render_markdown(rows, include_speedup: bool):
+    if include_speedup:
+        print("| Workload | Implementation | Case | Median | Throughput | Speedup vs x1 |")
+        print("| --- | --- | --- | ---: | ---: | ---: |")
+    else:
+        print("| Workload | Implementation | Case | Median | Throughput |")
+        print("| --- | --- | --- | ---: | ---: |")
     for row in rows:
-        print(
+        base = (
             "| {group} | {implementation} | {case} | {median} | {throughput} |".format(
                 group=row["group"],
                 implementation=row["implementation"],
@@ -85,20 +98,59 @@ def render_markdown(rows):
                 throughput=row["throughput_display"],
             )
         )
+        if include_speedup:
+            print(f"{base} {row['speedup_display']} |")
+        else:
+            print(base)
 
 
-def render_csv(rows):
-    print("group,implementation,case,median_ns,throughput_bytes_per_second")
+def render_csv(rows, include_speedup: bool):
+    columns = ["group", "implementation", "case", "median_ns", "throughput_bytes_per_second"]
+    if include_speedup:
+        columns.append("speedup_vs_x1")
+    print(",".join(columns))
     for row in rows:
-        print(
-            "{group},{implementation},{case},{median_ns:.1f},{throughput}".format(
-                group=row["group"],
-                implementation=row["implementation"],
-                case=row["case"],
-                median_ns=row["median_ns"],
-                throughput="" if row["throughput_bps"] is None else f"{row['throughput_bps']:.3f}",
-            )
-        )
+        values = [
+            row["group"],
+            row["implementation"],
+            row["case"],
+            f"{row['median_ns']:.1f}",
+            "" if row["throughput_bps"] is None else f"{row['throughput_bps']:.3f}",
+        ]
+        if include_speedup:
+            values.append("" if row["speedup"] is None else f"{row['speedup']:.3f}")
+        print(",".join(values))
+
+
+def annotate_speedups(rows):
+    baselines = {}
+    for row in rows:
+        match = THREAD_SUFFIX_RE.match(row["implementation"])
+        if not match:
+            continue
+        family = match.group("family")
+        threads = int(match.group("threads"))
+        if threads == 1:
+            baselines[(row["group"], row["case"], family)] = row
+
+    for row in rows:
+        row["speedup"] = None
+        row["speedup_display"] = "-"
+        match = THREAD_SUFFIX_RE.match(row["implementation"])
+        if not match:
+            continue
+        family = match.group("family")
+        baseline = baselines.get((row["group"], row["case"], family))
+        if baseline is None:
+            continue
+
+        if row["throughput_bps"] is not None and baseline["throughput_bps"] is not None:
+            speedup = row["throughput_bps"] / baseline["throughput_bps"]
+        else:
+            speedup = baseline["median_ns"] / row["median_ns"]
+
+        row["speedup"] = speedup
+        row["speedup_display"] = f"{speedup:.2f}x"
 
 
 def main() -> int:
@@ -124,11 +176,13 @@ def main() -> int:
         rows.append(result)
 
     rows.sort(key=lambda row: (row["group"], row["case"], row["implementation"]))
+    if args.speedup:
+        annotate_speedups(rows)
 
     if args.format == "markdown":
-        render_markdown(rows)
+        render_markdown(rows, args.speedup)
     else:
-        render_csv(rows)
+        render_csv(rows, args.speedup)
 
     return 0
 

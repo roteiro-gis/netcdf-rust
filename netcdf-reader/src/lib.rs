@@ -36,6 +36,8 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use ndarray::ArrayD;
+#[cfg(feature = "rayon")]
+use rayon::ThreadPool;
 
 /// Trait alias for types readable from both classic and NetCDF-4 files.
 ///
@@ -258,6 +260,34 @@ impl NcFile {
             NcFileInner::Classic(c) => c.read_variable::<T>(name),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable::<T>(name)?),
+        }
+    }
+
+    /// Read a variable using internal chunk-level parallelism when available.
+    ///
+    /// Classic formats fall back to `read_variable`.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_parallel<T: NcReadable>(&self, name: &str) -> Result<ArrayD<T>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable_parallel::<T>(name)?),
+        }
+    }
+
+    /// Read a variable using the provided Rayon thread pool when available.
+    ///
+    /// Classic formats fall back to `read_variable`.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_in_pool<T: NcReadable>(
+        &self,
+        name: &str,
+        pool: &ThreadPool,
+    ) -> Result<ArrayD<T>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable_in_pool::<T>(name, pool)?),
         }
     }
 

@@ -6,6 +6,7 @@ use std::thread;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use ndarray::ArrayD;
+use rayon::ThreadPoolBuilder;
 use tempfile::TempDir;
 
 use netcdf_reader::{NcFile, NcGroup};
@@ -358,6 +359,17 @@ fn full_read_checksum_cairn_file(file: &NcFile, case: &BenchCase) -> u64 {
     }
 }
 
+fn full_read_checksum_cairn_file_in_pool(
+    file: &NcFile,
+    case: &BenchCase,
+    pool: &rayon::ThreadPool,
+) -> u64 {
+    match case.kind {
+        NumericKind::F32 => checksum_f32(&file.read_variable_in_pool::<f32>(case.variable, pool).unwrap()),
+        NumericKind::F64 => checksum_f64(&file.read_variable_in_pool::<f64>(case.variable, pool).unwrap()),
+    }
+}
+
 fn full_read_checksum_cairn(path: &Path, case: &BenchCase) -> u64 {
     let file = NcFile::open(path).unwrap();
     full_read_checksum_cairn_file(&file, case)
@@ -410,6 +422,24 @@ fn slice_checksum_cairn_dataset(dataset: &hdf5_reader::Dataset<'_>, case: &Bench
     match case.kind {
         NumericKind::F32 => checksum_f32(&dataset.read_slice::<f32>(&selection).unwrap()),
         NumericKind::F64 => checksum_f64(&dataset.read_slice::<f64>(&selection).unwrap()),
+    }
+}
+
+fn full_read_checksum_cairn_dataset(dataset: &hdf5_reader::Dataset<'_>, case: &BenchCase) -> u64 {
+    match case.kind {
+        NumericKind::F32 => checksum_f32(&dataset.read_array::<f32>().unwrap()),
+        NumericKind::F64 => checksum_f64(&dataset.read_array::<f64>().unwrap()),
+    }
+}
+
+fn full_read_checksum_cairn_dataset_in_pool(
+    dataset: &hdf5_reader::Dataset<'_>,
+    case: &BenchCase,
+    pool: &rayon::ThreadPool,
+) -> u64 {
+    match case.kind {
+        NumericKind::F32 => checksum_f32(&dataset.read_array_in_pool::<f32>(pool).unwrap()),
+        NumericKind::F64 => checksum_f64(&dataset.read_array_in_pool::<f64>(pool).unwrap()),
     }
 }
 
@@ -612,6 +642,20 @@ fn validate_cases() {
                 case.id
             );
 
+            if case.is_netcdf4 {
+                let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+                let cairn_parallel = full_read_checksum_cairn_file_in_pool(
+                    &NcFile::open(&path).unwrap(),
+                    case,
+                    &pool,
+                );
+                assert_eq!(
+                    cairn_full, cairn_parallel,
+                    "parallel full-read checksum mismatch for {}",
+                    case.id
+                );
+            }
+
             let cairn_metadata = metadata_cairn(&path);
             let georust_metadata = metadata_georust(&path);
             assert!(
@@ -794,11 +838,45 @@ fn bench_parallel_read_shared_cairn(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_read_full_internal_parallel(c: &mut Criterion) {
+    validate_cases();
+    let mut group = c.benchmark_group("read_full_internal_parallel");
+
+    for case in CASES
+        .iter()
+        .filter(|case| matches!(case.id, "nc4_compressed" | "large_nc4_compressed"))
+    {
+        let path = case_path(case);
+        let cairn_file = Hdf5File::open(&path).unwrap();
+        let dataset = cairn_file.dataset(&variable_hdf5_path(case.variable)).unwrap();
+        let georust = netcdf::open(&path).unwrap();
+        group.throughput(Throughput::Bytes(case_bytes(case) as u64));
+
+        group.bench_function(BenchmarkId::new("cairn_x1", case.id), |b| {
+            b.iter(|| black_box(full_read_checksum_cairn_dataset(&dataset, case)));
+        });
+
+        group.bench_function(BenchmarkId::new("georust_x1", case.id), |b| {
+            b.iter(|| black_box(full_read_checksum_georust_file(&georust, case)));
+        });
+
+        for threads in thread_counts().into_iter().filter(|threads| *threads > 1) {
+            let pool = ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            group.bench_function(BenchmarkId::new(format!("cairn_x{threads}"), case.id), |b| {
+                b.iter(|| black_box(full_read_checksum_cairn_dataset_in_pool(&dataset, case, &pool)));
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_open_only,
     bench_metadata_reuse_handle,
     bench_read_full_reuse_handle,
+    bench_read_full_internal_parallel,
     bench_open_and_read_full,
     bench_slice_reuse_handle,
     bench_parallel_open_and_read,

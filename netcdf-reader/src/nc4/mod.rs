@@ -19,6 +19,8 @@ use std::path::Path;
 use hdf5_reader::datatype_api::H5Type;
 use hdf5_reader::Hdf5File;
 use ndarray::ArrayD;
+#[cfg(feature = "rayon")]
+use rayon::ThreadPool;
 
 use crate::error::{Error, Result};
 use crate::types::NcGroup;
@@ -77,6 +79,38 @@ impl Nc4File {
         debug_assert_eq!(dataset.shape(), &var.shape()[..]);
 
         Ok(dataset.read_array::<T>()?)
+    }
+
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_parallel<T: H5Type>(&self, path: &str) -> Result<ArrayD<T>> {
+        let normalized = normalize_dataset_path(path)?;
+        let var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+
+        debug_assert_eq!(dataset.shape(), &var.shape()[..]);
+
+        Ok(dataset.read_array_parallel::<T>()?)
+    }
+
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_in_pool<T: H5Type>(
+        &self,
+        path: &str,
+        pool: &ThreadPool,
+    ) -> Result<ArrayD<T>> {
+        let normalized = normalize_dataset_path(path)?;
+        let var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+
+        debug_assert_eq!(dataset.shape(), &var.shape()[..]);
+
+        Ok(dataset.read_array_in_pool::<T>(pool)?)
     }
 }
 

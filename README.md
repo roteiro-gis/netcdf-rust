@@ -135,6 +135,11 @@ BENCH_THREAD_LIST=1,2,4 cargo bench -p netcdf-reader --bench compare_georust
 
 # Summarize the latest Criterion results as a markdown table
 python3 scripts/criterion_summary.py
+
+# Include x1-relative speedup for threaded workloads
+python3 scripts/criterion_summary.py --speedup \
+  --group read_full_internal_parallel \
+  --group parallel_open_and_read
 ```
 
 Notes:
@@ -142,13 +147,17 @@ Notes:
   `netcdf-c` stack instead of depending on a specific system HDF5 install.
 - The suite separates `open_only`, `metadata_reuse_handle`,
   `read_full_reuse_handle`, `open_and_read_full`,
-  `slice_reuse_handle_hdf5_backend`, and parallel throughput workloads so setup
-  costs and steady-state read costs are visible independently.
+  `read_full_internal_parallel`, `slice_reuse_handle_hdf5_backend`, and
+  parallel throughput workloads so setup costs and steady-state read costs are
+  visible independently.
 - Larger benchmark-only fixtures are generated at runtime, so the suite covers
   both small checked-in files and more realistic compressed datasets.
 - Parallel cases include both independent `open + read` scaling against the
   C-backed baseline and a `parallel_read_shared_cairn` case that measures our
   shared-open-handle throughput directly.
+- `read_full_internal_parallel` measures one large chunked read with internal
+  chunk-level Rayon parallelism, which is distinct from the independent-read
+  throughput cases.
 - The slice workload is NetCDF-4 only and uses the native HDF5 dataset API on
   our side, because `netcdf-reader` does not yet expose high-level sliced reads.
 
