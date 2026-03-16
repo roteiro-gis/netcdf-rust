@@ -298,10 +298,10 @@ def generate_netcdf3_fixtures(base_dir):
     path = os.path.join(nc3_dir, "global_attrs.nc")
     print(f"  Generating {path}")
     ds = netCDF4.Dataset(path, "w", format="NETCDF3_CLASSIC")
-    ds.title = "Global Attributes Test"
-    ds.version = np.int32(2)
-    ds.scale = np.float64(1.5)
-    ds.history = "created for testing"
+    ds.setncattr("title", "Global Attributes Test")
+    ds.setncattr("version", np.int32(2))
+    ds.setncattr("scale", np.float64(1.5))
+    ds.setncattr("history", "created for testing")
     ds.createDimension("x", 1)
     dummy = ds.createVariable("dummy", "i4", ("x",))
     dummy[:] = np.array([0], dtype=np.int32)
