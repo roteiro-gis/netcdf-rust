@@ -10,6 +10,8 @@
 //! Unlimited dimensions are represented by chunked datasets whose maximum
 //! dimension in the dataspace is `H5S_UNLIMITED`.
 
+use std::collections::HashMap;
+
 use hdf5_reader::group::Group;
 
 use crate::error::Result;
@@ -17,16 +19,21 @@ use crate::types::NcDimension;
 
 /// Extract dimensions from an HDF5 group.
 ///
-/// This scans the group's datasets for those that are dimension scales
-/// (have `CLASS=DIMENSION_SCALE` attribute) and constructs `NcDimension`
-/// entries from them.
-pub fn extract_dimensions(group: &Group<'_>) -> Result<Vec<NcDimension>> {
+/// Returns a tuple of:
+/// - The list of dimensions (sorted by `_Netcdf4Dimid` if available)
+/// - A map from dataset object-header address to the corresponding dimension
+///
+/// The address map is used by `extract_variables` to resolve `DIMENSION_LIST`
+/// references back to the correct dimension by address rather than by size.
+pub fn extract_dimensions(
+    group: &Group<'_>,
+) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let datasets = match group.datasets() {
         Ok(ds) => ds,
-        Err(_) => return Ok(Vec::new()),
+        Err(_) => return Ok((Vec::new(), HashMap::new())),
     };
 
-    let mut dims: Vec<(Option<i64>, NcDimension)> = Vec::new();
+    let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
 
     for ds in &datasets {
         // Check for CLASS=DIMENSION_SCALE attribute
@@ -73,6 +80,8 @@ pub fn extract_dimensions(group: &Group<'_>) -> Result<Vec<NcDimension>> {
             .and_then(|attr| attr.read_scalar::<i32>().ok())
             .map(|id| id as i64);
 
+        let address = ds.address();
+
         dims.push((
             dimid,
             NcDimension {
@@ -80,11 +89,17 @@ pub fn extract_dimensions(group: &Group<'_>) -> Result<Vec<NcDimension>> {
                 size,
                 is_unlimited,
             },
+            address,
         ));
     }
 
     // Sort by _Netcdf4Dimid if available, otherwise preserve order
-    dims.sort_by_key(|(id, _)| id.unwrap_or(i64::MAX));
+    dims.sort_by_key(|(id, _, _)| id.unwrap_or(i64::MAX));
 
-    Ok(dims.into_iter().map(|(_, d)| d).collect())
+    let addr_map: HashMap<u64, NcDimension> =
+        dims.iter().map(|(_, d, addr)| (*addr, d.clone())).collect();
+
+    let dim_list: Vec<NcDimension> = dims.into_iter().map(|(_, d, _)| d).collect();
+
+    Ok((dim_list, addr_map))
 }

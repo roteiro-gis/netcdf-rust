@@ -25,10 +25,11 @@ fn build_group_recursive(
     name: &str,
 ) -> Result<NcGroup> {
     // Extract dimensions from dimension-scale datasets in this group.
-    let dimensions = dimensions::extract_dimensions(hdf5_group)?;
+    // Also get the address map for DIMENSION_LIST resolution.
+    let (dimensions, dim_addr_map) = dimensions::extract_dimensions(hdf5_group)?;
 
     // Extract variables (non-dimension-scale datasets).
-    let variables = variables::extract_variables(hdf5_group, &dimensions)?;
+    let variables = variables::extract_variables(hdf5_group, &dimensions, &dim_addr_map)?;
 
     // Extract group-level attributes, filtering internal NetCDF-4 attributes.
     let nc_attributes = attributes::extract_group_attributes(hdf5_group)?;
