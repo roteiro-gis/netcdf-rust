@@ -15,6 +15,8 @@ hdf5-reader = { path = "../hdf5-reader", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+criterion = "0.5"
+netcdf = { version = "0.12", features = ["static"] }
 
 [features]
 default = ["netcdf4"]
@@ -24,3 +26,7 @@ cf = ["dep:chrono"]
 [dependencies.chrono]
 version = "0.4"
 optional = true
+
+[[bench]]
+name = "compare_georust"
+harness = false

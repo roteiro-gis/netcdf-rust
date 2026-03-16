@@ -120,6 +120,26 @@ python testdata/generate_fixtures.py
 cargo test
 ```
 
+## Benchmarks
+
+`netcdf-reader` includes a Criterion benchmark that compares this implementation
+against the C-backed [`netcdf`](https://github.com/georust/netcdf) crate on the
+generated NetCDF fixture set.
+
+```sh
+# Single-threaded metadata + full-read comparisons
+cargo bench -p netcdf-reader --bench compare_georust
+
+# Override the parallel read benchmark thread count
+BENCH_THREADS=4 cargo bench -p netcdf-reader --bench compare_georust
+```
+
+Notes:
+- The benchmark uses `netcdf` with its `static` feature, so it builds a bundled
+  `netcdf-c` stack instead of depending on a specific system HDF5 install.
+- Parallel cases are included to compare our native Rust implementation against
+  the C-backed baseline under concurrent read workloads.
+
 ## Known limitations
 
 - Soft and external HDF5 links are skipped
