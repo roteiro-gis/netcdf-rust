@@ -20,7 +20,7 @@ const FADB_SIGNATURE: [u8; 4] = *b"FADB";
 #[derive(Debug)]
 struct FaHeader {
     client_id: u8,
-    _entry_size: u8,
+    entry_size: u8,
     page_bits: u8,
     num_entries: u64,
     data_block_address: u64,
@@ -51,7 +51,7 @@ fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> 
     }
 
     let client_id = cursor.read_u8()?;
-    let _entry_size = cursor.read_u8()?;
+    let entry_size = cursor.read_u8()?;
     let page_bits = cursor.read_u8()?;
     let num_entries = cursor.read_length(length_size)?;
     let data_block_address = cursor.read_offset(offset_size)?;
@@ -70,7 +70,7 @@ fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> 
 
     Ok(FaHeader {
         client_id,
-        _entry_size,
+        entry_size,
         page_bits,
         num_entries,
         data_block_address,
@@ -91,7 +91,6 @@ fn parse_data_block(
     address: u64,
     header: &FaHeader,
     offset_size: u8,
-    length_size: u8,
 ) -> Result<Vec<FaRawEntry>> {
     let mut cursor = Cursor::new(data);
     cursor.set_position(address);
@@ -127,7 +126,7 @@ fn parse_data_block(
             num_entries,
             is_filtered,
             offset_size,
-            length_size,
+            header.entry_size,
         )?;
         // Skip the trailing checksum (already verified structurally).
         let _checksum = cursor.read_u32_le()?;
@@ -168,7 +167,7 @@ fn parse_data_block(
                     entries_in_this_page,
                     is_filtered,
                     offset_size,
-                    length_size,
+                    header.entry_size,
                 )?;
                 // Each page has its own checksum.
                 let _page_checksum = cursor.read_u32_le()?;
@@ -195,13 +194,17 @@ fn read_entries(
     count: usize,
     is_filtered: bool,
     offset_size: u8,
-    length_size: u8,
+    entry_size: u8,
 ) -> Result<Vec<FaRawEntry>> {
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let address = cursor.read_offset(offset_size)?;
         let (chunk_size, filter_mask) = if is_filtered {
-            let cs = cursor.read_length(length_size)?;
+            let chunk_size_len = entry_size
+                .checked_sub(offset_size)
+                .and_then(|remaining| remaining.checked_sub(4))
+                .ok_or_else(|| Error::InvalidData("invalid fixed array entry size".into()))?;
+            let cs = cursor.read_length(chunk_size_len)?;
             let fm = cursor.read_u32_le()?;
             (cs, fm)
         } else {
@@ -234,13 +237,7 @@ pub fn collect_fixed_array_chunk_entries(
         return Ok(Vec::new());
     }
 
-    let raw_entries = parse_data_block(
-        data,
-        header.data_block_address,
-        &header,
-        offset_size,
-        length_size,
-    )?;
+    let raw_entries = parse_data_block(data, header.data_block_address, &header, offset_size)?;
 
     let ndim = dataset_shape.len();
     let chunks_per_dim: Vec<u64> = (0..ndim)
@@ -289,14 +286,14 @@ mod tests {
     fn test_fadb_bad_signature() {
         let header = FaHeader {
             client_id: 0,
-            _entry_size: 8,
+            entry_size: 8,
             page_bits: 0,
             num_entries: 1,
             data_block_address: 0,
         };
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
-        let err = parse_data_block(&data, 0, &header, 8, 8).unwrap_err();
+        let err = parse_data_block(&data, 0, &header, 8).unwrap_err();
         assert!(matches!(err, Error::InvalidFixedArraySignature { .. }));
     }
 }

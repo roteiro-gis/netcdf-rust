@@ -10,6 +10,8 @@ relative to this script's location.
 """
 
 import os
+import subprocess
+import sys
 import numpy as np
 
 
@@ -298,10 +300,10 @@ def generate_netcdf3_fixtures(base_dir):
     path = os.path.join(nc3_dir, "global_attrs.nc")
     print(f"  Generating {path}")
     ds = netCDF4.Dataset(path, "w", format="NETCDF3_CLASSIC")
-    ds.title = "Global Attributes Test"
-    ds.version = np.int32(2)
-    ds.scale = np.float64(1.5)
-    ds.history = "created for testing"
+    ds.setncattr("title", "Global Attributes Test")
+    ds.setncattr("version", np.int32(2))
+    ds.setncattr("scale", np.float64(1.5))
+    ds.setncattr("history", "created for testing")
     ds.createDimension("x", 1)
     dummy = ds.createVariable("dummy", "i4", ("x",))
     dummy[:] = np.array([0], dtype=np.int32)
@@ -320,7 +322,6 @@ def generate_netcdf4_fixtures(base_dir):
     path = os.path.join(nc4_dir, "nc4_basic.nc")
     print(f"  Generating {path}")
     ds = netCDF4.Dataset(path, "w", format="NETCDF4")
-    ds.format = "NetCDF-4"
     ds.createDimension("x", 5)
     ds.createDimension("y", 10)
     data = ds.createVariable("data", "f8", ("x", "y"))
@@ -391,7 +392,6 @@ def generate_netcdf4_fixtures(base_dir):
     path = os.path.join(nc4_dir, "nc4_classic_model.nc")
     print(f"  Generating {path}")
     ds = netCDF4.Dataset(path, "w", format="NETCDF4_CLASSIC")
-    ds.format = "NetCDF-4"
     ds.createDimension("x", 5)
     ds.createDimension("y", 10)
     data = ds.createVariable("data", "f8", ("x", "y"))
@@ -411,34 +411,54 @@ def generate_netcdf4_fixtures(base_dir):
     ds.close()
 
 
+SECTION_GENERATORS = {
+    "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),
+    "netcdf3": ("NetCDF-3 fixtures", "netCDF4", generate_netcdf3_fixtures),
+    "netcdf4": ("NetCDF-4 fixtures", "netCDF4", generate_netcdf4_fixtures),
+}
+
+
+def run_section(section, base_dir):
+    """Run a single fixture family inside the current process."""
+    if section not in SECTION_GENERATORS:
+        print(f"unknown fixture section: {section}", file=sys.stderr)
+        return 2
+
+    label, dependency, generator = SECTION_GENERATORS[section]
+    print(f"[{label}]", flush=True)
+    try:
+        generator(base_dir)
+        print("  Done.\n", flush=True)
+        return 0
+    except ImportError as e:
+        print(f"  SKIPPED: {dependency} not available ({e})\n", flush=True)
+        return 0
+
+
+def run_all_sections(base_dir):
+    """Run fixture families in isolated subprocesses.
+
+    Isolating sections avoids HDF5 library conflicts between h5py and netCDF4
+    in CI environments where the two extensions may link against different
+    HDF5 builds.
+    """
+    print("Generating test fixture files...", flush=True)
+    print(f"Base directory: {base_dir}\n", flush=True)
+    script_path = os.path.abspath(__file__)
+
+    for section in SECTION_GENERATORS:
+        subprocess.run(
+            [sys.executable, script_path, "--section", section],
+            check=True,
+        )
+
+    print("Fixture generation complete.", flush=True)
+    return 0
+
+
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
+    if len(sys.argv) == 3 and sys.argv[1] == "--section":
+        sys.exit(run_section(sys.argv[2], base_dir))
 
-    print("Generating test fixture files...")
-    print(f"Base directory: {base_dir}\n")
-
-    # --- HDF5 fixtures ---
-    print("[HDF5 fixtures]")
-    try:
-        generate_hdf5_fixtures(base_dir)
-        print("  Done.\n")
-    except ImportError as e:
-        print(f"  SKIPPED: h5py not available ({e})\n")
-
-    # --- NetCDF-3 fixtures ---
-    print("[NetCDF-3 fixtures]")
-    try:
-        generate_netcdf3_fixtures(base_dir)
-        print("  Done.\n")
-    except ImportError as e:
-        print(f"  SKIPPED: netCDF4 not available ({e})\n")
-
-    # --- NetCDF-4 fixtures ---
-    print("[NetCDF-4 fixtures]")
-    try:
-        generate_netcdf4_fixtures(base_dir)
-        print("  Done.\n")
-    except ImportError as e:
-        print(f"  SKIPPED: netCDF4 not available ({e})\n")
-
-    print("Fixture generation complete.")
+    sys.exit(run_all_sections(base_dir))

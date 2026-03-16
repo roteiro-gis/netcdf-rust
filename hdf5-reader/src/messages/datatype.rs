@@ -332,6 +332,7 @@ fn parse_opaque(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Dataty
 fn parse_compound(cursor: &mut Cursor<'_>, flags: u32, size: u32, version: u8) -> Result<Datatype> {
     // Lower 16 bits of class flags = number of members
     let n_members = (flags & 0xFFFF) as usize;
+    let byte_offset_size = compound_member_offset_size(size);
 
     let mut fields = Vec::with_capacity(n_members);
 
@@ -349,6 +350,8 @@ fn parse_compound(cursor: &mut Cursor<'_>, flags: u32, size: u32, version: u8) -
         let byte_offset = if version == 1 {
             // V1: byte offset is `size of offsets` (4 bytes)
             cursor.read_u32_le()?
+        } else if version >= 3 {
+            cursor.read_uvar(byte_offset_size)? as u32
         } else {
             // V2/V3: byte offset is 4 bytes
             cursor.read_u32_le()?
@@ -374,6 +377,15 @@ fn parse_compound(cursor: &mut Cursor<'_>, flags: u32, size: u32, version: u8) -
     }
 
     Ok(Datatype::Compound { size, fields })
+}
+
+fn compound_member_offset_size(size: u32) -> usize {
+    match size {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFF_FFFF => 3,
+        _ => 4,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -689,6 +701,39 @@ mod tests {
                 assert_eq!(*size, 12);
             }
             other => panic!("expected Reference, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_compound_v3_variable_member_offsets() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&class_word(6, 3, 2).to_le_bytes());
+        data.extend_from_slice(&16u32.to_le_bytes());
+
+        data.extend_from_slice(b"dataset\0");
+        data.push(0x00);
+        data.extend_from_slice(&class_word(7, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+
+        data.extend_from_slice(b"dimension\0");
+        data.push(0x08);
+        data.extend_from_slice(&class_word(0, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&32u16.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, data.len()).unwrap();
+        match &msg.datatype {
+            Datatype::Compound { size, fields } => {
+                assert_eq!(*size, 16);
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].name, "dataset");
+                assert_eq!(fields[0].byte_offset, 0);
+                assert_eq!(fields[1].name, "dimension");
+                assert_eq!(fields[1].byte_offset, 8);
+            }
+            other => panic!("expected Compound, got {:?}", other),
         }
     }
 

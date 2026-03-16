@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::attribute_api::Attribute;
+use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::btree_v1;
 use crate::btree_v2;
 use crate::cache::ChunkCache;
@@ -101,7 +101,7 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut groups = Vec::new();
         for child in &children {
-            if self.is_group_at(child.address)? {
+            if self.child_is_group(child)? {
                 groups.push(Group::new(
                     self.file_data,
                     child.address,
@@ -149,16 +149,10 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         let mut datasets = Vec::new();
         for child in &children {
-            if !self.is_group_at(child.address)? {
-                datasets.push(Dataset::from_object_header(
-                    self.file_data,
-                    child.address,
-                    child.name.clone(),
-                    self.offset_size,
-                    self.length_size,
-                    self.chunk_cache.clone(),
-                    self.filter_registry.clone(),
-                )?);
+            if !self.child_is_group(child)? {
+                if let Some(dataset) = self.try_open_child_dataset(child) {
+                    datasets.push(dataset);
+                }
             }
         }
         Ok(datasets)
@@ -169,15 +163,10 @@ impl<'f> Group<'f> {
         let children = self.resolve_children()?;
         for child in &children {
             if child.name == name {
-                return Dataset::from_object_header(
-                    self.file_data,
-                    child.address,
-                    child.name.clone(),
-                    self.offset_size,
-                    self.length_size,
-                    self.chunk_cache.clone(),
-                    self.filter_registry.clone(),
-                );
+                if let Some(dataset) = self.try_open_child_dataset(child) {
+                    return Ok(dataset);
+                }
+                return Err(Error::DatasetNotFound(name.to_string()));
             }
         }
         Err(Error::DatasetNotFound(name.to_string()))
@@ -185,14 +174,21 @@ impl<'f> Group<'f> {
 
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
-        let header = self.cached_header(self.address)?;
-        let mut attrs = Vec::new();
-        for msg in &header.messages {
-            if let HdfMessage::Attribute(attr) = msg {
-                attrs.push(Attribute::from_message(attr.clone()));
-            }
-        }
-        Ok(attrs)
+        let mut header = (*self.cached_header(self.address)?).clone();
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
+        Ok(
+            collect_attribute_messages(
+                &header,
+                self.file_data,
+                self.offset_size,
+                self.length_size,
+            )?
+            .into_iter()
+            .map(|attr| {
+                Attribute::from_message_with_context(attr, Some(self.file_data), self.offset_size)
+            })
+            .collect(),
+        )
     }
 
     /// Find an attribute by name.
@@ -249,11 +245,16 @@ impl<'f> Group<'f> {
                 }
             }
 
-            // If there's a link_info pointing to a fractal heap, resolve dense links
-            if children.is_empty() {
-                if let Some(ref li) = link_info {
-                    if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size) {
-                        children = self.resolve_dense_links(li)?;
+            // Dense-link storage can coexist with compact links, so merge both.
+            if let Some(ref li) = link_info {
+                if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size) {
+                    for child in self.resolve_dense_links(li)? {
+                        let is_duplicate = children.iter().any(|existing| {
+                            existing.name == child.name && existing.address == child.address
+                        });
+                        if !is_duplicate {
+                            children.push(child);
+                        }
                     }
                 }
             }
@@ -364,7 +365,8 @@ impl<'f> Group<'f> {
     /// A group has either a symbol table message, link messages, or link info.
     /// A dataset has a dataspace + datatype + layout.
     fn is_group_at(&self, address: u64) -> Result<bool> {
-        let header = self.cached_header(address)?;
+        let mut header = (*self.cached_header(address)?).clone();
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
         for msg in &header.messages {
             match msg {
                 // Group indicators
@@ -379,5 +381,25 @@ impl<'f> Group<'f> {
         }
         // Default: if it has neither, treat as group (root groups can be empty)
         Ok(true)
+    }
+
+    fn try_open_child_dataset(&self, child: &ChildEntry) -> Option<Dataset<'f>> {
+        Dataset::from_object_header(
+            self.file_data,
+            child.address,
+            child.name.clone(),
+            self.offset_size,
+            self.length_size,
+            self.chunk_cache.clone(),
+            self.filter_registry.clone(),
+        )
+        .ok()
+    }
+
+    fn child_is_group(&self, child: &ChildEntry) -> Result<bool> {
+        match self.is_group_at(child.address) {
+            Ok(is_group) => Ok(is_group),
+            Err(_) => Ok(self.try_open_child_dataset(child).is_none()),
+        }
     }
 }

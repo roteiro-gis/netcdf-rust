@@ -390,13 +390,14 @@ impl ObjectHeader {
                 let _creation_order = cursor.read_u16_le()?;
             }
 
-            // If the remaining space is all zeros (nil padding), stop early.
-            if msg_type == MSG_TYPE_NIL && msg_data_size == 0 {
-                // Possible zero-fill to the end of the chunk; skip remaining.
-                break;
-            }
-
             if msg_type == MSG_TYPE_NIL {
+                if msg_data_size == 0
+                    && base.data()[cursor.position() as usize..end as usize]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    break;
+                }
                 cursor.skip(msg_data_size)?;
                 messages.push(HdfMessage::Nil);
                 continue;
@@ -976,6 +977,23 @@ mod tests {
             HdfMessage::Unknown { type_id, .. } => assert_eq!(*type_id, 0x00A1),
             other => panic!("expected Unknown 0xA1, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn v2_zero_length_nil_before_more_messages() {
+        let p1 = [0xAA];
+        let p2 = [0xBB];
+        let data = build_v2_header(
+            0x04,
+            &[(0xFE, 0, &p1), (0x00, 0, &[]), (0xFD, 0, &p2)],
+            None,
+            None,
+        );
+        let hdr = ObjectHeader::parse_at(&data, 0, 8, 8).unwrap();
+        assert_eq!(hdr.messages.len(), 3);
+        assert!(matches!(hdr.messages[0], HdfMessage::Unknown { .. }));
+        assert!(matches!(hdr.messages[1], HdfMessage::Nil));
+        assert!(matches!(hdr.messages[2], HdfMessage::Unknown { .. }));
     }
 
     #[test]

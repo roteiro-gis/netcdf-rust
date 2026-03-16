@@ -15,13 +15,14 @@ pub enum ChunkIndexing {
     /// Implicit indexing — chunk addresses are computed, not stored.
     Implicit,
     /// Fixed array indexing.
-    FixedArray { page_bits: u8 },
+    FixedArray { page_bits: u8, chunk_size_len: u8 },
     /// Extensible array indexing.
     ExtensibleArray {
         max_bits: u8,
         index_bits: u8,
         min_pointers: u8,
         min_elements: u8,
+        chunk_size_len: u8,
     },
     /// Version 2 B-tree indexing.
     BTreeV2,
@@ -66,7 +67,7 @@ pub fn parse(
     let layout = match version {
         1 | 2 => parse_v1_v2(cursor, offset_size, length_size, version)?,
         3 => parse_v3(cursor, offset_size, length_size)?,
-        4 | 5 => parse_v4_v5(cursor, offset_size, version)?,
+        4 | 5 => parse_v4_v5(cursor, offset_size, length_size, version)?,
         v => return Err(Error::UnsupportedLayoutVersion(v)),
     };
 
@@ -208,16 +209,15 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
 
 /// Parse v4/v5 layout messages.
 ///
-/// v4 (HDF5 1.10+): dimensionality = number of chunk dimensions. Element
-///   size is a separate field after the dimension values.
-///   Index types: 0=SingleChunk, 1=Implicit, 2=FixedArray, 3=ExtensibleArray, 4=BTreeV2
-///
-/// v5 (HDF5 2.0+): dimensionality = chunk dims + 1 (last value is element size,
-///   matching the internal `ndims+1` convention). Element size is NOT a
-///   separate field.
-///   Index types (H5D_chunk_index_t on-disk): 0=BTREE, 1=NONE/Implicit,
-///     2=SINGLE, 3=FARRAY, 4=EARRAY, 5=BT2
-fn parse_v4_v5(cursor: &mut Cursor<'_>, offset_size: u8, version: u8) -> Result<DataLayout> {
+/// v4/v5 chunked layouts store only the chunk dimensions here; element size
+/// is derived from the datatype. Filtered chunk-index records switched from
+/// `length_size` to `offset_size` in v5.
+fn parse_v4_v5(
+    cursor: &mut Cursor<'_>,
+    offset_size: u8,
+    length_size: u8,
+    version: u8,
+) -> Result<DataLayout> {
     let layout_class = cursor.read_u8()?;
 
     match layout_class {
@@ -234,75 +234,77 @@ fn parse_v4_v5(cursor: &mut Cursor<'_>, offset_size: u8, version: u8) -> Result<
             Ok(DataLayout::Contiguous { address, size })
         }
         2 => {
-            // Chunked
-            let flags = cursor.read_u8()?;
-            let ndims_raw = cursor.read_u8()? as usize;
-
-            // Encoded dimension size.
-            // v4: stored as (bytes_per_dim - 1), so dim_bytes = enc + 1.
-            // v5: stored as bytes_per_dim directly.
-            let dim_size_enc = cursor.read_u8()?;
-            let dim_bytes = if version >= 5 {
-                dim_size_enc as usize
-            } else {
-                (dim_size_enc + 1) as usize
-            };
-
-            let (dims, element_size) = if version >= 5 {
-                // v5: ndims_raw includes element_size as the last "dimension".
-                // Read ndims_raw values; the last is element_size.
-                let actual_ndims = ndims_raw.saturating_sub(1);
-                let mut dims = Vec::with_capacity(actual_ndims);
-                for _ in 0..actual_ndims {
-                    dims.push(cursor.read_uvar(dim_bytes)? as u32);
+            let start = cursor.clone();
+            let direct = parse_v4_v5_chunked(cursor, offset_size, length_size, version, false);
+            match direct {
+                Ok(layout) => Ok(layout),
+                Err(err) if version == 4 && should_retry_v4_chunked_parse(&err) => {
+                    *cursor = start;
+                    parse_v4_v5_chunked(cursor, offset_size, length_size, version, true)
                 }
-                let element_size = cursor.read_uvar(dim_bytes)? as u32;
-                (dims, element_size)
-            } else {
-                // v4: ndims_raw is the actual number of chunk dimensions.
-                // Element size is a separate field after the dims.
-                let mut dims = Vec::with_capacity(ndims_raw);
-                for _ in 0..ndims_raw {
-                    dims.push(cursor.read_uvar(dim_bytes)? as u32);
-                }
-                let element_size = cursor.read_uvar(dim_bytes)? as u32;
-                (dims, element_size)
-            };
-
-            // Chunk indexing type
-            let index_type = cursor.read_u8()?;
-
-            let chunk_indexing = if version >= 5 {
-                // v5 on-disk H5D_chunk_index_t values
-                parse_chunk_indexing_v5(cursor, flags, index_type)?
-            } else {
-                // v4 on-disk values
-                parse_chunk_indexing_v4(cursor, flags, index_type)?
-            };
-
-            // Address of the chunk index
-            let address = cursor.read_offset(offset_size)?;
-
-            Ok(DataLayout::Chunked {
-                address,
-                dims,
-                element_size,
-                chunk_indexing: Some(chunk_indexing),
-            })
+                Err(err) => Err(err),
+            }
         }
         c => Err(Error::UnsupportedLayoutClass(c)),
     }
 }
 
-/// Parse chunk indexing for v4 layout.
-/// On-disk values: 0=SingleChunk, 1=Implicit, 2=FixedArray, 3=ExtensibleArray, 4=BTreeV2
-fn parse_chunk_indexing_v4(
+fn parse_v4_v5_chunked(
+    cursor: &mut Cursor<'_>,
+    offset_size: u8,
+    length_size: u8,
+    version: u8,
+    legacy_dim_size_encoding: bool,
+) -> Result<DataLayout> {
+    let flags = cursor.read_u8()?;
+    let ndims_raw = cursor.read_u8()? as usize;
+    let dim_size_enc = cursor.read_u8()?;
+    let dim_bytes = if legacy_dim_size_encoding {
+        dim_size_enc as usize + 1
+    } else {
+        dim_size_enc as usize
+    };
+
+    let mut dims = Vec::with_capacity(ndims_raw);
+    for _ in 0..ndims_raw {
+        dims.push(cursor.read_uvar(dim_bytes)? as u32);
+    }
+
+    let index_type = cursor.read_u8()?;
+    let chunk_size_len = if version >= 5 {
+        offset_size
+    } else {
+        length_size
+    };
+    let chunk_indexing = parse_chunk_indexing_v4_v5(cursor, flags, index_type, chunk_size_len)?;
+    let address = cursor.read_offset(offset_size)?;
+
+    Ok(DataLayout::Chunked {
+        address,
+        dims,
+        element_size: 0,
+        chunk_indexing: Some(chunk_indexing),
+    })
+}
+
+fn should_retry_v4_chunked_parse(err: &Error) -> bool {
+    match err {
+        Error::UnexpectedEof { .. } | Error::UnsupportedChunkIndexType(_) => true,
+        Error::InvalidData(msg) => msg.starts_with("unsupported variable integer size:"),
+        _ => false,
+    }
+}
+
+/// Parse chunk indexing for v4/v5 layout.
+/// On-disk values: 1=SingleChunk, 2=Implicit, 3=FixedArray, 4=ExtensibleArray, 5=BTreeV2
+fn parse_chunk_indexing_v4_v5(
     cursor: &mut Cursor<'_>,
     flags: u8,
     index_type: u8,
+    chunk_size_len: u8,
 ) -> Result<ChunkIndexing> {
     match index_type {
-        0 => {
+        1 => {
             // Single chunk
             let idx_flags = if (flags & 0x01) != 0 {
                 let filtered_size = cursor.read_u64_le()?;
@@ -317,63 +319,15 @@ fn parse_chunk_indexing_v4(
                 filters: fm,
             })
         }
-        1 => Ok(ChunkIndexing::Implicit),
-        2 => {
-            let page_bits = cursor.read_u8()?;
-            Ok(ChunkIndexing::FixedArray { page_bits })
-        }
+        2 => Ok(ChunkIndexing::Implicit),
         3 => {
-            let max_bits = cursor.read_u8()?;
-            let index_bits = cursor.read_u8()?;
-            let min_pointers = cursor.read_u8()?;
-            let min_elements = cursor.read_u8()?;
-            Ok(ChunkIndexing::ExtensibleArray {
-                max_bits,
-                index_bits,
-                min_pointers,
-                min_elements,
-            })
-        }
-        4 => Ok(ChunkIndexing::BTreeV2),
-        t => Err(Error::UnsupportedChunkIndexType(t)),
-    }
-}
-
-/// Parse chunk indexing for v5 layout (HDF5 2.0).
-/// On-disk H5D_chunk_index_t: 0=BTREE, 1=NONE, 2=SINGLE, 3=FARRAY, 4=EARRAY, 5=BT2
-fn parse_chunk_indexing_v5(
-    cursor: &mut Cursor<'_>,
-    flags: u8,
-    index_type: u8,
-) -> Result<ChunkIndexing> {
-    match index_type {
-        0 => Err(Error::InvalidData(
-            "v1 B-tree index type should not appear in v5 layout".into(),
-        )),
-        1 => Ok(ChunkIndexing::Implicit),
-        2 => {
-            // SINGLE
-            let idx_flags = if (flags & 0x01) != 0 {
-                let filtered_size = cursor.read_u64_le()?;
-                let filter_mask = cursor.read_u32_le()?;
-                Some((filtered_size, filter_mask))
-            } else {
-                None
-            };
-            let (fs, fm) = idx_flags.unwrap_or((0, 0));
-            Ok(ChunkIndexing::SingleChunk {
-                filtered_size: fs,
-                filters: fm,
-            })
-        }
-        3 => {
-            // FARRAY — Fixed Array
             let page_bits = cursor.read_u8()?;
-            Ok(ChunkIndexing::FixedArray { page_bits })
+            Ok(ChunkIndexing::FixedArray {
+                page_bits,
+                chunk_size_len,
+            })
         }
         4 => {
-            // EARRAY — Extensible Array
-            // v5 adds max_dblk_page_nelmts_bits as a 5th parameter.
             let max_bits = cursor.read_u8()?;
             let index_bits = cursor.read_u8()?;
             let min_pointers = cursor.read_u8()?;
@@ -384,9 +338,13 @@ fn parse_chunk_indexing_v5(
                 index_bits,
                 min_pointers,
                 min_elements,
+                chunk_size_len,
             })
         }
-        5 => Ok(ChunkIndexing::BTreeV2),
+        5 => {
+            cursor.skip(6)?;
+            Ok(ChunkIndexing::BTreeV2)
+        }
         t => Err(Error::UnsupportedChunkIndexType(t)),
     }
 }
@@ -467,6 +425,90 @@ mod tests {
                 assert_eq!(dims, &[256, 128]);
                 assert_eq!(*element_size, 4);
                 assert!(chunk_indexing.is_none());
+            }
+            other => panic!("expected Chunked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_chunked_direct_dim_size_encoding() {
+        let mut data = vec![
+            0x04, // version 4
+            0x02, // layout class = chunked
+            0x00, // flags
+            0x02, // ndims
+            0x04, // 4 bytes per dimension
+        ];
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.push(0x03); // fixed array indexing
+        data.push(0x00); // page bits
+        data.extend_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();
+        match &msg.layout {
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            } => {
+                assert_eq!(*address, 0x1122_3344_5566_7788);
+                assert_eq!(dims, &[3, 5]);
+                assert_eq!(*element_size, 0);
+                match chunk_indexing {
+                    Some(ChunkIndexing::FixedArray {
+                        page_bits,
+                        chunk_size_len,
+                    }) => {
+                        assert_eq!(*page_bits, 0);
+                        assert_eq!(*chunk_size_len, 8);
+                    }
+                    other => panic!("expected FixedArray indexing, got {:?}", other),
+                }
+            }
+            other => panic!("expected Chunked, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_chunked_legacy_dim_size_encoding() {
+        let mut data = vec![
+            0x04, // version 4
+            0x02, // layout class = chunked
+            0x00, // flags
+            0x02, // ndims
+            0x03, // legacy encoding: 4 bytes per dimension stored as 3
+        ];
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.push(0x03); // fixed array indexing
+        data.push(0x00); // page bits
+        data.extend_from_slice(&0x8877_6655_4433_2211u64.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();
+        match &msg.layout {
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            } => {
+                assert_eq!(*address, 0x8877_6655_4433_2211);
+                assert_eq!(dims, &[3, 5]);
+                assert_eq!(*element_size, 0);
+                match chunk_indexing {
+                    Some(ChunkIndexing::FixedArray {
+                        page_bits,
+                        chunk_size_len,
+                    }) => {
+                        assert_eq!(*page_bits, 0);
+                        assert_eq!(*chunk_size_len, 8);
+                    }
+                    other => panic!("expected FixedArray indexing, got {:?}", other),
+                }
             }
             other => panic!("expected Chunked, got {:?}", other),
         }

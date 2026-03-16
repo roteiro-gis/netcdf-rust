@@ -118,6 +118,29 @@ fn test_nc4_compressed() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn test_nc4_groups_nested_lookup_and_read() {
+    let path = skip_if_missing!("netcdf4", "nc4_groups.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let obs = file.group("obs").unwrap();
+    assert_eq!(obs.name, "obs");
+
+    let temp_data: ndarray::ArrayD<f32> = file.read_variable("/obs/temperature").unwrap();
+    assert_eq!(temp_data.shape(), &[3]);
+    assert_eq!(obs.dimension("time").unwrap().size, 3);
+    let temperature = file.variable("obs/temperature").unwrap();
+    let dim_names: Vec<&str> = temperature
+        .dimensions()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(dim_names, vec!["time"]);
+    assert!((temp_data[[1]] - 21.0).abs() < 1e-6);
+    assert!(file.variable("temperature").is_err());
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn test_nc4_classic_model() {
     let path = skip_if_missing!("netcdf4", "nc4_classic_model.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();

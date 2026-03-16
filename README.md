@@ -25,10 +25,8 @@ for var in file.variables() {
     println!("  var: {} {:?}", var.name(), var.shape());
 }
 
-// Read data (classic format)
-if let Some(classic) = file.as_classic() {
-    let temp: ndarray::ArrayD<f32> = classic.read_variable("temperature")?;
-}
+// Read data (works for both classic and NetCDF-4)
+let temp: ndarray::ArrayD<f32> = file.read_variable("temperature")?;
 ```
 
 Using `hdf5-reader` directly:
@@ -56,7 +54,8 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 **HDF5 reader:**
 - Superblock v0-v3, object header v1/v2 with checksum verification
 - Compact, contiguous, and chunked data layouts
-- V1 B-tree, V2 B-tree, single-chunk, and implicit chunk indexing
+- All chunk index types: V1/V2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
+- Layout v4 and v5 (HDF5 2.0)
 - Filter pipeline: deflate (zlib), shuffle, Fletcher-32
 - Pluggable `FilterRegistry` for custom filters (Blosc, LZ4, etc.)
 - Fractal heap + B-tree v2 dense link resolution
@@ -71,7 +70,8 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 - CDF-1 classic, CDF-2 64-bit offset, CDF-5 64-bit data
 - NetCDF-4 via `hdf5-reader` (feature-gated, on by default)
 - Automatic format detection from magic bytes
-- Dimension reconstruction from HDF5 dimension scales
+- Dimension reconstruction via `DIMENSION_LIST` object references (with size-based fallback)
+- Unified `NcFile::read_variable::<T>()` across all formats
 - Attribute filtering (hides internal `_NCProperties`, `DIMENSION_LIST`, etc.)
 - Record (unlimited) dimension support
 
@@ -122,11 +122,9 @@ cargo test
 
 ## Known limitations
 
-- Fixed array and extensible array chunk indexing are not yet supported (returns an error)
 - Soft and external HDF5 links are skipped
 - SZIP, N-Bit, and ScaleOffset filters are not built in (register via `FilterRegistry`)
 - SOHM (shared object header message table) resolution is deferred
-- NetCDF-4 dimension matching uses size-based heuristics rather than parsing `DIMENSION_LIST` object references
 
 ## License
 

@@ -132,10 +132,13 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let name_size = cursor.read_u16_le()? as usize;
     let datatype_size = cursor.read_u16_le()? as usize;
     let dataspace_size = cursor.read_u16_le()? as usize;
+    let _name_encoding = cursor.read_u8()?;
 
-    // Bit 0: character encoding for name (0=ASCII, 1=UTF-8). We handle
-    // both identically since our string handling is UTF-8 throughout.
-    let _name_encoding = flags & 0x01;
+    if (flags & 0x03) != 0 {
+        return Err(Error::InvalidData(
+            "shared datatype/dataspace in attribute v3 is not supported".to_string(),
+        ));
+    }
 
     // Name — NOT padded in v3
     let name = cursor.read_fixed_string(name_size)?;
@@ -244,6 +247,7 @@ mod tests {
         data.extend_from_slice(&4u16.to_le_bytes());
         data.extend_from_slice(&(dt.len() as u16).to_le_bytes());
         data.extend_from_slice(&(ds.len() as u16).to_le_bytes());
+        data.push(0x00); // ASCII name encoding
 
         // Name (not padded in v3)
         data.extend_from_slice(b"abc\0");
@@ -260,6 +264,32 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();
         assert_eq!(msg.name, "abc");
+        assert_eq!(msg.dataspace.dataspace_type, DataspaceType::Scalar);
         assert_eq!(msg.raw_data, 99u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_parse_v3_utf8_name_attr() {
+        let dt = u32_le_datatype();
+        let ds = scalar_dataspace();
+
+        let mut data = vec![
+            0x03, // version 3
+            0x00, // flags
+        ];
+        data.extend_from_slice(&2u16.to_le_bytes()); // "x\0"
+        data.extend_from_slice(&(dt.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(ds.len() as u16).to_le_bytes());
+        data.push(0x01); // UTF-8 name encoding
+        data.extend_from_slice(b"x\0");
+        data.extend_from_slice(&dt);
+        data.extend_from_slice(&ds);
+        data.extend_from_slice(&7u32.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();
+        assert_eq!(msg.name, "x");
+        assert_eq!(msg.dataspace.dataspace_type, DataspaceType::Scalar);
+        assert_eq!(msg.raw_data, 7u32.to_le_bytes());
     }
 }

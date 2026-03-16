@@ -212,21 +212,164 @@ pub struct NcGroup {
 impl NcGroup {
     /// Find a variable by name in this group.
     pub fn variable(&self, name: &str) -> Option<&NcVariable> {
-        self.variables.iter().find(|v| v.name == name)
+        let (group_path, variable_name) = split_parent_path(name)?;
+        let group = self.group(group_path)?;
+        group.variables.iter().find(|v| v.name == variable_name)
     }
 
     /// Find a dimension by name in this group.
     pub fn dimension(&self, name: &str) -> Option<&NcDimension> {
-        self.dimensions.iter().find(|d| d.name == name)
+        let (group_path, dimension_name) = split_parent_path(name)?;
+        let group = self.group(group_path)?;
+        group.dimensions.iter().find(|d| d.name == dimension_name)
     }
 
     /// Find an attribute by name in this group.
     pub fn attribute(&self, name: &str) -> Option<&NcAttribute> {
-        self.attributes.iter().find(|a| a.name == name)
+        let (group_path, attribute_name) = split_parent_path(name)?;
+        let group = self.group(group_path)?;
+        group.attributes.iter().find(|a| a.name == attribute_name)
     }
 
-    /// Find a child group by name.
+    /// Find a child group by relative path.
     pub fn group(&self, name: &str) -> Option<&NcGroup> {
-        self.groups.iter().find(|g| g.name == name)
+        let trimmed = name.trim_matches('/');
+        if trimmed.is_empty() {
+            return Some(self);
+        }
+
+        let mut group = self;
+        for component in trimmed.split('/').filter(|part| !part.is_empty()) {
+            group = group.groups.iter().find(|child| child.name == component)?;
+        }
+
+        Some(group)
+    }
+}
+
+fn split_parent_path(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    match trimmed.rsplit_once('/') {
+        Some((group_path, leaf_name)) if !leaf_name.is_empty() => Some((group_path, leaf_name)),
+        Some(_) => None,
+        None => Some(("", trimmed)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_group_tree() -> NcGroup {
+        NcGroup {
+            name: "/".to_string(),
+            dimensions: vec![NcDimension {
+                name: "root_dim".to_string(),
+                size: 2,
+                is_unlimited: false,
+            }],
+            variables: vec![NcVariable {
+                name: "root_var".to_string(),
+                dimensions: vec![],
+                dtype: NcType::Int,
+                attributes: vec![],
+                data_offset: 0,
+                _data_size: 0,
+                is_record_var: false,
+                record_size: 4,
+            }],
+            attributes: vec![NcAttribute {
+                name: "title".to_string(),
+                value: NcAttrValue::Chars("root".to_string()),
+            }],
+            groups: vec![NcGroup {
+                name: "obs".to_string(),
+                dimensions: vec![NcDimension {
+                    name: "time".to_string(),
+                    size: 3,
+                    is_unlimited: false,
+                }],
+                variables: vec![NcVariable {
+                    name: "temperature".to_string(),
+                    dimensions: vec![],
+                    dtype: NcType::Float,
+                    attributes: vec![],
+                    data_offset: 0,
+                    _data_size: 0,
+                    is_record_var: false,
+                    record_size: 4,
+                }],
+                attributes: vec![],
+                groups: vec![NcGroup {
+                    name: "surface".to_string(),
+                    dimensions: vec![],
+                    variables: vec![NcVariable {
+                        name: "pressure".to_string(),
+                        dimensions: vec![],
+                        dtype: NcType::Double,
+                        attributes: vec![],
+                        data_offset: 0,
+                        _data_size: 0,
+                        is_record_var: false,
+                        record_size: 8,
+                    }],
+                    attributes: vec![NcAttribute {
+                        name: "units".to_string(),
+                        value: NcAttrValue::Chars("hPa".to_string()),
+                    }],
+                    groups: vec![],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_group_path_lookup() {
+        let root = sample_group_tree();
+
+        let surface = root.group("obs/surface").unwrap();
+        assert_eq!(surface.name, "surface");
+        assert!(root.group("/obs/surface").is_some());
+        assert!(root.group("missing").is_none());
+    }
+
+    #[test]
+    fn test_variable_path_lookup() {
+        let root = sample_group_tree();
+
+        assert_eq!(root.variable("root_var").unwrap().name(), "root_var");
+        assert_eq!(
+            root.variable("obs/temperature").unwrap().dtype(),
+            NcType::Float
+        );
+        assert_eq!(
+            root.variable("/obs/surface/pressure").unwrap().dtype(),
+            NcType::Double
+        );
+        assert!(root.variable("pressure").is_none());
+    }
+
+    #[test]
+    fn test_dimension_and_attribute_path_lookup() {
+        let root = sample_group_tree();
+
+        assert_eq!(root.dimension("root_dim").unwrap().size, 2);
+        assert_eq!(root.dimension("obs/time").unwrap().size, 3);
+        assert_eq!(
+            root.attribute("title").unwrap().value.as_string().unwrap(),
+            "root"
+        );
+        assert_eq!(
+            root.attribute("obs/surface/units")
+                .unwrap()
+                .value
+                .as_string()
+                .unwrap(),
+            "hPa"
+        );
     }
 }

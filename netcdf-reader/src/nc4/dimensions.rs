@@ -17,6 +17,10 @@ use hdf5_reader::group::Group;
 use crate::error::Result;
 use crate::types::NcDimension;
 
+fn leaf_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
 /// Extract dimensions from an HDF5 group.
 ///
 /// Returns a tuple of:
@@ -57,12 +61,12 @@ pub fn extract_dimensions(
                 // NetCDF-4 uses "This is a netCDF dimension but not a netCDF variable."
                 // as a sentinel for anonymous dimensions. In that case, use the dataset name.
                 if s.starts_with("This is a netCDF dimension but not a netCDF variable") {
-                    ds.name().to_string()
+                    leaf_name(ds.name()).to_string()
                 } else {
                     s
                 }
             })
-            .unwrap_or_else(|| ds.name().to_string());
+            .unwrap_or_else(|| leaf_name(ds.name()).to_string());
 
         // Get current size from dataspace
         let shape = ds.shape();

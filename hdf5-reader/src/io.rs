@@ -261,13 +261,21 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Read a variable-size unsigned integer of 1, 2, 4, or 8 bytes (little-endian).
+    /// Read a variable-size unsigned integer of 1..=8 bytes (little-endian).
     pub fn read_uvar(&mut self, size: usize) -> Result<u64> {
         match size {
             1 => self.read_u8().map(u64::from),
             2 => self.read_u16_le().map(u64::from),
             4 => self.read_u32_le().map(u64::from),
             8 => self.read_u64_le(),
+            3 | 5..=7 => {
+                let bytes = self.read_bytes(size)?;
+                let mut value = 0u64;
+                for (shift, byte) in bytes.iter().enumerate() {
+                    value |= (*byte as u64) << (shift * 8);
+                }
+                Ok(value)
+            }
             _ => Err(Error::InvalidData(format!(
                 "unsupported variable integer size: {}",
                 size

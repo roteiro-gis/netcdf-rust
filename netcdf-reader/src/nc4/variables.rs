@@ -14,6 +14,10 @@ use crate::types::{NcDimension, NcVariable};
 use super::attributes;
 use super::types::hdf5_to_nc_type;
 
+fn leaf_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
 /// Extract variables from an HDF5 group.
 ///
 /// Datasets with `CLASS=DIMENSION_SCALE` are dimensions, not variables.
@@ -80,7 +84,7 @@ pub fn extract_variables(
         let var_attrs = attributes::extract_variable_attributes(ds)?;
 
         variables.push(NcVariable {
-            name: ds.name().to_string(),
+            name: leaf_name(ds.name()).to_string(),
             dimensions: var_dims,
             dtype: nc_type,
             attributes: var_attrs,

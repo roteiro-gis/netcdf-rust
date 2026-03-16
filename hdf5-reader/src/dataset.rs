@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use ndarray::{ArrayD, IxDyn};
 
-use crate::attribute_api::Attribute;
+use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
@@ -85,7 +85,7 @@ impl<'f> Dataset<'f> {
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
-        let mut attributes = Vec::new();
+        let attributes = collect_attribute_messages(&header, file_data, offset_size, length_size)?;
 
         for msg in header.messages {
             match msg {
@@ -94,7 +94,6 @@ impl<'f> Dataset<'f> {
                 HdfMessage::DataLayout(dl) => layout = Some(dl.layout),
                 HdfMessage::FillValue(fv) => fill_value = Some(fv),
                 HdfMessage::FilterPipeline(fp) => filter_pipeline = Some(fp),
-                HdfMessage::Attribute(attr) => attributes.push(attr),
                 _ => {}
             }
         }
@@ -104,6 +103,7 @@ impl<'f> Dataset<'f> {
         let dt = datatype.ok_or_else(|| Error::InvalidData("dataset missing datatype".into()))?;
         let layout =
             layout.ok_or_else(|| Error::InvalidData("dataset missing data layout".into()))?;
+        let layout = normalize_layout(layout, &dataspace);
 
         Ok(Dataset {
             file_data,
@@ -170,7 +170,13 @@ impl<'f> Dataset<'f> {
     pub fn attributes(&self) -> Vec<Attribute> {
         self.attributes
             .iter()
-            .map(|a| Attribute::from_message(a.clone()))
+            .map(|a| {
+                Attribute::from_message_with_context(
+                    a.clone(),
+                    Some(self.file_data),
+                    self.offset_size,
+                )
+            })
             .collect()
     }
 
@@ -179,7 +185,13 @@ impl<'f> Dataset<'f> {
         self.attributes
             .iter()
             .find(|a| a.name == name)
-            .map(|a| Attribute::from_message(a.clone()))
+            .map(|a| {
+                Attribute::from_message_with_context(
+                    a.clone(),
+                    Some(self.file_data),
+                    self.offset_size,
+                )
+            })
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
     }
 
@@ -778,6 +790,30 @@ impl<'f> Dataset<'f> {
             Ok(ArrayD::from_shape_vec(IxDyn(&shape), elements)
                 .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
         }
+    }
+}
+
+fn normalize_layout(layout: DataLayout, dataspace: &DataspaceMessage) -> DataLayout {
+    match layout {
+        DataLayout::Chunked {
+            address,
+            mut dims,
+            mut element_size,
+            chunk_indexing,
+        } if dims.len() == dataspace.dims.len() + 1 => {
+            if let Some(legacy_element_size) = dims.pop() {
+                if element_size == 0 {
+                    element_size = legacy_element_size;
+                }
+            }
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size,
+                chunk_indexing,
+            }
+        }
+        other => other,
     }
 }
 

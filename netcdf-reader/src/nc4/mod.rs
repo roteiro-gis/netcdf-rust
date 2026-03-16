@@ -63,19 +63,15 @@ impl Nc4File {
 
     /// Read a variable's data as a typed array.
     ///
-    /// Looks up the variable by name, then opens the HDF5 dataset at its
-    /// stored `data_offset` address and reads the data.
-    pub fn read_variable<T: H5Type>(&self, name: &str) -> Result<ArrayD<T>> {
+    /// Looks up the variable by path relative to the root group, then opens the
+    /// matching HDF5 dataset and reads the data.
+    pub fn read_variable<T: H5Type>(&self, path: &str) -> Result<ArrayD<T>> {
+        let normalized = normalize_dataset_path(path)?;
         let var = self
             .root_group
-            .variable(name)
-            .ok_or_else(|| Error::VariableNotFound(name.to_string()))?;
-
-        // data_offset holds the HDF5 object header address stored during
-        // variable extraction — use it to open the dataset directly by path.
-        let path = find_variable_path(&self.root_group, name)
-            .ok_or_else(|| Error::VariableNotFound(name.to_string()))?;
-        let dataset = self.hdf5.dataset(&path)?;
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
 
         // Verify the shape matches what we expect
         debug_assert_eq!(dataset.shape(), &var.shape()[..]);
@@ -84,18 +80,10 @@ impl Nc4File {
     }
 }
 
-/// Find the HDF5 path for a variable by searching the group hierarchy.
-fn find_variable_path(group: &NcGroup, name: &str) -> Option<String> {
-    if group.variable(name).is_some() {
-        let prefix = if group.name == "/" { "" } else { &group.name };
-        return Some(format!("{}/{}", prefix, name));
+fn normalize_dataset_path(path: &str) -> Result<&str> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(Error::VariableNotFound(path.to_string()));
     }
-
-    for child in &group.groups {
-        if let Some(path) = find_variable_path(child, name) {
-            return Some(path);
-        }
-    }
-
-    None
+    Ok(trimmed)
 }

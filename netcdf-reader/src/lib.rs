@@ -219,21 +219,28 @@ impl NcFile {
         &self.root_group().attributes
     }
 
-    /// Find a variable by name in the root group.
+    /// Find a group by path relative to the root group.
+    pub fn group(&self, path: &str) -> Result<&NcGroup> {
+        self.root_group()
+            .group(path)
+            .ok_or_else(|| Error::GroupNotFound(path.to_string()))
+    }
+
+    /// Find a variable by name or path relative to the root group.
     pub fn variable(&self, name: &str) -> Result<&NcVariable> {
         self.root_group()
             .variable(name)
             .ok_or_else(|| Error::VariableNotFound(name.to_string()))
     }
 
-    /// Find a dimension by name in the root group.
+    /// Find a dimension by name or path relative to the root group.
     pub fn dimension(&self, name: &str) -> Result<&NcDimension> {
         self.root_group()
             .dimension(name)
             .ok_or_else(|| Error::DimensionNotFound(name.to_string()))
     }
 
-    /// Find a global attribute by name.
+    /// Find a group attribute by name or path relative to the root group.
     pub fn global_attribute(&self, name: &str) -> Result<&NcAttribute> {
         self.root_group()
             .attribute(name)
@@ -242,7 +249,8 @@ impl NcFile {
 
     /// Read a variable's data as a typed array.
     ///
-    /// Works for both classic (CDF-1/2/5) and NetCDF-4 files. The type
+    /// Works for both classic (CDF-1/2/5) and NetCDF-4 files. NetCDF-4 nested
+    /// variables can be addressed with paths like `group/subgroup/var`. The type
     /// parameter `T` must implement `NcReadable`, which is satisfied by:
     /// `i8, u8, i16, u16, i32, u32, i64, u64, f32, f64`.
     pub fn read_variable<T: NcReadable>(&self, name: &str) -> Result<ArrayD<T>> {
@@ -444,6 +452,25 @@ mod tests {
         assert!(matches!(
             file.variable("nonexistent").unwrap_err(),
             Error::VariableNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn test_group_not_found() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"CDF\x01");
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+
+        let file = NcFile::from_bytes(&data).unwrap();
+        assert!(matches!(
+            file.group("nonexistent").unwrap_err(),
+            Error::GroupNotFound(_)
         ));
     }
 }
