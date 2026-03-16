@@ -13,8 +13,13 @@ pub fn jenkins_lookup3(data: &[u8]) -> u32 {
 
     let mut offset = 0;
 
-    // Process 12-byte chunks
-    while offset + 12 <= len {
+    // Process 12-byte chunks.
+    // Note: the C code uses `while (length > 12)`, leaving the last 0–12
+    // bytes for the switch/final path.  Using `<` (not `<=`) matches that
+    // behaviour — otherwise an input whose length is an exact multiple of
+    // 12 would incorrectly run the last chunk through mix() instead of
+    // the add-then-final path.
+    while offset + 12 < len {
         a = a.wrapping_add(u32::from_le_bytes([
             data[offset],
             data[offset + 1],
@@ -115,26 +120,36 @@ fn final_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
 }
 
 /// Fletcher-32 checksum used by the HDF5 filter pipeline.
-/// Operates on 16-bit big-endian words per the HDF5 specification.
-/// Pads with zero if odd number of bytes.
+///
+/// Matches the HDF5 library's `H5_checksum_fletcher32`: reads 16-bit
+/// big-endian words, accumulates in batches of 360, and reduces with
+/// `(x & 0xffff) + (x >> 16)` (not `% 65535`).
 pub fn fletcher32(data: &[u8]) -> u32 {
     let mut sum1: u32 = 0;
     let mut sum2: u32 = 0;
+    let total_words = data.len() / 2;
 
-    let mut i = 0;
-    while i + 1 < data.len() {
-        let word = u16::from_be_bytes([data[i], data[i + 1]]) as u32;
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
-        i += 2;
+    let mut offset = 0usize;
+    let mut remaining = total_words;
+
+    while remaining > 0 {
+        let batch = remaining.min(360);
+        remaining -= batch;
+
+        for _ in 0..batch {
+            let word = ((data[offset] as u32) << 8) | (data[offset + 1] as u32);
+            sum1 += word;
+            sum2 += sum1;
+            offset += 2;
+        }
+
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
 
-    // Handle odd trailing byte
-    if i < data.len() {
-        let word = data[i] as u32;
-        sum1 = (sum1 + word) % 65535;
-        sum2 = (sum2 + sum1) % 65535;
-    }
+    // Final reduction
+    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
 
     (sum2 << 16) | sum1
 }
@@ -187,7 +202,7 @@ mod tests {
         let payload = vec![0x00u8, 0x80, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00];
         let ck = fletcher32(&payload);
         let mut data = payload.clone();
-        data.extend_from_slice(&ck.to_be_bytes());
+        data.extend_from_slice(&ck.to_le_bytes());
         // The filter stores checksum in big-endian
         let stripped = crate::filters::fletcher32::verify_and_strip(&data).unwrap();
         assert_eq!(stripped, payload);
