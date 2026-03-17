@@ -309,6 +309,62 @@ fn split_parent_path(path: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// Hyperslab selection for reading slices of NetCDF variables.
+///
+/// Each element corresponds to one dimension of the variable.
+#[derive(Debug, Clone)]
+pub struct NcSliceInfo {
+    pub selections: Vec<NcSliceInfoElem>,
+}
+
+/// A single dimension's selection within a hyperslab.
+#[derive(Debug, Clone)]
+pub enum NcSliceInfoElem {
+    /// Select a single index (reduces dimensionality).
+    Index(u64),
+    /// Select a range with stride.
+    Slice { start: u64, end: u64, step: u64 },
+}
+
+impl NcSliceInfo {
+    /// Create a selection that reads everything for an `ndim`-dimensional variable.
+    pub fn all(ndim: usize) -> Self {
+        NcSliceInfo {
+            selections: vec![
+                NcSliceInfoElem::Slice {
+                    start: 0,
+                    end: u64::MAX,
+                    step: 1,
+                };
+                ndim
+            ],
+        }
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+impl NcSliceInfo {
+    /// Convert to hdf5_reader::SliceInfo for NC4 delegation.
+    pub(crate) fn to_hdf5_slice_info(&self) -> hdf5_reader::SliceInfo {
+        hdf5_reader::SliceInfo {
+            selections: self
+                .selections
+                .iter()
+                .map(|s| match s {
+                    NcSliceInfoElem::Index(idx) => hdf5_reader::SliceInfoElem::Index(*idx),
+                    NcSliceInfoElem::Slice { start, end, step } => {
+                        hdf5_reader::SliceInfoElem::Slice {
+                            start: *start,
+                            end: *end,
+                            step: *step,
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

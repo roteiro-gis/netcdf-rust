@@ -22,6 +22,31 @@ pub trait NcReadType: Clone + Default + Send + 'static {
 
     /// Size in bytes of one element.
     fn element_size() -> usize;
+
+    /// Bulk decode `count` elements from a contiguous big-endian byte slice.
+    ///
+    /// Default implementation falls back to per-element decoding. Types with
+    /// multi-byte elements override this with an optimized bulk path using
+    /// `chunks_exact` + byte-swap (on LE hosts) or `copy_nonoverlapping`
+    /// (on BE hosts).
+    fn decode_bulk_be(raw: &[u8], count: usize) -> Result<Vec<Self>> {
+        let elem_size = Self::element_size();
+        let needed = count * elem_size;
+        if raw.len() < needed {
+            return Err(Error::InvalidData(format!(
+                "need {} bytes for {} elements, got {}",
+                needed,
+                count,
+                raw.len()
+            )));
+        }
+        let mut values = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = i * elem_size;
+            values.push(Self::from_be_bytes(&raw[start..start + elem_size])?);
+        }
+        Ok(values)
+    }
 }
 
 macro_rules! impl_nc_read_type {
@@ -47,6 +72,46 @@ macro_rules! impl_nc_read_type {
 
             fn element_size() -> usize {
                 $size
+            }
+
+            fn decode_bulk_be(raw: &[u8], count: usize) -> Result<Vec<Self>> {
+                let total_bytes = count * $size;
+                if raw.len() < total_bytes {
+                    return Err(Error::InvalidData(format!(
+                        "need {} bytes for {} elements of {}, got {}",
+                        total_bytes,
+                        count,
+                        stringify!($ty),
+                        raw.len()
+                    )));
+                }
+                let bytes = &raw[..total_bytes];
+                #[cfg(target_endian = "big")]
+                {
+                    // Native BE: memcpy is safe for any element size.
+                    let mut values = Vec::<$ty>::with_capacity(count);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            values.as_mut_ptr() as *mut u8,
+                            total_bytes,
+                        );
+                        values.set_len(count);
+                    }
+                    Ok(values)
+                }
+                #[cfg(target_endian = "little")]
+                {
+                    // LE host reading BE data: chunks_exact + byte-swap.
+                    Ok(bytes
+                        .chunks_exact($size)
+                        .map(|chunk| {
+                            let mut arr = [0u8; $size];
+                            arr.copy_from_slice(chunk);
+                            <$ty>::from_be_bytes(arr)
+                        })
+                        .collect())
+                }
             }
         }
     };
@@ -93,11 +158,7 @@ pub fn read_non_record_variable<T: NcReadType>(
     }
 
     let data_slice = &file_data[offset..offset + total_bytes];
-    let mut values = Vec::with_capacity(total_elements);
-    for i in 0..total_elements {
-        let start = i * elem_size;
-        values.push(T::from_be_bytes(&data_slice[start..start + elem_size])?);
-    }
+    let values = T::decode_bulk_be(data_slice, total_elements)?;
 
     let shape: Vec<usize> = var.shape().iter().map(|&s| s as usize).collect();
     if shape.is_empty() {
@@ -160,10 +221,8 @@ pub fn read_record_variable<T: NcReadType>(
             )));
         }
         let rec_slice = &file_data[rec_offset..rec_offset + bytes_per_record];
-        for i in 0..elements_per_record {
-            let start = i * elem_size;
-            values.push(T::from_be_bytes(&rec_slice[start..start + elem_size])?);
-        }
+        let rec_values = T::decode_bulk_be(rec_slice, elements_per_record)?;
+        values.extend(rec_values);
     }
 
     ArrayD::from_shape_vec(IxDyn(&shape), values)

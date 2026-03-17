@@ -18,6 +18,8 @@ rayon = { version = "1", optional = true }
 tempfile = "3"
 criterion = "0.5"
 netcdf = { version = "0.12", features = ["static"] }
+proptest = "1"
+peak_alloc = "0.2"
 
 [features]
 default = ["netcdf4", "rayon"]

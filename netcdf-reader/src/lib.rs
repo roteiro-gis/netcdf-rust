@@ -123,10 +123,7 @@ impl NcFile {
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
-                // For classic formats, the ClassicFile will re-mmap, so we just
-                // pass the path. (We could also hand it the mmap, but re-opening
-                // is cleaner for ownership.)
-                let classic = classic::ClassicFile::open(path, format)?;
+                let classic = classic::ClassicFile::from_mmap(mmap, format)?;
                 Ok(NcFile {
                     format,
                     inner: NcFileInner::Classic(classic),
@@ -304,14 +301,28 @@ impl NcFile {
         }
     }
 
+    /// Read a variable with automatic type promotion to f64.
+    ///
+    /// Reads in the native storage type (i8, i16, i32, f32, f64, u8, etc.)
+    /// and promotes all values to f64. This avoids the `TypeMismatch` error
+    /// that `read_variable::<f64>` produces for non-f64 variables.
+    pub fn read_variable_as_f64(&self, name: &str) -> Result<ArrayD<f64>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_as_f64(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.read_variable_as_f64(name),
+        }
+    }
+
     /// Read a variable and apply `scale_factor`/`add_offset` unpacking.
     ///
     /// Returns `actual = stored * scale_factor + add_offset`.
     /// If neither attribute is present, returns the raw data as f64.
+    /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_unpacked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
         let params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable::<f64>(name)?;
+        let mut data = self.read_variable_as_f64(name)?;
         if let Some(p) = params {
             p.apply(&mut data);
         }
@@ -320,10 +331,11 @@ impl NcFile {
 
     /// Read a variable, replace `_FillValue`/`missing_value` with NaN,
     /// and mask values outside `valid_min`/`valid_max`/`valid_range`.
+    /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_masked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
         let params = masked::MaskParams::from_variable(var);
-        let mut data = self.read_variable::<f64>(name)?;
+        let mut data = self.read_variable_as_f64(name)?;
         if let Some(p) = params {
             p.apply(&mut data);
         }
@@ -333,11 +345,12 @@ impl NcFile {
     /// Read a variable with both masking and unpacking (CF spec order).
     ///
     /// Order: read → mask fill/missing → unpack (scale+offset).
+    /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_unpacked_masked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
         let mask_params = masked::MaskParams::from_variable(var);
         let unpack_params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable::<f64>(name)?;
+        let mut data = self.read_variable_as_f64(name)?;
         if let Some(p) = mask_params {
             p.apply(&mut data);
         }
@@ -345,6 +358,242 @@ impl NcFile {
             p.apply(&mut data);
         }
         Ok(data)
+    }
+
+    // ----- Slice API -----
+
+    /// Read a slice (hyperslab) of a variable as a typed array.
+    pub fn read_variable_slice<T: NcReadable>(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<T>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_slice::<T>(name, selection),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable_slice::<T>(name, selection)?),
+        }
+    }
+
+    /// Read a slice (hyperslab) using chunk-level parallelism when available.
+    ///
+    /// For NetCDF-4 chunked datasets, overlapping chunks are decompressed in
+    /// parallel via Rayon. Classic formats fall back to `read_variable_slice`.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_slice_parallel<T: NcReadable>(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<T>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_slice::<T>(name, selection),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable_slice_parallel::<T>(name, selection)?),
+        }
+    }
+
+    /// Read a slice of a variable with automatic type promotion to f64.
+    pub fn read_variable_slice_as_f64(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<f64>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_slice_as_f64(name, selection),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.read_variable_slice_as_f64(name, selection),
+        }
+    }
+
+    /// Read a slice with `scale_factor`/`add_offset` unpacking.
+    pub fn read_variable_slice_unpacked(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<f64>> {
+        let var = self.variable(name)?;
+        let params = unpack::UnpackParams::from_variable(var);
+        let mut data = self.read_variable_slice_as_f64(name, selection)?;
+        if let Some(p) = params {
+            p.apply(&mut data);
+        }
+        Ok(data)
+    }
+
+    /// Read a slice with fill/missing value masking.
+    pub fn read_variable_slice_masked(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<f64>> {
+        let var = self.variable(name)?;
+        let params = masked::MaskParams::from_variable(var);
+        let mut data = self.read_variable_slice_as_f64(name, selection)?;
+        if let Some(p) = params {
+            p.apply(&mut data);
+        }
+        Ok(data)
+    }
+
+    /// Read a slice with both masking and unpacking (CF spec order).
+    pub fn read_variable_slice_unpacked_masked(
+        &self,
+        name: &str,
+        selection: &NcSliceInfo,
+    ) -> Result<ArrayD<f64>> {
+        let var = self.variable(name)?;
+        let mask_params = masked::MaskParams::from_variable(var);
+        let unpack_params = unpack::UnpackParams::from_variable(var);
+        let mut data = self.read_variable_slice_as_f64(name, selection)?;
+        if let Some(p) = mask_params {
+            p.apply(&mut data);
+        }
+        if let Some(p) = unpack_params {
+            p.apply(&mut data);
+        }
+        Ok(data)
+    }
+
+    // ----- Lazy Slice Iterator -----
+
+    /// Create an iterator that yields one slice per index along a given dimension.
+    ///
+    /// Each call to `next()` reads one slice using the slice API. This is
+    /// useful for iterating time steps, levels, etc. without loading the
+    /// entire dataset into memory.
+    pub fn iter_slices<T: NcReadable>(
+        &self,
+        name: &str,
+        dim: usize,
+    ) -> Result<NcSliceIterator<'_, T>> {
+        let var = self.variable(name)?;
+        let ndim = var.ndim();
+        if dim >= ndim {
+            return Err(Error::InvalidData(format!(
+                "dimension index {} out of range for {}-dimensional variable '{}'",
+                dim, ndim, name
+            )));
+        }
+        let dim_size = var.dimensions[dim].size;
+        Ok(NcSliceIterator {
+            file: self,
+            name: name.to_string(),
+            dim,
+            dim_size,
+            current: 0,
+            ndim,
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Configuration options for opening a NetCDF file.
+pub struct NcOpenOptions {
+    /// Maximum bytes for the chunk cache (NC4 only). Default: 64 MiB.
+    pub chunk_cache_bytes: usize,
+    /// Maximum number of chunk cache slots (NC4 only). Default: 521.
+    pub chunk_cache_slots: usize,
+    /// Custom filter registry (NC4 only).
+    #[cfg(feature = "netcdf4")]
+    pub filter_registry: Option<hdf5_reader::FilterRegistry>,
+}
+
+impl Default for NcOpenOptions {
+    fn default() -> Self {
+        NcOpenOptions {
+            chunk_cache_bytes: 64 * 1024 * 1024,
+            chunk_cache_slots: 521,
+            #[cfg(feature = "netcdf4")]
+            filter_registry: None,
+        }
+    }
+}
+
+impl NcFile {
+    /// Open a NetCDF file with custom options.
+    pub fn open_with_options(path: impl AsRef<Path>, options: NcOpenOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let format = detect_format(&mmap)?;
+
+        match format {
+            NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
+                let classic = classic::ClassicFile::from_mmap(mmap, format)?;
+                Ok(NcFile {
+                    format,
+                    inner: NcFileInner::Classic(classic),
+                })
+            }
+            NcFormat::Nc4 | NcFormat::Nc4Classic => {
+                #[cfg(feature = "netcdf4")]
+                {
+                    let hdf5_opts = hdf5_reader::OpenOptions {
+                        chunk_cache_bytes: options.chunk_cache_bytes,
+                        chunk_cache_slots: options.chunk_cache_slots,
+                        filter_registry: options.filter_registry,
+                    };
+                    let hdf5 = hdf5_reader::Hdf5File::open_with_options(path, hdf5_opts)?;
+                    let root_group = nc4::groups::build_root_group(&hdf5)?;
+                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, root_group);
+                    let actual_format = if nc4.is_classic_model() {
+                        NcFormat::Nc4Classic
+                    } else {
+                        NcFormat::Nc4
+                    };
+                    Ok(NcFile {
+                        format: actual_format,
+                        inner: NcFileInner::Nc4(nc4),
+                    })
+                }
+                #[cfg(not(feature = "netcdf4"))]
+                {
+                    let _ = options;
+                    Err(Error::Nc4NotEnabled)
+                }
+            }
+        }
+    }
+}
+
+/// Lazy iterator over slices of a variable along a given dimension.
+pub struct NcSliceIterator<'f, T: NcReadable> {
+    file: &'f NcFile,
+    name: String,
+    dim: usize,
+    dim_size: u64,
+    current: u64,
+    ndim: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'f, T: NcReadable> Iterator for NcSliceIterator<'f, T> {
+    type Item = Result<ArrayD<T>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current >= self.dim_size {
+            return None;
+        }
+        let mut selections = Vec::with_capacity(self.ndim);
+        for d in 0..self.ndim {
+            if d == self.dim {
+                selections.push(NcSliceInfoElem::Index(self.current));
+            } else {
+                selections.push(NcSliceInfoElem::Slice {
+                    start: 0,
+                    end: u64::MAX,
+                    step: 1,
+                });
+            }
+        }
+        let selection = NcSliceInfo { selections };
+        self.current += 1;
+        Some(self.file.read_variable_slice::<T>(&self.name, &selection))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = (self.dim_size - self.current) as usize;
+        (remaining, Some(remaining))
     }
 }
 

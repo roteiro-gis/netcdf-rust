@@ -84,6 +84,26 @@ impl ClassicFile {
         })
     }
 
+    /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
+    pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
+        let header = header::parse_header(&mmap, format)?;
+
+        let root_group = NcGroup {
+            name: "/".to_string(),
+            dimensions: header.dimensions,
+            variables: header.variables,
+            attributes: header.global_attributes,
+            groups: Vec::new(),
+        };
+
+        Ok(ClassicFile {
+            format,
+            root_group,
+            data: ClassicData::Mmap(mmap),
+            numrecs: header.numrecs,
+        })
+    }
+
     /// The file format (Classic, Offset64, or Cdf5).
     pub fn format(&self) -> NcFormat {
         self.format

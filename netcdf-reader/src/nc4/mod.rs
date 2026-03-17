@@ -25,6 +25,85 @@ use rayon::ThreadPool;
 use crate::error::{Error, Result};
 use crate::types::NcGroup;
 
+/// Dispatch on `NcType` to read data and promote to `f64`.
+///
+/// `$dtype` must be an expression of type `&NcType`.
+/// `$read_expr` is a macro-like callback: for each numeric type `$T`,
+/// the macro evaluates `$read_expr` with `$T` substituted in.
+///
+/// Usage:
+/// ```ignore
+/// dispatch_read_as_f64!(&var.dtype, |$T| dataset.read_array::<$T>())
+/// ```
+macro_rules! dispatch_read_as_f64 {
+    ($dtype:expr, |$T:ident| $read_expr:expr) => {{
+        use crate::types::NcType;
+        match $dtype {
+            NcType::Byte => {
+                type $T = i8;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Short => {
+                type $T = i16;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Int => {
+                type $T = i32;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Float => {
+                type $T = f32;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Double => {
+                type $T = f64;
+                Ok($read_expr?)
+            }
+            NcType::UByte => {
+                type $T = u8;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::UShort => {
+                type $T = u16;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::UInt => {
+                type $T = u32;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Int64 => {
+                type $T = i64;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::UInt64 => {
+                type $T = u64;
+                let arr = $read_expr?;
+                Ok(arr.mapv(|v| v as f64))
+            }
+            NcType::Char => Err(Error::TypeMismatch {
+                expected: "numeric type".to_string(),
+                actual: "Char".to_string(),
+            }),
+            NcType::String => Err(Error::TypeMismatch {
+                expected: "numeric type".to_string(),
+                actual: "String".to_string(),
+            }),
+            other => Err(Error::TypeMismatch {
+                expected: "numeric type".to_string(),
+                actual: format!("{:?}", other),
+            }),
+        }
+    }};
+}
+
 /// An opened NetCDF-4 file (backed by HDF5).
 pub struct Nc4File {
     hdf5: Hdf5File,
@@ -32,6 +111,11 @@ pub struct Nc4File {
 }
 
 impl Nc4File {
+    /// Create from an already-opened HDF5 file and pre-built root group.
+    pub(crate) fn from_hdf5(hdf5: Hdf5File, root_group: NcGroup) -> Self {
+        Nc4File { hdf5, root_group }
+    }
+
     /// Open a NetCDF-4 file from disk.
     pub fn open(path: &Path) -> Result<Self> {
         let hdf5 = Hdf5File::open(path)?;
@@ -111,6 +195,77 @@ impl Nc4File {
         debug_assert_eq!(dataset.shape(), &var.shape()[..]);
 
         Ok(dataset.read_array_in_pool::<T>(pool)?)
+    }
+}
+
+impl Nc4File {
+    /// Read a variable with automatic type promotion to f64.
+    ///
+    /// Reads in the native HDF5 type and promotes to f64 via `mapv`.
+    pub fn read_variable_as_f64(&self, path: &str) -> Result<ArrayD<f64>> {
+        let normalized = normalize_dataset_path(path)?;
+        let var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+
+        debug_assert_eq!(dataset.shape(), &var.shape()[..]);
+
+        dispatch_read_as_f64!(&var.dtype, |T| dataset.read_array::<T>())
+    }
+
+    /// Read a slice of a variable with automatic type promotion to f64.
+    pub fn read_variable_slice_as_f64(
+        &self,
+        path: &str,
+        selection: &crate::types::NcSliceInfo,
+    ) -> Result<ArrayD<f64>> {
+        let normalized = normalize_dataset_path(path)?;
+        let var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        let hdf5_sel = selection.to_hdf5_slice_info();
+
+        dispatch_read_as_f64!(&var.dtype, |T| dataset.read_slice::<T>(&hdf5_sel))
+    }
+
+    /// Read a typed slice of a variable (NC4 delegation).
+    pub fn read_variable_slice<T: H5Type>(
+        &self,
+        path: &str,
+        selection: &crate::types::NcSliceInfo,
+    ) -> Result<ArrayD<T>> {
+        let normalized = normalize_dataset_path(path)?;
+        let _var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        let hdf5_sel = selection.to_hdf5_slice_info();
+        Ok(dataset.read_slice::<T>(&hdf5_sel)?)
+    }
+
+    /// Read a typed slice of a variable using chunk-level parallelism.
+    ///
+    /// Chunked datasets decompress overlapping chunks in parallel via Rayon.
+    /// Non-chunked layouts fall back to `read_variable_slice`.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_slice_parallel<T: H5Type>(
+        &self,
+        path: &str,
+        selection: &crate::types::NcSliceInfo,
+    ) -> Result<ArrayD<T>> {
+        let normalized = normalize_dataset_path(path)?;
+        let _var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        let hdf5_sel = selection.to_hdf5_slice_info();
+        Ok(dataset.read_slice_parallel::<T>(&hdf5_sel)?)
     }
 }
 
