@@ -35,13 +35,13 @@ pub mod cache;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use memmap2::Mmap;
+// parking_lot::Mutex used via fully-qualified paths in HeaderCache and constructors.
 
 use cache::ChunkCache;
 use error::{Error, Result};
-use filters::FilterRegistry;
 use group::Group;
 use io::Cursor;
 use object_header::ObjectHeader;
@@ -55,6 +55,7 @@ pub use datatype_api::{
     StringPadding, StringSize,
 };
 pub use error::ByteOrder;
+pub use filters::FilterRegistry;
 pub use messages::datatype::Datatype;
 
 /// Configuration options for opening an HDF5 file.
@@ -78,7 +79,7 @@ impl Default for OpenOptions {
 }
 
 /// Cache for parsed object headers, keyed by file address.
-pub type HeaderCache = Arc<Mutex<HashMap<u64, Arc<ObjectHeader>>>>;
+pub type HeaderCache = Arc<parking_lot::Mutex<HashMap<u64, Arc<ObjectHeader>>>>;
 
 /// An opened HDF5 file.
 ///
@@ -139,7 +140,7 @@ impl Hdf5File {
             data: FileData::Mmap(mmap),
             superblock,
             chunk_cache: cache,
-            header_cache: Arc::new(Mutex::new(HashMap::new())),
+            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             filter_registry: Arc::new(registry),
         })
     }
@@ -160,7 +161,7 @@ impl Hdf5File {
             data: FileData::Bytes(data),
             superblock,
             chunk_cache: Arc::new(ChunkCache::default()),
-            header_cache: Arc::new(Mutex::new(HashMap::new())),
+            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             filter_registry: Arc::new(FilterRegistry::default()),
         })
     }
@@ -175,7 +176,7 @@ impl Hdf5File {
     /// Uses the internal cache to avoid re-parsing the same header.
     pub fn get_or_parse_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
         {
-            let cache = self.header_cache.lock().unwrap();
+            let cache = self.header_cache.lock();
             if let Some(hdr) = cache.get(&addr) {
                 return Ok(Arc::clone(hdr));
             }
@@ -188,7 +189,7 @@ impl Hdf5File {
             self.superblock.length_size,
         )?;
         let arc = Arc::new(hdr);
-        let mut cache = self.header_cache.lock().unwrap();
+        let mut cache = self.header_cache.lock();
         cache.insert(addr, Arc::clone(&arc));
         Ok(arc)
     }

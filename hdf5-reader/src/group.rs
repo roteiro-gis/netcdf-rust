@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::btree_v1;
@@ -88,14 +90,14 @@ impl<'f> Group<'f> {
     /// Parse (or retrieve from cache) the object header at the given address.
     fn cached_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
         {
-            let cache = self.header_cache.lock().unwrap();
+            let cache = self.header_cache.lock();
             if let Some(hdr) = cache.get(&addr) {
                 return Ok(Arc::clone(hdr));
             }
         }
         let hdr = ObjectHeader::parse_at(self.file_data, addr, self.offset_size, self.length_size)?;
         let arc = Arc::new(hdr);
-        let mut cache = self.header_cache.lock().unwrap();
+        let mut cache = self.header_cache.lock();
         cache.insert(addr, Arc::clone(&arc));
         Ok(arc)
     }
@@ -181,7 +183,7 @@ impl<'f> Group<'f> {
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
         let mut header = (*self.cached_header(self.address)?).clone();
-        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size)?;
         Ok(
             collect_attribute_messages(
                 &header,
@@ -407,7 +409,7 @@ impl<'f> Group<'f> {
     /// A dataset has a dataspace + datatype + layout.
     fn is_group_at(&self, address: u64) -> Result<bool> {
         let mut header = (*self.cached_header(address)?).clone();
-        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size);
+        header.resolve_shared_messages(self.file_data, self.offset_size, self.length_size)?;
         for msg in &header.messages {
             match msg {
                 // Group indicators

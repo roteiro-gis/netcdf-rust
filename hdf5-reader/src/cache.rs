@@ -1,19 +1,24 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use lru::LruCache;
+use parking_lot::Mutex;
+use smallvec::SmallVec;
 use std::num::NonZeroUsize;
 
 /// Key for the chunk cache: (dataset object header address, chunk offset tuple).
+///
+/// Uses `SmallVec<[u64; 4]>` to avoid heap allocation for datasets with up to
+/// 4 dimensions (the common case for climate/science data).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChunkKey {
     pub dataset_addr: u64,
-    pub chunk_offsets: Vec<u64>,
+    pub chunk_offsets: SmallVec<[u64; 4]>,
 }
 
 /// LRU cache for decompressed chunks.
 ///
-/// Thread-safe via `Mutex`. Values are `Arc<Vec<u8>>` so multiple readers
-/// can share the same decompressed chunk data.
+/// Thread-safe via `parking_lot::Mutex` (non-poisoning). Values are
+/// `Arc<Vec<u8>>` so multiple readers can share the same decompressed chunk data.
 pub struct ChunkCache {
     inner: Mutex<ChunkCacheState>,
     max_bytes: usize,
@@ -40,10 +45,10 @@ impl ChunkCache {
         }
     }
 
-    /// Get a cached chunk, if present.
+    /// Get a cached chunk, if present. Promotes the entry in LRU order.
     pub fn get(&self, key: &ChunkKey) -> Option<Arc<Vec<u8>>> {
-        let cache = self.inner.lock().unwrap();
-        cache.cache.peek(key).cloned()
+        let mut cache = self.inner.lock();
+        cache.cache.get(key).cloned()
     }
 
     /// Insert a chunk into the cache. Evicts LRU entries if over capacity.
@@ -55,7 +60,7 @@ impl ChunkCache {
             return arc;
         }
 
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
         // Evict until we have room
         while state.current_bytes + data_len > self.max_bytes && !state.cache.is_empty() {
             if let Some((_, evicted)) = state.cache.pop_lru() {
@@ -85,7 +90,7 @@ mod tests {
         let cache = ChunkCache::new(1024, 10);
         let key = ChunkKey {
             dataset_addr: 100,
-            chunk_offsets: vec![0, 0],
+            chunk_offsets: SmallVec::from_vec(vec![0, 0]),
         };
         cache.insert(key.clone(), vec![1, 2, 3]);
         let val = cache.get(&key).unwrap();
@@ -98,7 +103,7 @@ mod tests {
         for i in 0..5 {
             let key = ChunkKey {
                 dataset_addr: 100,
-                chunk_offsets: vec![i],
+                chunk_offsets: SmallVec::from_vec(vec![i]),
             };
             cache.insert(key, vec![0; 4]); // 4 bytes each
         }
@@ -106,7 +111,7 @@ mod tests {
         // At most 2 entries of 4 bytes each = 8 bytes
         let first_key = ChunkKey {
             dataset_addr: 100,
-            chunk_offsets: vec![0],
+            chunk_offsets: SmallVec::from_vec(vec![0]),
         };
         assert!(cache.get(&first_key).is_none()); // should be evicted
     }
@@ -116,9 +121,44 @@ mod tests {
         let cache = ChunkCache::new(0, 10);
         let key = ChunkKey {
             dataset_addr: 100,
-            chunk_offsets: vec![0],
+            chunk_offsets: SmallVec::from_vec(vec![0]),
         };
         cache.insert(key.clone(), vec![1, 2, 3]);
         assert!(cache.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_cache_promotes_on_get() {
+        // Verify that get() promotes entries in LRU order (the bug fix).
+        let cache = ChunkCache::new(12, 10); // room for 3 entries of 4 bytes
+        let key_a = ChunkKey {
+            dataset_addr: 1,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+        let key_b = ChunkKey {
+            dataset_addr: 2,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+        let key_c = ChunkKey {
+            dataset_addr: 3,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+
+        cache.insert(key_a.clone(), vec![0; 4]); // LRU order: a
+        cache.insert(key_b.clone(), vec![0; 4]); // LRU order: a, b
+        cache.insert(key_c.clone(), vec![0; 4]); // LRU order: a, b, c
+
+        // Access key_a to promote it
+        assert!(cache.get(&key_a).is_some()); // LRU order: b, c, a
+
+        // Insert a new entry that forces eviction
+        let key_d = ChunkKey {
+            dataset_addr: 4,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+        cache.insert(key_d, vec![0; 4]); // Should evict b (LRU)
+
+        assert!(cache.get(&key_a).is_some()); // a was promoted, should survive
+        assert!(cache.get(&key_b).is_none()); // b was LRU, should be evicted
     }
 }

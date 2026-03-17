@@ -13,9 +13,12 @@ thiserror = { workspace = true }
 memmap2 = { workspace = true }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 lru = "0.12"
+parking_lot = "0.12"
+smallvec = "1"
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
 
 [features]
 default = ["rayon", "lz4"]
