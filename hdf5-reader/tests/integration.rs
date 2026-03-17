@@ -327,3 +327,47 @@ fn test_chunked_slice_range_with_step() {
         assert!((sliced[[1, c]] - (40 + c) as f32).abs() < 1e-6);
     }
 }
+
+#[test]
+fn test_chunked_shuffle_deflate() {
+    let path = skip_if_missing!("chunked_shuffle_deflate.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/values").unwrap();
+    assert_eq!(ds.shape(), &[100, 100]);
+    assert_eq!(ds.chunks().unwrap(), vec![10, 10]);
+
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[100, 100]);
+    // Verify the data is finite (generated from np.random.randn with seed 42)
+    assert!(data.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn test_chunked_lz4() {
+    let path = skip_if_missing!("chunked_lz4.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[10, 20]);
+
+    let data: ndarray::ArrayD<f32> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[10, 20]);
+    // Data is np.arange(200).reshape(10,20)
+    assert!((data[[0, 0]] - 0.0).abs() < 1e-6);
+    assert!((data[[0, 1]] - 1.0).abs() < 1e-6);
+    assert!((data[[1, 0]] - 20.0).abs() < 1e-6);
+    assert!((data[[9, 19]] - 199.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_chunked_lz4_compressed() {
+    // This fixture has all-zero data that actually compresses with LZ4
+    let path = skip_if_missing!("chunked_lz4_zeros.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    let data: ndarray::ArrayD<f32> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[10, 20]);
+    assert!(data.iter().all(|&v| v == 0.0));
+}
