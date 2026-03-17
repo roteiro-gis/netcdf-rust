@@ -26,6 +26,20 @@ jobs:
       - name: Test
         run: cargo test
 
+  no-default-features:
+    name: Test without default features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test hdf5-reader no defaults
+        run: cargo test -p hdf5-reader --no-default-features
+
+      - name: Test netcdf-reader no defaults
+        run: cargo test -p netcdf-reader --no-default-features
+
   fixtures:
     name: Integration tests with fixtures
     runs-on: ubuntu-latest
@@ -46,3 +60,42 @@ jobs:
 
       - name: Test with fixtures
         run: cargo test
+
+  bench-regression:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev libnetcdf-dev
+
+      - name: Install critcmp
+        run: cargo install critcmp
+
+      - name: Generate fixtures for benchmarks
+        run: |
+          pip install 'h5py<3.16' netCDF4 numpy
+          python testdata/generate_fixtures.py
+
+      - name: Checkout base and run baseline benchmarks
+        run: |
+          git worktree add ../base origin/${{ github.base_ref }}
+          cd ../base
+          cargo bench --bench compare_georust -- --save-baseline base 2>/dev/null || true
+
+      - name: Run PR benchmarks
+        run: cargo bench --bench compare_georust -- --save-baseline pr
+
+      - name: Compare (fail on >10% regression)
+        run: |
+          critcmp base pr --threshold 10 || {
+            echo "::warning::Benchmark regression >10% detected"
+            critcmp base pr
+            exit 1
+          }
