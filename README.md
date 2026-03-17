@@ -12,21 +12,43 @@ Pure-Rust, read-only decoders for HDF5 and NetCDF files. No C libraries, no buil
 ## Usage
 
 ```rust
-use netcdf_reader::NcFile;
+use netcdf_reader::{NcFile, NcSliceInfo, NcSliceInfoElem};
 
 let file = NcFile::open("era5.nc")?;
 println!("format: {:?}", file.format());
-
-for dim in file.dimensions() {
-    println!("  dim: {} ({})", dim.name, dim.size);
-}
 
 for var in file.variables() {
     println!("  var: {} {:?}", var.name(), var.shape());
 }
 
-// Read data (works for both classic and NetCDF-4)
+// Read typed data (works for both classic and NetCDF-4)
 let temp: ndarray::ArrayD<f32> = file.read_variable("temperature")?;
+
+// Type-promoting read (any numeric type → f64)
+let data = file.read_variable_as_f64("temperature")?;
+
+// CF conventions: unpack packed integer data (scale_factor + add_offset)
+let unpacked = file.read_variable_unpacked("temperature")?;
+
+// CF conventions: mask fill values + unpack in one call
+let clean = file.read_variable_unpacked_masked("temperature")?;
+
+// Hyperslab: read a single time step from a 4D variable
+let sel = NcSliceInfo {
+    selections: vec![
+        NcSliceInfoElem::Index(0),                                        // time=0
+        NcSliceInfoElem::Slice { start: 0, end: u64::MAX, step: 1 },     // all levels
+        NcSliceInfoElem::Slice { start: 0, end: u64::MAX, step: 1 },     // all lat
+        NcSliceInfoElem::Slice { start: 0, end: u64::MAX, step: 1 },     // all lon
+    ],
+};
+let step: ndarray::ArrayD<f32> = file.read_variable_slice("temperature", &sel)?;
+
+// Lazy iteration over time steps
+for slice in file.iter_slices::<f32>("temperature", 0)? {
+    let data = slice?;
+    println!("  step shape: {:?}", data.shape());
+}
 ```
 
 Using `hdf5-reader` directly:
@@ -63,7 +85,8 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 - Shared (committed) datatype resolution
 - Variable-length string reading via global heap
 - Object reference resolution
-- LRU chunk cache with configurable size
+- Parallel chunk decompression for full reads and slice reads (Rayon, feature-gated)
+- LRU chunk cache with configurable size (non-poisoning `parking_lot::Mutex`)
 - Object header cache for repeated access
 - Memory-mapped I/O or owned-byte (`from_vec`) access
 
@@ -73,9 +96,14 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 - Automatic format detection from magic bytes
 - Dimension reconstruction via `DIMENSION_LIST` object references (with size-based fallback)
 - Unified `NcFile::read_variable::<T>()` across all formats
+- Type-promoting `read_variable_as_f64()` — reads any numeric type and promotes to f64
 - `scale_factor`/`add_offset` unpacking via `read_variable_unpacked()`
 - `_FillValue`/`missing_value` masking via `read_variable_masked()`
 - Combined mask-then-unpack via `read_variable_unpacked_masked()`
+- Hyperslab/slice API: `read_variable_slice()`, `read_variable_slice_as_f64()`, plus CF variants
+- Lazy slice iterator: `iter_slices()` for streaming one dimension at a time
+- Parallel slice reads: `read_variable_slice_parallel()` for chunked NC4 data
+- `NcOpenOptions` builder for cache sizing and custom filter registries
 - Compound, Opaque, Array, and VLen type mapping for NetCDF-4
 - Attribute filtering (hides internal `_NCProperties`, `DIMENSION_LIST`, etc.)
 - Record (unlimited) dimension support
@@ -164,6 +192,12 @@ Notes:
   `read_full_internal_parallel`, `slice_reuse_handle_hdf5_backend`, and
   parallel throughput workloads so setup costs and steady-state read costs are
   visible independently.
+- `cf_conventions_overhead` measures the cost of type promotion, unpacking, and
+  masking compared to a raw typed read.
+- `slice_selectivity` measures slice reads at 100%/50%/10%/1% selectivity on
+  large compressed data to show how chunk-selective reading scales.
+- `memory_profile` tracks peak allocation via `peak_alloc` for full reads vs
+  slice reads.
 - The suite also includes `parallel_metadata_batch` and
   `parallel_slice_batch`, which keep one open handle per worker, synchronize
   start with a barrier, and then execute many small operations. Those runs are
@@ -183,14 +217,14 @@ Notes:
   that means a shared process-global mutex around FFI calls into `netcdf-c`.
   The contention benchmarks are intended to make the effect of that design
   visible.
-- The slice workload is NetCDF-4 only and uses the native HDF5 dataset API on
-  our side, because `netcdf-reader` does not yet expose high-level sliced reads.
 
 ## Known limitations
 
 - External HDF5 links are skipped (soft links are resolved)
 - SZIP, N-Bit, and ScaleOffset filters are not built in (register via `FilterRegistry`)
-- SOHM (shared object header message table) resolution is deferred
+- SOHM (shared object header message table) resolution returns a descriptive error
+- Fractal heap huge/tiny objects are not yet supported (managed objects work)
+- Classic format slice reads fall back to full-read-then-slice when the selection has a stride >1 or restricts inner dimensions
 - CF time decoding uses Gregorian approximation for non-standard calendars (noleap, 360_day)
 
 ## License

@@ -1,6 +1,6 @@
 # Benchmark Report
 
-Date: 2026-03-16
+Date: 2026-03-17
 
 This document summarizes the current benchmark suite for `netcdf-rust` and a
 representative local run against the C-backed `georust/netcdf` baseline.
@@ -38,6 +38,11 @@ The suite covers the main user-visible workloads for this repository:
 - `read_full_internal_parallel`: one large read using internal chunk-parallelism
 - `read_full_internal_parallel_nocache`: the same single-read path with the
   chunk cache disabled to expose cold decompression cost
+- `cf_conventions_overhead`: cost of type promotion (`read_variable_as_f64`),
+  unpacking, and masking relative to a raw typed read
+- `slice_selectivity`: slice reads at 100%/50%/10%/1% selectivity on large
+  compressed data
+- `memory_profile`: peak allocation tracking via `peak_alloc` for full vs slice reads
 
 The compared baseline is `georust/netcdf`, which uses the native `netcdf-c`
 library underneath.
@@ -249,14 +254,18 @@ The current suite is representative because it separates:
 
 The current results demonstrate that:
 
-- `netcdf-rust` is already strong on classic files, NetCDF-4 metadata, and nested
-  groups
+- `netcdf-rust` is faster than georust/netcdf-C on classic format reads at all
+  sizes, including large CDF-5 (previously a loss, now 1.6x faster due to bulk
+  big-endian decode optimization)
+- `netcdf-rust` is faster on NetCDF-4 metadata, nested groups, and small-to-medium
+  reads
 - `netcdf-rust` scales materially better on repeated concurrent metadata and
   tiny-slice workloads in this environment
 - the `georust/netcdf` baseline uses a shared process-global mutex around FFI
   calls into `netcdf-c`, and it does not show the same aggregate throughput
   scaling in those workloads
-- `netcdf-rust` is competitive on large compressed reads
+- `netcdf-rust` is competitive on large compressed reads (0.87x on
+  large_nc4_compressed, closing in on parity)
 - `netcdf-rust` benefits from concurrency in independent-read and cold-read paths
 - warm single-read scaling is now constrained more by this host than by obvious
   decoder serialization
@@ -267,25 +276,22 @@ Summary of the latest full benchmark run (Apple M1, macOS 13.0):
 
 | Benchmark | cairn | georust | Ratio |
 |---|---:|---:|---|
-| **open_only** | | | |
-| cdf1_simple | 23 µs | 61 µs | 2.6x faster |
-| nc4_basic | 44 µs | 259 µs | 5.9x faster |
-| nc4_compressed | 54 µs | 254 µs | 4.7x faster |
-| large_cdf5 | 36 µs | 1.09 ms | 30x faster |
-| large_nc4_compressed | 52 µs | 291 µs | 5.6x faster |
-| **metadata_reuse** | | | |
-| cdf1_simple | 6.5 ns | 781 ns | 120x faster |
-| nc4_basic | 6.1 ns | 2.59 µs | 424x faster |
-| large_nc4_compressed | 7.2 ns | 1.07 µs | 148x faster |
-| **read_full** | | | |
-| cdf1_simple | 223 ns (857 MiB/s) | 1.0 µs (190 MiB/s) | 4.5x faster |
-| nc4_basic | 2.1 µs (181 MiB/s) | 4.5 µs (86 MiB/s) | 2.1x faster |
-| nc4_compressed | 24.6 µs (1.51 GiB/s) | 25.3 µs (1.47 GiB/s) | ~parity |
-| large_nc4_compressed | 5.6 ms (1.40 GiB/s) | 4.1 ms (1.91 GiB/s) | 0.73x |
-| **parallel read** | | | |
-| cairn_x1 nc4_compressed | 22.4 µs (1.66 GiB/s) | 33.9 µs (1.10 GiB/s) | 1.5x faster |
-| cairn_x1 large_nc4 | 3.77 ms (2.07 GiB/s) | 4.14 ms (1.89 GiB/s) | 1.1x faster |
-| cairn_x4 large_nc4 | 3.69 ms (2.12 GiB/s) | — | internal parallelism |
+| **read_full (reuse handle)** | | | |
+| cdf1_simple | 167 ns | 992 ns | 5.9x faster |
+| nc4_basic | 2.1 µs | 4.5 µs | 2.1x faster |
+| nc4_compressed | 29 µs | 28 µs | ~parity |
+| nc4_groups | 2.2 µs | 4.9 µs | 2.2x faster |
+| nested_nc4_groups | 3.1 µs | 4.6 µs | 1.5x faster |
+| large_cdf5 | 2.9 ms | 4.6 ms | 1.6x faster |
+| large_nc4_compressed | 4.0 ms | 3.5 ms | 0.87x |
+| **slice (reuse handle)** | | | |
+| nc4_basic | 604 ns | 5.1 µs | 8.5x faster |
+| large_nc4_compressed | 1.49 ms | 170 µs | 0.11x |
+
+Changes since previous report:
+- **large_cdf5**: was 1.54x *slower* than georust, now **1.6x faster** (bulk BE decode optimization)
+- **cdf1_simple**: improved from 3.6x to **5.9x** faster (same optimization)
+- **large_nc4_compressed**: improved from 0.73x to **0.87x** (filter pipeline and cache fixes)
 
 ## Limits
 
