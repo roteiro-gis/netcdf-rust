@@ -19,6 +19,9 @@ const FRHP_SIGNATURE: [u8; 4] = *b"FRHP";
 /// Signature bytes for a direct block: ASCII `FHDB`.
 const _FHDB_SIGNATURE: [u8; 4] = *b"FHDB";
 
+/// Signature bytes for an indirect block: ASCII `FHIB`.
+const FHIB_SIGNATURE: [u8; 4] = *b"FHIB";
+
 /// Parsed fractal heap header.
 #[derive(Debug, Clone)]
 pub struct FractalHeap {
@@ -207,11 +210,24 @@ impl FractalHeap {
 
         // First nibble is the type: 0 = managed, 1 = tiny, 2 = huge.
         let id_type = (heap_id[0] >> 4) & 0x03;
-        if id_type != 0 {
-            return Err(Error::InvalidData(format!(
-                "fractal heap ID type {} not supported (only managed=0)",
-                id_type
-            )));
+        match id_type {
+            0 => {} // managed — handled below
+            1 => {
+                return Err(Error::Other(
+                    "fractal heap tiny objects not yet supported".to_string(),
+                ));
+            }
+            2 => {
+                return Err(Error::Other(
+                    "fractal heap huge objects not yet supported".to_string(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidData(format!(
+                    "unknown fractal heap ID type {}",
+                    other
+                )));
+            }
         }
 
         // Decode the offset and length from the heap ID.
@@ -293,6 +309,19 @@ impl FractalHeap {
         offset_size: u8,
         nrows: u16,
     ) -> Result<(u64, u64, u64)> {
+        // Validate FHIB signature
+        let addr = indirect_address as usize;
+        if addr + 4 > file_data.len() {
+            return Err(Error::OffsetOutOfBounds(indirect_address));
+        }
+        if file_data[addr..addr + 4] != FHIB_SIGNATURE {
+            return Err(Error::InvalidData(format!(
+                "expected FHIB signature at offset {:#x}, got {:?}",
+                indirect_address,
+                &file_data[addr..addr + 4]
+            )));
+        }
+
         // The doubling table has `table_width` entries per row.
         // Row 0 and 1 have blocks of size `starting_block_size`.
         // Row r (for r >= 1) has blocks of size `starting_block_size * 2^(r-1)`.
