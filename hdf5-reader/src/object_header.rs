@@ -69,9 +69,15 @@ impl ObjectHeader {
     ///
     /// For `SharedInOhdr`, the referenced object header is parsed and the first
     /// matching message type is extracted. `SharedInSohm` returns an error (rare).
-    pub fn resolve_shared_messages(&mut self, data: &[u8], offset_size: u8, length_size: u8) {
-        let mut resolved = Vec::with_capacity(self.messages.len());
-        for msg in self.messages.drain(..) {
+    pub fn resolve_shared_messages(
+        &mut self,
+        data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<()> {
+        let old_messages = std::mem::take(&mut self.messages);
+        let mut resolved = Vec::with_capacity(old_messages.len());
+        for msg in old_messages {
             match msg {
                 HdfMessage::Shared(SharedMessage::SharedInOhdr { address }) => {
                     match Self::parse_at(data, address, offset_size, length_size) {
@@ -98,14 +104,17 @@ impl ObjectHeader {
                         }
                     }
                 }
-                HdfMessage::Shared(SharedMessage::SharedInSohm { heap_id }) => {
-                    // SOHM resolution not supported — keep the wrapper
-                    resolved.push(HdfMessage::Shared(SharedMessage::SharedInSohm { heap_id }));
+                HdfMessage::Shared(SharedMessage::SharedInSohm { .. }) => {
+                    self.messages = resolved;
+                    return Err(Error::Other(
+                        "SOHM table lookup not yet supported — file uses shared object header messages".to_string(),
+                    ));
                 }
                 other => resolved.push(other),
             }
         }
         self.messages = resolved;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
