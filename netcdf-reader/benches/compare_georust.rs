@@ -6,10 +6,14 @@ use std::thread;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdf5_reader::{Hdf5File, OpenOptions, SliceInfo, SliceInfoElem};
 use ndarray::ArrayD;
+use peak_alloc::PeakAlloc;
 use rayon::ThreadPoolBuilder;
 use tempfile::TempDir;
 
 use netcdf_reader::{NcFile, NcGroup};
+
+#[global_allocator]
+static PEAK_ALLOC: PeakAlloc = PeakAlloc;
 
 #[derive(Clone, Copy)]
 enum NumericKind {
@@ -1199,6 +1203,153 @@ fn bench_read_full_internal_parallel_nocache(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_cf_conventions_overhead(c: &mut Criterion) {
+    validate_cases();
+    let mut group = c.benchmark_group("cf_conventions_overhead");
+
+    // Use large_nc4_compressed — it has f32 data, good for measuring promotion overhead.
+    for case in CASES
+        .iter()
+        .filter(|c| matches!(c.id, "large_nc4_compressed"))
+    {
+        let path = case_path(case);
+        let cairn = NcFile::open(&path).unwrap();
+        group.throughput(Throughput::Bytes(case_bytes(case) as u64));
+
+        // Baseline: typed read (f32)
+        group.bench_function(BenchmarkId::new("read_variable_f32", case.id), |b| {
+            b.iter(|| black_box(cairn.read_variable::<f32>(case.variable).unwrap()));
+        });
+
+        // Type-promoting read (f32 → f64)
+        group.bench_function(BenchmarkId::new("read_variable_as_f64", case.id), |b| {
+            b.iter(|| black_box(cairn.read_variable_as_f64(case.variable).unwrap()));
+        });
+
+        // Unpacked (includes type promotion + scale/offset — no-op if absent)
+        group.bench_function(BenchmarkId::new("read_variable_unpacked", case.id), |b| {
+            b.iter(|| black_box(cairn.read_variable_unpacked(case.variable).unwrap()));
+        });
+
+        // Full CF pipeline (mask + unpack)
+        group.bench_function(
+            BenchmarkId::new("read_variable_unpacked_masked", case.id),
+            |b| {
+                b.iter(|| black_box(cairn.read_variable_unpacked_masked(case.variable).unwrap()));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_slice_selectivity(c: &mut Criterion) {
+    validate_cases();
+    let mut group = c.benchmark_group("slice_selectivity");
+
+    // Test different selectivity levels on large_nc4_compressed (2048x1024).
+    for case in CASES
+        .iter()
+        .filter(|c| matches!(c.id, "large_nc4_compressed"))
+    {
+        let path = case_path(case);
+        let hdf5 = Hdf5File::open(&path).unwrap();
+        let dataset = hdf5.dataset(&variable_hdf5_path(case.variable)).unwrap();
+
+        let selectivities: &[(&str, SliceSpec)] = &[
+            (
+                "100pct",
+                SliceSpec {
+                    start: &[0, 0],
+                    count: &[2048, 1024],
+                },
+            ),
+            (
+                "50pct",
+                SliceSpec {
+                    start: &[0, 0],
+                    count: &[1024, 1024],
+                },
+            ),
+            (
+                "10pct",
+                SliceSpec {
+                    start: &[0, 0],
+                    count: &[205, 1024],
+                },
+            ),
+            (
+                "1pct",
+                SliceSpec {
+                    start: &[512, 256],
+                    count: &[20, 1024],
+                },
+            ),
+        ];
+
+        for (label, slice) in selectivities {
+            let sel = slice_selection(*slice);
+            let elem_count: usize = slice.count.iter().product();
+            group.throughput(Throughput::Bytes((elem_count * 4) as u64)); // f32
+
+            group.bench_function(BenchmarkId::new("cairn", label), |b| {
+                b.iter(|| black_box(dataset.read_slice::<f32>(&sel).unwrap()));
+            });
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_memory_profile(c: &mut Criterion) {
+    validate_cases();
+    let mut group = c.benchmark_group("memory_profile");
+
+    for case in CASES
+        .iter()
+        .filter(|c| matches!(c.id, "large_nc4_compressed"))
+    {
+        let path = case_path(case);
+
+        // Full read memory
+        group.bench_function(BenchmarkId::new("full_read", case.id), |b| {
+            b.iter(|| {
+                PEAK_ALLOC.reset_peak_usage();
+                let file = NcFile::open(&path).unwrap();
+                let _ = black_box(match case.kind {
+                    NumericKind::F32 => {
+                        checksum_f32(&file.read_variable::<f32>(case.variable).unwrap())
+                    }
+                    NumericKind::F64 => {
+                        checksum_f64(&file.read_variable::<f64>(case.variable).unwrap())
+                    }
+                });
+                black_box(PEAK_ALLOC.peak_usage_as_mb())
+            });
+        });
+
+        // Slice read memory (10% selectivity)
+        if case.is_netcdf4 {
+            let hdf5 = Hdf5File::open(&path).unwrap();
+            let dataset = hdf5.dataset(&variable_hdf5_path(case.variable)).unwrap();
+            let sel = slice_selection(SliceSpec {
+                start: &[0, 0],
+                count: &[205, 1024],
+            });
+
+            group.bench_function(BenchmarkId::new("slice_10pct", case.id), |b| {
+                b.iter(|| {
+                    PEAK_ALLOC.reset_peak_usage();
+                    let _ = black_box(dataset.read_slice::<f32>(&sel).unwrap());
+                    black_box(PEAK_ALLOC.peak_usage_as_mb())
+                });
+            });
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_open_only,
@@ -1211,6 +1362,9 @@ criterion_group!(
     bench_parallel_open_and_read,
     bench_parallel_read_shared_cairn,
     bench_parallel_metadata_batch,
-    bench_parallel_slice_batch
+    bench_parallel_slice_batch,
+    bench_cf_conventions_overhead,
+    bench_slice_selectivity,
+    bench_memory_profile,
 );
 criterion_main!(benches);
