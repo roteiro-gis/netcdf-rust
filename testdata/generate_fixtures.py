@@ -194,7 +194,37 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(60, dtype=np.float64).reshape(6, 10)
         f.create_dataset("data", data=data, chunks=(3, 5), compression="gzip")
 
-    # ---- 19. extensible_array_chunked.h5 ----
+    # ---- 19. chunked_lz4.h5 ----
+    # Tests: LZ4 compression filter (requires hdf5plugin for writing).
+    path = os.path.join(hdf5_dir, "chunked_lz4.h5")
+    print(f"  Generating {path}")
+    try:
+        import hdf5plugin
+
+        with h5py.File(path, "w") as f:
+            data = np.arange(200, dtype=np.float32).reshape(10, 20)
+            f.create_dataset(
+                "data",
+                data=data,
+                chunks=(5, 10),
+                **hdf5plugin.LZ4(),
+            )
+        # ---- 19b. chunked_lz4_zeros.h5 ----
+        # Tests: LZ4 with data that actually compresses (exercises the compressed block path).
+        path = os.path.join(hdf5_dir, "chunked_lz4_zeros.h5")
+        print(f"  Generating {path}")
+        with h5py.File(path, "w") as f:
+            data = np.zeros((10, 20), dtype=np.float32)
+            f.create_dataset(
+                "data",
+                data=data,
+                chunks=(5, 10),
+                **hdf5plugin.LZ4(),
+            )
+    except ImportError:
+        print("    SKIPPED: hdf5plugin not available")
+
+    # ---- 20. extensible_array_chunked.h5 ----
     # Tests: Extensible Array chunk indexing (libver='latest', one unlimited dim).
     path = os.path.join(hdf5_dir, "extensible_array_chunked.h5")
     print(f"  Generating {path}")
