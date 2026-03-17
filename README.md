@@ -92,8 +92,8 @@ netcdf-reader = { version = "0.1", default-features = false }  # CDF-1/2/5 only
 |---|---|---|
 | `netcdf4` | yes | NetCDF-4 support via `hdf5-reader` |
 | `rayon` | yes | Parallel chunk reading |
+| `lz4` | yes | LZ4 filter support (hdf5-reader) |
 | `cf` | no | CF Conventions helpers (axis identification, time decoding, CRS extraction, bounds) |
-| `lz4` | no | LZ4 filter support (hdf5-reader) |
 
 ## Custom filters
 
