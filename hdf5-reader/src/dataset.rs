@@ -76,11 +76,13 @@ unsafe impl Sync for FlatBufferPtr {}
 
 impl FlatBufferPtr {
     #[cfg(feature = "rayon")]
+    #[inline(always)]
     unsafe fn copy_chunk(self, chunk_data: &[u8], layout: ChunkCopyLayout<'_>) {
         copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout);
     }
 
     #[cfg(feature = "rayon")]
+    #[inline(always)]
     unsafe fn copy_selected(
         self,
         chunk_data: &[u8],
@@ -103,6 +105,7 @@ impl FlatBufferPtr {
     }
 
     #[cfg(feature = "rayon")]
+    #[inline(always)]
     unsafe fn copy_unit_stride_chunk_overlap(
         self,
         chunk_data: &[u8],
@@ -1985,6 +1988,7 @@ fn copy_chunk_to_flat_with_strides(
     }
 }
 
+#[inline(always)]
 unsafe fn copy_chunk_to_flat_with_strides_ptr(
     chunk_data: &[u8],
     flat: FlatBufferPtr,
@@ -2108,6 +2112,7 @@ fn unit_stride_chunk_overlap_plan(
     Ok((overlap_counts, chunk_local_start, result_start))
 }
 
+#[inline(always)]
 fn copy_unit_stride_chunk_overlap(
     chunk_data: &[u8],
     result_buf: &mut [u8],
@@ -2135,6 +2140,7 @@ fn copy_unit_stride_chunk_overlap(
 ///
 /// The caller must guarantee that `[result_ptr .. result_ptr + result_len)` is
 /// valid for writes. Concurrent callers must write to disjoint byte ranges.
+#[inline(always)]
 unsafe fn copy_unit_stride_chunk_overlap_ptr(
     chunk_data: &[u8],
     result: FlatBufferPtr,
@@ -2237,6 +2243,7 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
 /// Copy selected elements from a chunk into the result buffer.
 ///
 /// `dim_indices[d]` is a list of `(chunk_local_idx, result_dim_idx)` pairs for dimension `d`.
+#[inline(always)]
 fn copy_selected_elements(
     chunk_data: &[u8],
     result_buf: &mut [u8],
@@ -2299,6 +2306,7 @@ fn copy_selected_elements(
 /// byte range within `[result_ptr .. result_ptr + result_len)`.
 #[cfg(feature = "rayon")]
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 unsafe fn copy_selected_elements_ptr(
     chunk_data: &[u8],
     result_ptr: *mut u8,

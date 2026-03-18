@@ -1,6 +1,6 @@
 # netcdf-rust
 
-Pure-Rust, read-only decoders for HDF5 and NetCDF files. No C libraries, no build scripts, no unsafe beyond `memmap2`.
+Pure-Rust, read-only decoders for HDF5 and NetCDF. No C libraries, no build scripts, and no unsafe beyond `memmap2`.
 
 ## Crates
 
@@ -73,40 +73,22 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 
 ## Features
 
-**HDF5 reader:**
-- Superblock v0-v3, object header v1/v2 with checksum verification
-- Compact, contiguous, and chunked data layouts
-- All chunk index types: V1/V2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
-- Layout v4 and v5 (HDF5 2.0)
-- Filter pipeline: deflate (zlib), shuffle, Fletcher-32, LZ4 (feature-gated)
-- Pluggable `FilterRegistry` for custom filters (Blosc, ZFP, etc.)
-- Soft link resolution with cycle detection
-- Fractal heap + B-tree v2 dense link resolution
-- Shared (committed) datatype resolution
-- Variable-length string reading via global heap
-- Object reference resolution
-- Parallel chunk decompression for full reads and slice reads (Rayon, feature-gated)
-- LRU chunk cache with configurable size (non-poisoning `parking_lot::Mutex`)
-- Object header cache for repeated access
-- Memory-mapped I/O or owned-byte (`from_vec`) access
+**HDF5**
+- Superblock v0-v3 and object header v1/v2 with checksum verification
+- Compact, contiguous, and chunked layouts
+- All chunk index types: v1/v2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
+- Deflate, shuffle, Fletcher-32, and optional LZ4 filters
+- Custom filters via `FilterRegistry`
+- Dense-link resolution, soft-link resolution, committed datatypes, global heap strings, and object references
+- Parallel chunk decoding, chunk caching, and object-header caching
 
-**NetCDF reader:**
-- CDF-1 classic, CDF-2 64-bit offset, CDF-5 64-bit data
-- NetCDF-4 via `hdf5-reader` (feature-gated, on by default)
-- Automatic format detection from magic bytes
-- Dimension reconstruction via `DIMENSION_LIST` object references (with size-based fallback)
-- Unified `NcFile::read_variable::<T>()` across all formats
-- Type-promoting `read_variable_as_f64()` — reads any numeric type and promotes to f64
-- `scale_factor`/`add_offset` unpacking via `read_variable_unpacked()`
-- `_FillValue`/`missing_value` masking via `read_variable_masked()`
-- Combined mask-then-unpack via `read_variable_unpacked_masked()`
-- Hyperslab/slice API: `read_variable_slice()`, `read_variable_slice_as_f64()`, plus CF variants
-- Lazy slice iterator: `iter_slices()` for streaming one dimension at a time
-- Parallel slice reads: `read_variable_slice_parallel()` for chunked NC4 data
-- `NcOpenOptions` builder for cache sizing and custom filter registries
-- Compound, Opaque, Array, and VLen type mapping for NetCDF-4
-- Attribute filtering (hides internal `_NCProperties`, `DIMENSION_LIST`, etc.)
-- Record (unlimited) dimension support
+**NetCDF**
+- CDF-1, CDF-2, CDF-5, and NetCDF-4
+- Automatic format detection
+- Unified typed reads across formats
+- Type promotion to `f64`, unpacking, masking, and combined CF helpers
+- Slice reads, lazy slice iteration, and parallel NC4 slice reads
+- Cache and filter configuration through `NcOpenOptions`
 
 ## Feature flags
 
@@ -165,15 +147,7 @@ checked-in fixtures plus larger generated benchmark fixtures.
 # Full benchmark matrix
 cargo bench -p netcdf-reader --bench compare_georust
 
-# Contention-focused scaling run that makes cross-thread serialization visible
-BENCH_THREAD_LIST=1,2,4,8 BENCH_HOT_OPS_PER_THREAD=256 \
-  cargo bench -p netcdf-reader --bench compare_georust \
-  'parallel_metadata_batch/.*/(nc4_basic|nested_nc4_groups)|parallel_slice_batch/.*/(nc4_basic|nc4_compressed|large_nc4_compressed)'
-
-# Restrict thread scaling cases
-BENCH_THREAD_LIST=1,2,4 cargo bench -p netcdf-reader --bench compare_georust
-
-# Summarize the latest Criterion results as a markdown table
+# Summarize the latest Criterion results
 python3 scripts/criterion_summary.py
 
 # Include x1-relative speedup for threaded workloads
@@ -185,38 +159,10 @@ python3 scripts/criterion_summary.py --speedup \
 ```
 
 Notes:
-- The benchmark uses `netcdf` with its `static` feature, so it builds a bundled
-  `netcdf-c` stack instead of depending on a specific system HDF5 install.
-- The suite separates `open_only`, `metadata_reuse_handle`,
-  `read_full_reuse_handle`, `open_and_read_full`,
-  `read_full_internal_parallel`, `slice_reuse_handle_hdf5_backend`, and
-  parallel throughput workloads so setup costs and steady-state read costs are
-  visible independently.
-- `cf_conventions_overhead` measures the cost of type promotion, unpacking, and
-  masking compared to a raw typed read.
-- `slice_selectivity` measures slice reads at 100%/50%/10%/1% selectivity on
-  large compressed data to show how chunk-selective reading scales.
-- `memory_profile` tracks peak allocation via `peak_alloc` for full reads vs
-  slice reads.
-- The suite also includes `parallel_metadata_batch` and
-  `parallel_slice_batch`, which keep one open handle per worker, synchronize
-  start with a barrier, and then execute many small operations. Those runs are
-  intended to show how `netcdf-rust` and the C-backed `georust/netcdf`
-  baseline behave under the same concurrent call pattern.
-- Larger benchmark-only fixtures are generated at runtime, so the suite covers
-  both small checked-in files and more realistic compressed datasets.
-- Parallel cases include both independent `open + read` scaling against the
-  C-backed baseline and a `parallel_read_shared_netcdf_rust` case that measures our
-  shared-open-handle throughput directly.
-- `read_full_internal_parallel` measures one large chunked read with internal
-  chunk-level Rayon parallelism, which is distinct from the independent-read
-  throughput cases.
-- In the local `netcdf 0.12.0` baseline source used for these runs, libnetcdf
-  entry points are wrapped through `with_lock` / `checked_with_lock`, which
-  take `netcdf_sys::libnetcdf_lock` before entering the C API. In practice,
-  that means a shared process-global mutex around FFI calls into `netcdf-c`.
-  The contention benchmarks are intended to make the effect of that design
-  visible.
+- The benchmark uses `netcdf` with its `static` feature, so it builds a bundled `netcdf-c` stack.
+- The suite separates open cost, metadata walks, warm full reads, end-to-end reads, slices, and threaded workloads.
+- Larger benchmark fixtures are generated at runtime.
+- In the `netcdf 0.12.0` baseline used for these runs, libnetcdf entry points go through a shared process-global lock. The contention benchmarks are intended to make that visible.
 
 ## Known limitations
 

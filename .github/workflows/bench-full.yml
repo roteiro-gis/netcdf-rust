@@ -1,0 +1,50 @@
+name: Full benchmark sweep
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench-full:
+    name: Full benchmark sweep
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/bench-full
+      BENCH_THREAD_LIST: "1,2,4,8"
+      BENCH_HOT_OPS_PER_THREAD: "256"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev libnetcdf-dev
+
+      - name: Generate fixtures for benchmarks
+        run: |
+          pip install 'h5py<3.16' netCDF4 numpy
+          python testdata/generate_fixtures.py
+
+      - name: Run full benchmark suite
+        run: cargo bench -p netcdf-reader --bench compare_georust -- --noplot
+
+      - name: Summarize results
+        run: |
+          python3 scripts/criterion_summary.py \
+            --criterion-root "$CARGO_TARGET_DIR/criterion" \
+            --speedup \
+            > benchmark-summary.md
+
+      - name: Upload benchmark summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: benchmark-summary.md
+
+      - name: Upload criterion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: ${{ env.CARGO_TARGET_DIR }}/criterion
