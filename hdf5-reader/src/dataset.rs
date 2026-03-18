@@ -75,10 +75,12 @@ unsafe impl Send for FlatBufferPtr {}
 unsafe impl Sync for FlatBufferPtr {}
 
 impl FlatBufferPtr {
+    #[cfg(feature = "rayon")]
     unsafe fn copy_chunk(self, chunk_data: &[u8], layout: ChunkCopyLayout<'_>) {
         copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout);
     }
 
+    #[cfg(feature = "rayon")]
     unsafe fn copy_selected(
         self,
         chunk_data: &[u8],
@@ -100,6 +102,7 @@ impl FlatBufferPtr {
         );
     }
 
+    #[cfg(feature = "rayon")]
     unsafe fn copy_unit_stride_chunk_overlap(
         self,
         chunk_data: &[u8],
