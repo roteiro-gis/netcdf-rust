@@ -219,6 +219,188 @@ fn read_entries(
     Ok(entries)
 }
 
+fn read_entry_at(
+    data: &[u8],
+    position: u64,
+    is_filtered: bool,
+    offset_size: u8,
+    entry_size: u8,
+) -> Result<FaRawEntry> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(position);
+    let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
+    entries
+        .pop()
+        .ok_or_else(|| Error::InvalidData("missing fixed array entry".into()))
+}
+
+fn linear_target_offsets(
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Vec<(usize, Vec<u64>)> {
+    let ndim = dataset_shape.len();
+    let chunks_per_dim: Vec<u64> = (0..ndim)
+        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
+        .collect();
+
+    if ndim == 0 {
+        return vec![(0, Vec::new())];
+    }
+
+    let (first_chunk, last_chunk): (Vec<u64>, Vec<u64>) = match chunk_bounds {
+        Some((first, last)) => (first.to_vec(), last.to_vec()),
+        None => (
+            vec![0u64; ndim],
+            chunks_per_dim
+                .iter()
+                .map(|count| count.saturating_sub(1))
+                .collect(),
+        ),
+    };
+
+    let mut targets = Vec::new();
+    let mut chunk_indices = first_chunk.clone();
+    loop {
+        let mut linear_idx = 0u64;
+        for (dim, chunk_index) in chunk_indices.iter().enumerate() {
+            linear_idx = linear_idx * chunks_per_dim[dim] + chunk_index;
+        }
+        let offsets = chunk_indices
+            .iter()
+            .enumerate()
+            .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
+            .collect();
+        targets.push((linear_idx as usize, offsets));
+
+        let mut advanced = false;
+        for dim in (0..ndim).rev() {
+            if chunk_indices[dim] < last_chunk[dim] {
+                chunk_indices[dim] += 1;
+                for reset_dim in dim + 1..ndim {
+                    chunk_indices[reset_dim] = first_chunk[reset_dim];
+                }
+                advanced = true;
+                break;
+            }
+        }
+
+        if !advanced {
+            break;
+        }
+    }
+
+    targets
+}
+
+fn collect_fixed_array_chunk_entries_bounded(
+    data: &[u8],
+    header: &FaHeader,
+    offset_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: (&[u64], &[u64]),
+) -> Result<Vec<ChunkEntry>> {
+    let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds));
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(header.data_block_address);
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != FADB_SIGNATURE {
+        return Err(Error::InvalidFixedArraySignature {
+            context: "data block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported fixed array data block version {}",
+            version
+        )));
+    }
+
+    let _client_id = cursor.read_u8()?;
+    let _header_address = cursor.read_offset(offset_size)?;
+
+    let num_entries = header.num_entries as usize;
+    let is_filtered = header.client_id == 1;
+    let entry_bytes = header.entry_size as usize;
+    let use_paging = header.page_bits > 0 && num_entries > (1usize << header.page_bits);
+
+    if !use_paging {
+        let entries_start = cursor.position();
+        let mut entries = Vec::new();
+        for (linear_idx, offsets) in targets {
+            let position = entries_start + (linear_idx * entry_bytes) as u64;
+            let raw = read_entry_at(data, position, is_filtered, offset_size, header.entry_size)?;
+            if Cursor::is_undefined_offset(raw.address, offset_size) {
+                continue;
+            }
+            entries.push(ChunkEntry {
+                address: raw.address,
+                size: raw.chunk_size,
+                filter_mask: raw.filter_mask,
+                offsets,
+            });
+        }
+        return Ok(entries);
+    }
+
+    let entries_per_page = 1usize << header.page_bits;
+    let num_pages = num_entries.div_ceil(entries_per_page);
+    let bitmap_bytes = num_pages.div_ceil(8);
+    let page_bitmap = cursor.read_bytes(bitmap_bytes)?.to_vec();
+    let pages_start = cursor.position();
+
+    let mut page_offsets = vec![None; num_pages];
+    let mut next_page_start = pages_start;
+    for page_idx in 0..num_pages {
+        let byte_idx = page_idx / 8;
+        let bit_idx = page_idx % 8;
+        let page_initialized =
+            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+
+        let entries_in_page = if page_idx == num_pages - 1 {
+            let remainder = num_entries % entries_per_page;
+            if remainder == 0 {
+                entries_per_page
+            } else {
+                remainder
+            }
+        } else {
+            entries_per_page
+        };
+
+        if page_initialized {
+            page_offsets[page_idx] = Some(next_page_start);
+            next_page_start += (entries_in_page * entry_bytes + 4) as u64;
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (linear_idx, offsets) in targets {
+        let page_idx = linear_idx / entries_per_page;
+        let within_page = linear_idx % entries_per_page;
+        let Some(page_start) = page_offsets[page_idx] else {
+            continue;
+        };
+        let position = page_start + (within_page * entry_bytes) as u64;
+        let raw = read_entry_at(data, position, is_filtered, offset_size, header.entry_size)?;
+        if Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+        entries.push(ChunkEntry {
+            address: raw.address,
+            size: raw.chunk_size,
+            filter_mask: raw.filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(entries)
+}
+
 /// Collect chunk entries from a Fixed Array index.
 ///
 /// Reads the FAHD header and FADB data block, then converts linear entry
@@ -230,11 +412,23 @@ pub fn collect_fixed_array_chunk_entries(
     length_size: u8,
     dataset_shape: &[u64],
     chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
     let header = parse_header(data, header_address, offset_size, length_size)?;
 
     if Cursor::is_undefined_offset(header.data_block_address, offset_size) {
         return Ok(Vec::new());
+    }
+
+    if let Some(bounds) = chunk_bounds {
+        return collect_fixed_array_chunk_entries_bounded(
+            data,
+            &header,
+            offset_size,
+            dataset_shape,
+            chunk_dims,
+            bounds,
+        );
     }
 
     let raw_entries = parse_data_block(data, header.data_block_address, &header, offset_size)?;
@@ -257,6 +451,16 @@ pub fn collect_fixed_array_chunk_entries(
         for d in (0..ndim).rev() {
             offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
             remaining /= chunks_per_dim[d];
+        }
+
+        if let Some((first_chunk, last_chunk)) = chunk_bounds {
+            let overlaps = offsets.iter().enumerate().all(|(dim, offset)| {
+                let chunk_index = *offset / u64::from(chunk_dims[dim]);
+                chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
+            });
+            if !overlaps {
+                continue;
+            }
         }
 
         entries.push(ChunkEntry {

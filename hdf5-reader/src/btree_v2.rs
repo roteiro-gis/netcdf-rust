@@ -254,6 +254,27 @@ fn parse_record(
     Ok(record)
 }
 
+fn record_matches_chunk_bounds(
+    record: &BTreeV2Record,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> bool {
+    let Some((first_chunk, last_chunk)) = chunk_bounds else {
+        return true;
+    };
+
+    let offsets = match record {
+        BTreeV2Record::ChunkedNonFiltered { offsets, .. }
+        | BTreeV2Record::ChunkedFiltered { offsets, .. } => offsets,
+        _ => return true,
+    };
+
+    offsets.iter().enumerate().all(|(dim, offset)| {
+        let chunk_index = *offset / u64::from(chunk_dims[dim]);
+        chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Node parsing
 // ---------------------------------------------------------------------------
@@ -319,6 +340,8 @@ fn parse_leaf_node(
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
     num_records: u16,
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
@@ -355,7 +378,9 @@ fn parse_leaf_node(
             ndims,
             heap_id_len,
         )?;
-        records.push(record);
+        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
+            records.push(record);
+        }
     }
 
     // Verify checksum: covers signature through the end of records.
@@ -381,6 +406,8 @@ fn parse_internal_node(
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
     num_records: u16,
     depth: u16,
     heap_id_len: usize,
@@ -449,7 +476,9 @@ fn parse_internal_node(
             ndims,
             heap_id_len,
         )?;
-        node_records.push(record);
+        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
+            node_records.push(record);
+        }
     }
 
     // Read child node pointers (num_records + 1 of them).
@@ -516,6 +545,8 @@ fn parse_internal_node(
                 offset_size,
                 length_size,
                 ndims,
+                chunk_dims,
+                chunk_bounds,
                 child_nrec,
                 heap_id_len,
                 records,
@@ -529,6 +560,8 @@ fn parse_internal_node(
                 offset_size,
                 length_size,
                 ndims,
+                chunk_dims,
+                chunk_bounds,
                 child_nrec,
                 child_depth,
                 heap_id_len,
@@ -554,6 +587,8 @@ pub fn collect_btree_v2_records(
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<BTreeV2Record>> {
     if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
         return Ok(Vec::new());
@@ -578,6 +613,8 @@ pub fn collect_btree_v2_records(
             offset_size,
             length_size,
             ndims,
+            chunk_dims,
+            chunk_bounds,
             header.num_records_in_root,
             heap_id_len,
             &mut records,
@@ -591,6 +628,8 @@ pub fn collect_btree_v2_records(
             offset_size,
             length_size,
             ndims,
+            chunk_dims,
+            chunk_bounds,
             header.num_records_in_root,
             header.depth,
             heap_id_len,
@@ -713,7 +752,7 @@ mod tests {
             total_records: 0,
         };
         let data = vec![0u8; 100];
-        let records = collect_btree_v2_records(&data, &header, 8, 8, None).unwrap();
+        let records = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap();
         assert!(records.is_empty());
     }
 
@@ -805,6 +844,8 @@ mod tests {
             &header,
             8,
             8,
+            None,
+            &[],
             None,
             2,
             8, // heap_id_len

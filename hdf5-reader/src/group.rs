@@ -72,6 +72,11 @@ impl<'f> Group<'f> {
         &self.name
     }
 
+    /// Object header address of this group within the file.
+    pub fn address(&self) -> u64 {
+        self.address
+    }
+
     /// Access the raw file data backing this group.
     pub fn file_data(&self) -> &'f [u8] {
         self.file_data
@@ -104,8 +109,19 @@ impl<'f> Group<'f> {
 
     /// List all child groups.
     pub fn groups(&self) -> Result<Vec<Group<'f>>> {
+        let (groups, _) = self.resolve_member_objects()?;
+        Ok(groups)
+    }
+
+    /// List all child members, partitioned into groups and datasets.
+    pub fn members(&self) -> Result<(Vec<Group<'f>>, Vec<Dataset<'f>>)> {
+        self.resolve_member_objects()
+    }
+
+    fn resolve_member_objects(&self) -> Result<(Vec<Group<'f>>, Vec<Dataset<'f>>)> {
         let children = self.resolve_children()?;
         let mut groups = Vec::new();
+        let mut datasets = Vec::new();
         for child in &children {
             if self.child_is_group(child)? {
                 groups.push(Group::new(
@@ -119,9 +135,11 @@ impl<'f> Group<'f> {
                     self.header_cache.clone(),
                     self.filter_registry.clone(),
                 ));
+            } else if let Some(dataset) = self.try_open_child_dataset(child) {
+                datasets.push(dataset);
             }
         }
-        Ok(groups)
+        Ok((groups, datasets))
     }
 
     /// Get a child group by name.
@@ -154,15 +172,7 @@ impl<'f> Group<'f> {
 
     /// List all child datasets.
     pub fn datasets(&self) -> Result<Vec<Dataset<'f>>> {
-        let children = self.resolve_children()?;
-        let mut datasets = Vec::new();
-        for child in &children {
-            if !self.child_is_group(child)? {
-                if let Some(dataset) = self.try_open_child_dataset(child) {
-                    datasets.push(dataset);
-                }
-            }
-        }
+        let (_, datasets) = self.resolve_member_objects()?;
         Ok(datasets)
     }
 
@@ -308,6 +318,8 @@ impl<'f> Group<'f> {
             self.offset_size,
             self.length_size,
             None, // group B-tree, no ndims
+            &[],
+            None,
         )?;
 
         let mut children = Vec::new();
@@ -352,6 +364,8 @@ impl<'f> Group<'f> {
             &btree_header,
             self.offset_size,
             self.length_size,
+            None,
+            &[],
             None,
         )?;
 

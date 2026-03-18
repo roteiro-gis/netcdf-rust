@@ -33,6 +33,21 @@ macro_rules! skip_if_missing {
     };
 }
 
+#[cfg(feature = "netcdf4")]
+fn create_sparse_huge_nc4_fixture(path: &Path) {
+    const DIM: usize = 1 << 20;
+
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("row", DIM).unwrap();
+    file.add_dimension("col", DIM).unwrap();
+    {
+        let mut variable = file.add_variable::<f32>("sparse", &["row", "col"]).unwrap();
+        variable.set_chunking(&[1024, 1024]).unwrap();
+        variable.set_fill_value(42.5_f32).unwrap();
+    }
+    file.enddef().unwrap();
+}
+
 // ---- NetCDF-3 tests ----
 
 #[test]
@@ -178,6 +193,53 @@ fn test_nc4_read_variable_unified() {
     assert!((data[[0, 0]] - 0.0).abs() < 1e-10);
     // Last element should be 49.0
     assert!((data[[4, 9]] - 49.0).abs() < 1e-10);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_sparse_huge_logical_slice_reads_fill_value() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("sparse_huge.nc");
+    create_sparse_huge_nc4_fixture(&path);
+    let expected_fill = netcdf::open(&path)
+        .unwrap()
+        .variable("sparse")
+        .unwrap()
+        .fill_value::<f32>()
+        .unwrap()
+        .unwrap_or(0.0);
+
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let selection = netcdf_reader::NcSliceInfo {
+        selections: vec![
+            netcdf_reader::NcSliceInfoElem::Index((1 << 20) - 1),
+            netcdf_reader::NcSliceInfoElem::Index((1 << 20) - 1),
+        ],
+    };
+
+    let sliced: ndarray::ArrayD<f32> = file.read_variable_slice("sparse", &selection).unwrap();
+    assert_eq!(sliced.shape(), &[]);
+    assert_eq!(sliced[[]], expected_fill);
+
+    let hdf5 = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let dataset = hdf5.dataset("/sparse").unwrap();
+    let hdf5_selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: ((1 << 20) - 1) as u64,
+                end: 1 << 20,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: ((1 << 20) - 1) as u64,
+                end: 1 << 20,
+                step: 1,
+            },
+        ],
+    };
+    let hdf5_sliced: ndarray::ArrayD<f32> = dataset.read_slice(&hdf5_selection).unwrap();
+    assert_eq!(hdf5_sliced.shape(), &[1, 1]);
+    assert_eq!(hdf5_sliced[[0, 0]], expected_fill);
 }
 
 #[test]

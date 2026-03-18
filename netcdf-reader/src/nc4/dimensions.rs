@@ -36,10 +36,15 @@ pub fn extract_dimensions(
         Ok(ds) => ds,
         Err(_) => return Ok((Vec::new(), HashMap::new())),
     };
+    extract_dimensions_from_datasets(&datasets)
+}
 
+pub fn extract_dimensions_from_datasets(
+    datasets: &[hdf5_reader::Dataset<'_>],
+) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
 
-    for ds in &datasets {
+    for ds in datasets {
         // Check for CLASS=DIMENSION_SCALE attribute
         let is_dim_scale = ds
             .attribute("CLASS")

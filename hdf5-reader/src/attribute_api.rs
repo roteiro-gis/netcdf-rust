@@ -399,9 +399,15 @@ fn load_dense_attribute_records(
                 Err(_) => continue,
             };
 
-        if let Ok(records) =
-            btree_v2::collect_btree_v2_records(file_data, &header, offset_size, length_size, None)
-        {
+        if let Ok(records) = btree_v2::collect_btree_v2_records(
+            file_data,
+            &header,
+            offset_size,
+            length_size,
+            None,
+            &[],
+            None,
+        ) {
             return Ok(records);
         }
     }

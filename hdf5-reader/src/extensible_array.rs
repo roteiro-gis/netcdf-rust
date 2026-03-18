@@ -314,6 +314,328 @@ fn parse_secondary_block(
     Ok(addrs)
 }
 
+fn read_entry_at(
+    data: &[u8],
+    position: u64,
+    is_filtered: bool,
+    offset_size: u8,
+    entry_size: u8,
+) -> Result<EaRawEntry> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(position);
+    let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
+    entries
+        .pop()
+        .ok_or_else(|| Error::InvalidData("missing extensible array entry".into()))
+}
+
+fn linear_target_offsets(
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Vec<(usize, Vec<u64>)> {
+    let ndim = dataset_shape.len();
+    let chunks_per_dim: Vec<u64> = (0..ndim)
+        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
+        .collect();
+
+    if ndim == 0 {
+        return vec![(0, Vec::new())];
+    }
+
+    let (first_chunk, last_chunk): (Vec<u64>, Vec<u64>) = match chunk_bounds {
+        Some((first, last)) => (first.to_vec(), last.to_vec()),
+        None => (
+            vec![0u64; ndim],
+            chunks_per_dim
+                .iter()
+                .map(|count| count.saturating_sub(1))
+                .collect(),
+        ),
+    };
+
+    let mut targets = Vec::new();
+    let mut chunk_indices = first_chunk.clone();
+    loop {
+        let mut linear_idx = 0u64;
+        for (dim, chunk_index) in chunk_indices.iter().enumerate() {
+            linear_idx = linear_idx * chunks_per_dim[dim] + chunk_index;
+        }
+        let offsets = chunk_indices
+            .iter()
+            .enumerate()
+            .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
+            .collect();
+        targets.push((linear_idx as usize, offsets));
+
+        let mut advanced = false;
+        for dim in (0..ndim).rev() {
+            if chunk_indices[dim] < last_chunk[dim] {
+                chunk_indices[dim] += 1;
+                for reset_dim in dim + 1..ndim {
+                    chunk_indices[reset_dim] = first_chunk[reset_dim];
+                }
+                advanced = true;
+                break;
+            }
+        }
+
+        if !advanced {
+            break;
+        }
+    }
+
+    targets
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_data_block_entry(
+    data: &[u8],
+    address: u64,
+    num_entries: usize,
+    local_idx: usize,
+    is_filtered: bool,
+    max_page_bits: u8,
+    offset_size: u8,
+    entry_size: u8,
+    sizeof_nelmts: usize,
+) -> Result<EaRawEntry> {
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(address);
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != EADB_SIGNATURE {
+        return Err(Error::InvalidExtensibleArraySignature {
+            context: "data block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported extensible array data block version {}",
+            version
+        )));
+    }
+
+    let _client_id = cursor.read_u8()?;
+    let _header_address = cursor.read_offset(offset_size)?;
+    cursor.skip(sizeof_nelmts)?;
+
+    let page_nelmts = if max_page_bits > 0 {
+        1usize << max_page_bits
+    } else {
+        0
+    };
+
+    if page_nelmts > 0 && num_entries > page_nelmts {
+        let num_pages = num_entries.div_ceil(page_nelmts);
+        let bitmap_bytes = num_pages.div_ceil(8);
+        let page_bitmap = cursor.read_bytes(bitmap_bytes)?.to_vec();
+        let data_start = cursor.position();
+
+        let target_page = local_idx / page_nelmts;
+        let within_page = local_idx % page_nelmts;
+        let byte_idx = target_page / 8;
+        let bit_idx = target_page % 8;
+        let page_initialized =
+            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+        if !page_initialized {
+            return Ok(EaRawEntry {
+                address: u64::MAX,
+                chunk_size: 0,
+                filter_mask: 0,
+            });
+        }
+
+        let mut page_start = data_start;
+        for page_idx in 0..target_page {
+            let entries_in_page = if page_idx == num_pages - 1 {
+                let remainder = num_entries % page_nelmts;
+                if remainder == 0 {
+                    page_nelmts
+                } else {
+                    remainder
+                }
+            } else {
+                page_nelmts
+            };
+            let page_byte_idx = page_idx / 8;
+            let page_bit_idx = page_idx % 8;
+            let initialized = page_byte_idx < page_bitmap.len()
+                && (page_bitmap[page_byte_idx] & (1 << page_bit_idx)) != 0;
+            if initialized {
+                page_start += (entries_in_page * entry_size as usize + 4) as u64;
+            }
+        }
+
+        let position = page_start + (within_page * entry_size as usize) as u64;
+        return read_entry_at(data, position, is_filtered, offset_size, entry_size);
+    }
+
+    let position = cursor.position() + (local_idx * entry_size as usize) as u64;
+    read_entry_at(data, position, is_filtered, offset_size, entry_size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_extensible_array_chunk_entries_bounded(
+    data: &[u8],
+    header: &EaHeader,
+    offset_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: (&[u64], &[u64]),
+    sb_layout: &[(u64, u64)],
+    sizeof_nelmts: usize,
+) -> Result<Vec<ChunkEntry>> {
+    let is_filtered = header.client_id == 1;
+    let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds));
+
+    let mut cursor = Cursor::new(data);
+    cursor.set_position(header.index_block_address);
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != EAIB_SIGNATURE {
+        return Err(Error::InvalidExtensibleArraySignature {
+            context: "index block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported extensible array index block version {}",
+            version
+        )));
+    }
+
+    let _client_id = cursor.read_u8()?;
+    let _header_address = cursor.read_offset(offset_size)?;
+
+    let num_inline = header.idx_blk_elmts as usize;
+    let inline_start = cursor.position();
+    cursor.skip(num_inline * header.element_size as usize)?;
+
+    let ndblk_addrs = 2 * header.sec_blk_min_data_ptrs as usize;
+    let mut direct_dblk_addrs = Vec::with_capacity(ndblk_addrs);
+    for _ in 0..ndblk_addrs {
+        direct_dblk_addrs.push(cursor.read_offset(offset_size)?);
+    }
+
+    let nsblks = sb_layout.len();
+    let nsblk_addrs = nsblks.saturating_sub(ndblk_addrs);
+    let mut sec_block_addrs = Vec::with_capacity(nsblk_addrs);
+    for _ in 0..nsblk_addrs {
+        sec_block_addrs.push(cursor.read_offset(offset_size)?);
+    }
+
+    let mut secondary_block_cache: Vec<Option<Vec<u64>>> = vec![None; sec_block_addrs.len()];
+    let mut entries = Vec::new();
+
+    for (linear_idx, offsets) in targets {
+        let raw = if linear_idx < num_inline {
+            read_entry_at(
+                data,
+                inline_start + (linear_idx * header.element_size as usize) as u64,
+                is_filtered,
+                offset_size,
+                header.element_size,
+            )?
+        } else {
+            let mut relative_idx = (linear_idx - num_inline) as u64;
+            let mut sb_idx = None;
+            for (candidate_idx, (elmts_per_dblk, num_dblks)) in sb_layout.iter().enumerate() {
+                let capacity = elmts_per_dblk * num_dblks;
+                if relative_idx < capacity {
+                    sb_idx = Some(candidate_idx);
+                    break;
+                }
+                relative_idx -= capacity;
+            }
+
+            let Some(sb_idx) = sb_idx else {
+                continue;
+            };
+            let (elmts_per_dblk, _) = sb_layout[sb_idx];
+            let dblk_idx = (relative_idx / elmts_per_dblk) as usize;
+            let local_idx = (relative_idx % elmts_per_dblk) as usize;
+
+            let dblk_addr = if sb_idx < 2 {
+                let base = sb_layout[..sb_idx]
+                    .iter()
+                    .map(|(_, num_dblks)| *num_dblks as usize)
+                    .sum::<usize>();
+                *direct_dblk_addrs.get(base + dblk_idx).unwrap_or(&u64::MAX)
+            } else {
+                let sec_cache_idx = sb_idx - 2;
+                if secondary_block_cache[sec_cache_idx].is_none() {
+                    let sec_addr = sec_block_addrs
+                        .get(sec_cache_idx)
+                        .copied()
+                        .unwrap_or(u64::MAX);
+                    if Cursor::is_undefined_offset(sec_addr, offset_size) {
+                        secondary_block_cache[sec_cache_idx] = Some(Vec::new());
+                    } else {
+                        let (_, num_dblks) = sb_layout[sb_idx];
+                        let page_bitmap_bytes = if header.max_dblk_page_nelmts_bits > 0
+                            && elmts_per_dblk > (1u64 << header.max_dblk_page_nelmts_bits)
+                        {
+                            let page_nelmts = 1usize << header.max_dblk_page_nelmts_bits;
+                            let pages_per_dblk = (elmts_per_dblk as usize).div_ceil(page_nelmts);
+                            (num_dblks as usize * pages_per_dblk).div_ceil(8)
+                        } else {
+                            0
+                        };
+                        secondary_block_cache[sec_cache_idx] = Some(parse_secondary_block(
+                            data,
+                            sec_addr,
+                            num_dblks as usize,
+                            offset_size,
+                            sizeof_nelmts,
+                            page_bitmap_bytes,
+                        )?);
+                    }
+                }
+
+                secondary_block_cache[sec_cache_idx]
+                    .as_ref()
+                    .and_then(|addrs| addrs.get(dblk_idx))
+                    .copied()
+                    .unwrap_or(u64::MAX)
+            };
+
+            if Cursor::is_undefined_offset(dblk_addr, offset_size) {
+                continue;
+            }
+
+            read_data_block_entry(
+                data,
+                dblk_addr,
+                elmts_per_dblk as usize,
+                local_idx,
+                is_filtered,
+                header.max_dblk_page_nelmts_bits,
+                offset_size,
+                header.element_size,
+                sizeof_nelmts,
+            )?
+        };
+
+        if Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+
+        entries.push(ChunkEntry {
+            address: raw.address,
+            size: raw.chunk_size,
+            filter_mask: raw.filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(entries)
+}
+
 /// Collect chunk entries from an Extensible Array index.
 ///
 /// Walks the EAHD → EAIB → (EADB / EASB → EADB) hierarchy and converts
@@ -325,6 +647,7 @@ pub fn collect_extensible_array_chunk_entries(
     length_size: u8,
     dataset_shape: &[u64],
     chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
     let header = parse_header(data, header_address, offset_size, length_size)?;
 
@@ -335,6 +658,19 @@ pub fn collect_extensible_array_chunk_entries(
     let is_filtered = header.client_id == 1;
     let sb_layout = compute_super_block_layout(&header);
     let sizeof_nelmts = (header._max_nelmts_bits as usize).div_ceil(8);
+
+    if let Some(bounds) = chunk_bounds {
+        return collect_extensible_array_chunk_entries_bounded(
+            data,
+            &header,
+            offset_size,
+            dataset_shape,
+            chunk_dims,
+            bounds,
+            &sb_layout,
+            sizeof_nelmts,
+        );
+    }
 
     // Parse the index block.
     let mut cursor = Cursor::new(data);
@@ -518,6 +854,16 @@ pub fn collect_extensible_array_chunk_entries(
         for d in (0..ndim).rev() {
             offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
             remaining /= chunks_per_dim[d];
+        }
+
+        if let Some((first_chunk, last_chunk)) = chunk_bounds {
+            let overlaps = offsets.iter().enumerate().all(|(dim, offset)| {
+                let chunk_index = *offset / u64::from(chunk_dims[dim]);
+                chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
+            });
+            if !overlaps {
+                continue;
+            }
         }
 
         entries.push(ChunkEntry {

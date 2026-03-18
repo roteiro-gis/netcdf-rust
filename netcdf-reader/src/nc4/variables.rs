@@ -34,10 +34,18 @@ pub fn extract_variables(
         Ok(ds) => ds,
         Err(_) => return Ok(Vec::new()),
     };
+    extract_variables_from_datasets(&datasets, group, dimensions, dim_addr_map)
+}
 
+pub fn extract_variables_from_datasets(
+    datasets: &[hdf5_reader::Dataset<'_>],
+    group: &Group<'_>,
+    dimensions: &[NcDimension],
+    dim_addr_map: &HashMap<u64, NcDimension>,
+) -> Result<Vec<NcVariable>> {
     let mut variables = Vec::new();
 
-    for ds in &datasets {
+    for ds in datasets {
         // Skip dimension scale datasets
         let is_dim_scale = ds
             .attribute("CLASS")

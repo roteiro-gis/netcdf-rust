@@ -1,8 +1,13 @@
+use std::mem::MaybeUninit;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use lru::LruCache;
 use ndarray::{ArrayD, IxDyn};
+use parking_lot::Mutex;
 #[cfg(feature = "rayon")]
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use crate::attribute_api::{collect_attribute_messages, Attribute};
 use crate::cache::{ChunkCache, ChunkKey};
@@ -14,7 +19,7 @@ use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
 use crate::messages::datatype::Datatype;
-use crate::messages::fill_value::FillValueMessage;
+use crate::messages::fill_value::{FillTime, FillValueMessage};
 use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::messages::layout::{ChunkIndexing, DataLayout};
 use crate::messages::HdfMessage;
@@ -74,6 +79,31 @@ impl FlatBufferPtr {
             ndim,
         );
     }
+
+    unsafe fn copy_unit_stride_chunk_overlap(
+        self,
+        chunk_data: &[u8],
+        chunk_offsets: &[u64],
+        chunk_shape: &[u64],
+        dataset_shape: &[u64],
+        resolved: &ResolvedSelection,
+        chunk_strides: &[usize],
+        result_strides: &[usize],
+        elem_size: usize,
+    ) -> Result<()> {
+        copy_unit_stride_chunk_overlap_ptr(
+            chunk_data,
+            self.ptr,
+            self.len,
+            chunk_offsets,
+            chunk_shape,
+            dataset_shape,
+            resolved,
+            chunk_strides,
+            result_strides,
+            elem_size,
+        )
+    }
 }
 
 /// Hyperslab selection for reading slices of datasets.
@@ -89,6 +119,48 @@ pub enum SliceInfoElem {
     Index(u64),
     /// Select a range with optional step.
     Slice { start: u64, end: u64, step: u64 },
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSelectionDim {
+    start: u64,
+    end: u64,
+    step: u64,
+    count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ChunkEntryCacheKey {
+    index_address: u64,
+    first_chunk: SmallVec<[u64; 4]>,
+    last_chunk: SmallVec<[u64; 4]>,
+}
+
+impl ResolvedSelectionDim {
+    fn chunk_index_range(&self, chunk_extent: u64) -> Option<(u64, u64)> {
+        if self.count == 0 {
+            return None;
+        }
+
+        Some((self.start / chunk_extent, (self.end - 1) / chunk_extent))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSelection {
+    dims: Vec<ResolvedSelectionDim>,
+    result_shape: Vec<usize>,
+    result_elements: usize,
+}
+
+impl ResolvedSelection {
+    fn result_dims_with_collapsed(&self) -> Vec<usize> {
+        self.dims.iter().map(|dim| dim.count).collect()
+    }
+
+    fn is_unit_stride(&self) -> bool {
+        self.dims.iter().all(|dim| dim.step == 1)
+    }
 }
 
 impl SliceInfo {
@@ -107,6 +179,124 @@ impl SliceInfo {
     }
 }
 
+fn checked_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidData(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
+}
+
+fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
+fn checked_add_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
+fn expected_chunk_count(first_chunk: &[u64], last_chunk: &[u64]) -> Result<usize> {
+    let mut total = 1usize;
+    for (&first, &last) in first_chunk.iter().zip(last_chunk.iter()) {
+        let dim_count = checked_usize(last - first + 1, "selected chunk count")?;
+        total = checked_mul_usize(total, dim_count, "selected chunk count")?;
+    }
+    Ok(total)
+}
+
+fn assume_init_u8_vec(mut buffer: Vec<MaybeUninit<u8>>) -> Vec<u8> {
+    let ptr = buffer.as_mut_ptr() as *mut u8;
+    let len = buffer.len();
+    let capacity = buffer.capacity();
+    std::mem::forget(buffer);
+    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+}
+
+fn assume_init_vec<T>(mut buffer: Vec<MaybeUninit<T>>) -> Vec<T> {
+    let ptr = buffer.as_mut_ptr() as *mut T;
+    let len = buffer.len();
+    let capacity = buffer.capacity();
+    std::mem::forget(buffer);
+    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+}
+
+fn normalize_selection(selection: &SliceInfo, shape: &[u64]) -> Result<ResolvedSelection> {
+    if selection.selections.len() != shape.len() {
+        return Err(Error::InvalidData(format!(
+            "slice has {} dimensions but dataset has {}",
+            selection.selections.len(),
+            shape.len()
+        )));
+    }
+
+    let mut dims = Vec::with_capacity(shape.len());
+    let mut result_shape = Vec::new();
+    let mut result_elements = 1usize;
+
+    for (i, sel) in selection.selections.iter().enumerate() {
+        let dim_size = shape[i];
+        match sel {
+            SliceInfoElem::Index(idx) => {
+                if *idx >= dim_size {
+                    return Err(Error::SliceOutOfBounds {
+                        dim: i,
+                        index: *idx,
+                        size: dim_size,
+                    });
+                }
+                dims.push(ResolvedSelectionDim {
+                    start: *idx,
+                    end: *idx + 1,
+                    step: 1,
+                    count: 1,
+                });
+            }
+            SliceInfoElem::Slice { start, end, step } => {
+                if *step == 0 {
+                    return Err(Error::InvalidData("slice step cannot be 0".into()));
+                }
+                if *start > dim_size {
+                    return Err(Error::SliceOutOfBounds {
+                        dim: i,
+                        index: *start,
+                        size: dim_size,
+                    });
+                }
+
+                let actual_end = if *end == u64::MAX {
+                    dim_size
+                } else {
+                    (*end).min(dim_size)
+                };
+                let count_u64 = if *start >= actual_end {
+                    0
+                } else {
+                    (actual_end - *start).div_ceil(*step)
+                };
+                let count = checked_usize(count_u64, "slice element count")?;
+
+                dims.push(ResolvedSelectionDim {
+                    start: *start,
+                    end: actual_end,
+                    step: *step,
+                    count,
+                });
+                result_shape.push(count);
+                result_elements =
+                    checked_mul_usize(result_elements, count, "slice result element count")?;
+            }
+        }
+    }
+
+    Ok(ResolvedSelection {
+        dims,
+        result_shape,
+        result_elements,
+    })
+}
+
 /// A dataset within an HDF5 file.
 pub struct Dataset<'f> {
     file_data: &'f [u8],
@@ -121,6 +311,7 @@ pub struct Dataset<'f> {
     pub(crate) filters: Option<FilterPipelineMessage>,
     pub(crate) attributes: Vec<AttributeMessage>,
     pub(crate) chunk_cache: Arc<ChunkCache>,
+    chunk_entry_cache: Arc<Mutex<LruCache<ChunkEntryCacheKey, Arc<Vec<chunk_index::ChunkEntry>>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
 }
 
@@ -162,6 +353,18 @@ impl<'f> Dataset<'f> {
         let layout =
             layout.ok_or_else(|| Error::InvalidData("dataset missing data layout".into()))?;
         let layout = normalize_layout(layout, &dataspace);
+        let attr_fill_value = attributes
+            .iter()
+            .find(|attr| attr.name == "_FillValue" && attr.dataspace.num_elements() == 1)
+            .map(|attr| FillValueMessage {
+                defined: !attr.raw_data.is_empty(),
+                fill_time: FillTime::IfSet,
+                value: Some(attr.raw_data.clone()),
+            });
+        let fill_value = match fill_value {
+            Some(existing) if existing.value.is_some() => Some(existing),
+            _ => attr_fill_value,
+        };
 
         Ok(Dataset {
             file_data,
@@ -176,6 +379,7 @@ impl<'f> Dataset<'f> {
             filters: filter_pipeline,
             attributes,
             chunk_cache,
+            chunk_entry_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap()))),
             filter_registry,
         })
     }
@@ -331,13 +535,7 @@ impl<'f> Dataset<'f> {
     /// Non-chunked layouts fall back to `read_slice`.
     #[cfg(feature = "rayon")]
     pub fn read_slice_parallel<T: H5Type>(&self, selection: &SliceInfo) -> Result<ArrayD<T>> {
-        if selection.selections.len() != self.ndim() {
-            return Err(Error::InvalidData(format!(
-                "slice has {} dimensions but dataset has {}",
-                selection.selections.len(),
-                self.ndim()
-            )));
-        }
+        let resolved = normalize_selection(selection, &self.dataspace.dims)?;
 
         match &self.layout {
             DataLayout::Chunked {
@@ -351,6 +549,7 @@ impl<'f> Dataset<'f> {
                 *element_size,
                 chunk_indexing.as_ref(),
                 selection,
+                &resolved,
             ),
             _ => self.read_slice::<T>(selection),
         }
@@ -358,17 +557,11 @@ impl<'f> Dataset<'f> {
 
     /// Read a hyperslab of the dataset.
     pub fn read_slice<T: H5Type>(&self, selection: &SliceInfo) -> Result<ArrayD<T>> {
-        if selection.selections.len() != self.ndim() {
-            return Err(Error::InvalidData(format!(
-                "slice has {} dimensions but dataset has {}",
-                selection.selections.len(),
-                self.ndim()
-            )));
-        }
+        let resolved = normalize_selection(selection, &self.dataspace.dims)?;
 
         match &self.layout {
             DataLayout::Contiguous { address, size } => {
-                self.read_contiguous_slice::<T>(*address, *size, selection)
+                self.read_contiguous_slice::<T>(*address, *size, selection, &resolved)
             }
             DataLayout::Compact { data } => self.read_compact_slice::<T>(data, selection),
             DataLayout::Chunked {
@@ -382,6 +575,7 @@ impl<'f> Dataset<'f> {
                 *element_size,
                 chunk_indexing.as_ref(),
                 selection,
+                &resolved,
             ),
         }
     }
@@ -427,13 +621,14 @@ impl<'f> Dataset<'f> {
         let total_bytes = total_elements * elem_size;
         let mut flat_data = self.make_output_buffer(total_bytes);
 
-        let entries = self.collect_all_chunk_entries(
+        let entries = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
             shape,
             ndim,
             elem_size,
+            None,
         )?;
 
         for entry in &entries {
@@ -471,13 +666,14 @@ impl<'f> Dataset<'f> {
         let total_bytes = total_elements * elem_size;
         let mut flat_data = self.make_output_buffer(total_bytes);
 
-        let mut entries = self.collect_all_chunk_entries(
+        let mut entries = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
             shape,
             ndim,
             elem_size,
+            None,
         )?;
 
         // Dedup check: sort by output offsets and reject duplicates.
@@ -516,7 +712,7 @@ impl<'f> Dataset<'f> {
     /// Collect all chunk entries by dispatching on the chunk indexing type.
     ///
     /// Shared by `read_chunked` and `read_chunked_slice`.
-    fn collect_all_chunk_entries(
+    fn collect_chunk_entries(
         &self,
         index_address: u64,
         chunk_dims: &[u32],
@@ -524,11 +720,25 @@ impl<'f> Dataset<'f> {
         shape: &[u64],
         ndim: usize,
         elem_size: usize,
+        chunk_bounds: Option<(&[u64], &[u64])>,
     ) -> Result<Vec<chunk_index::ChunkEntry>> {
-        match chunk_indexing {
+        let cache_key = chunk_bounds.map(|(first_chunk, last_chunk)| ChunkEntryCacheKey {
+            index_address,
+            first_chunk: SmallVec::from_slice(first_chunk),
+            last_chunk: SmallVec::from_slice(last_chunk),
+        });
+
+        if let Some(ref key) = cache_key {
+            let mut cache = self.chunk_entry_cache.lock();
+            if let Some(cached) = cache.get(key) {
+                return Ok((**cached).clone());
+            }
+        }
+
+        let entries = match chunk_indexing {
             None => {
                 // V1-V3: B-tree v1 chunk indexing
-                self.collect_btree_v1_entries(index_address, ndim)
+                self.collect_btree_v1_entries(index_address, ndim, chunk_dims, chunk_bounds)
             }
             Some(ChunkIndexing::SingleChunk {
                 filtered_size,
@@ -545,12 +755,15 @@ impl<'f> Dataset<'f> {
                 self.offset_size,
                 self.length_size,
                 ndim as u32,
+                chunk_dims,
+                chunk_bounds,
             ),
             Some(ChunkIndexing::Implicit) => Ok(chunk_index::collect_implicit_chunk_entries(
                 index_address,
                 shape,
                 chunk_dims,
                 elem_size,
+                chunk_bounds,
             )),
             Some(ChunkIndexing::FixedArray { .. }) => {
                 crate::fixed_array::collect_fixed_array_chunk_entries(
@@ -560,6 +773,7 @@ impl<'f> Dataset<'f> {
                     self.length_size,
                     shape,
                     chunk_dims,
+                    chunk_bounds,
                 )
             }
             Some(ChunkIndexing::ExtensibleArray { .. }) => {
@@ -570,9 +784,17 @@ impl<'f> Dataset<'f> {
                     self.length_size,
                     shape,
                     chunk_dims,
+                    chunk_bounds,
                 )
             }
+        }?;
+
+        if let Some(key) = cache_key {
+            let mut cache = self.chunk_entry_cache.lock();
+            cache.put(key, Arc::new(entries.clone()));
         }
+
+        Ok(entries)
     }
 
     /// Collect chunk entries from a B-tree v1 index.
@@ -580,6 +802,8 @@ impl<'f> Dataset<'f> {
         &self,
         btree_address: u64,
         ndim: usize,
+        chunk_dims: &[u32],
+        chunk_bounds: Option<(&[u64], &[u64])>,
     ) -> Result<Vec<chunk_index::ChunkEntry>> {
         let leaves = crate::btree_v1::collect_btree_v1_leaves(
             self.file_data,
@@ -587,6 +811,8 @@ impl<'f> Dataset<'f> {
             self.offset_size,
             self.length_size,
             Some(ndim as u32),
+            chunk_dims,
+            chunk_bounds,
         )?;
 
         let mut entries = Vec::with_capacity(leaves.len());
@@ -666,117 +892,141 @@ impl<'f> Dataset<'f> {
         chunk_dims: &[u32],
         _element_size: u32,
         chunk_indexing: Option<&ChunkIndexing>,
-        selection: &SliceInfo,
+        _selection: &SliceInfo,
+        resolved: &ResolvedSelection,
     ) -> Result<ArrayD<T>> {
+        if resolved.result_elements == 0 {
+            return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
+        }
+
         if Cursor::is_undefined_offset(index_address, self.offset_size) {
-            // No data — build a fill-value array then slice it.
-            let full = self.make_fill_array::<T>()?;
-            return slice_array(&full, selection, &self.dataspace.dims);
+            return self
+                .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-
-        // Resolve each selection dimension to (start, end_exclusive, step, count).
-        let mut sel_ranges: Vec<(u64, u64, u64, usize)> = Vec::with_capacity(ndim);
-        let mut result_shape: Vec<usize> = Vec::new();
-
-        for (i, sel) in selection.selections.iter().enumerate() {
-            let dim_size = shape[i];
-            match sel {
-                SliceInfoElem::Index(idx) => {
-                    if *idx >= dim_size {
-                        return Err(Error::SliceOutOfBounds {
-                            dim: i,
-                            index: *idx,
-                            size: dim_size,
-                        });
-                    }
-                    sel_ranges.push((*idx, *idx + 1, 1, 1));
-                    // Don't add to result_shape — collapsed dim
-                }
-                SliceInfoElem::Slice { start, end, step } => {
-                    let actual_end = if *end == u64::MAX {
-                        dim_size
-                    } else {
-                        (*end).min(dim_size)
-                    };
-                    if *step == 0 {
-                        return Err(Error::InvalidData("slice step cannot be 0".into()));
-                    }
-                    let count = (actual_end - *start).div_ceil(*step) as usize;
-                    sel_ranges.push((*start, actual_end, *step, count));
-                    result_shape.push(count);
-                }
-            }
-        }
-
-        // Compute chunk grid range per dimension.
         let mut first_chunk = vec![0u64; ndim];
         let mut last_chunk = vec![0u64; ndim];
         for d in 0..ndim {
-            first_chunk[d] = sel_ranges[d].0 / chunk_shape[d];
-            last_chunk[d] = if sel_ranges[d].1 == 0 {
-                0
-            } else {
-                (sel_ranges[d].1 - 1) / chunk_shape[d]
-            };
+            let (first, last) = resolved.dims[d]
+                .chunk_index_range(chunk_shape[d])
+                .expect("zero-sized result handled above");
+            first_chunk[d] = first;
+            last_chunk[d] = last;
         }
 
         // Collect all chunk entries.
-        let all_entries = self.collect_all_chunk_entries(
+        let overlapping = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
             shape,
             ndim,
             elem_size,
+            Some((&first_chunk, &last_chunk)),
         )?;
 
-        // Filter to only chunks overlapping the selection.
-        let overlapping: Vec<&chunk_index::ChunkEntry> = all_entries
-            .iter()
-            .filter(|entry| {
-                for d in 0..ndim {
-                    let chunk_idx = entry.offsets[d] / chunk_shape[d];
-                    if chunk_idx < first_chunk[d] || chunk_idx > last_chunk[d] {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        // Allocate result buffer (raw bytes) initialized from fill value.
-        let result_elements: usize = sel_ranges.iter().map(|r| r.3).product();
-        let result_total_bytes = result_elements * elem_size;
-        let mut result_buf = if let Some(ref fv) = self.fill_value {
-            if let Some(ref fill_bytes) = fv.value {
-                let mut buf = vec![0u8; result_total_bytes];
-                if !fill_bytes.is_empty() {
-                    for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
-                        chunk.copy_from_slice(fill_bytes);
-                    }
-                }
-                buf
-            } else {
-                vec![0u8; result_total_bytes]
-            }
-        } else {
-            vec![0u8; result_total_bytes]
-        };
-
+        let result_total_bytes = checked_mul_usize(
+            resolved.result_elements,
+            elem_size,
+            "slice result size in bytes",
+        )?;
         // Compute result strides (including collapsed dims — they have count=1).
-        let result_dims: Vec<usize> = sel_ranges.iter().map(|r| r.3).collect();
+        let result_dims = resolved.result_dims_with_collapsed();
         let mut result_strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            result_strides[d] = result_strides[d + 1] * result_dims[d + 1];
+            result_strides[d] =
+                checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
+        }
+        let mut chunk_strides = vec![1usize; ndim];
+        for d in (0..ndim - 1).rev() {
+            chunk_strides[d] = checked_mul_usize(
+                chunk_strides[d + 1],
+                chunk_shape[d + 1] as usize,
+                "chunk stride",
+            )?;
+        }
+        let use_unit_stride_fast_path = resolved.is_unit_stride();
+        let fully_covered_unit_stride = use_unit_stride_fast_path
+            && overlapping.len() == expected_chunk_count(&first_chunk, &last_chunk)?;
+
+        if fully_covered_unit_stride {
+            if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
+                let mut result_values: Vec<MaybeUninit<T>> =
+                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
+                        .take(resolved.result_elements)
+                        .collect();
+                let result_ptr = result_values.as_mut_ptr() as *mut u8;
+                let result_len = checked_mul_usize(
+                    result_values.len(),
+                    std::mem::size_of::<T>(),
+                    "typed slice result size in bytes",
+                )?;
+
+                for entry in &overlapping {
+                    let chunk_data =
+                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+
+                    unsafe {
+                        copy_unit_stride_chunk_overlap_ptr(
+                            &chunk_data,
+                            result_ptr,
+                            result_len,
+                            &entry.offsets,
+                            &chunk_shape,
+                            shape,
+                            resolved,
+                            &chunk_strides,
+                            &result_strides,
+                            elem_size,
+                        )?;
+                    }
+                }
+
+                let result_values = assume_init_vec(result_values);
+                return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
+                    .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
+            }
+
+            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
+            let result_ptr = result_buf.as_mut_ptr() as *mut u8;
+            let result_len = result_buf.len();
+
+            for entry in &overlapping {
+                let chunk_data =
+                    self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+
+                unsafe {
+                    copy_unit_stride_chunk_overlap_ptr(
+                        &chunk_data,
+                        result_ptr,
+                        result_len,
+                        &entry.offsets,
+                        &chunk_shape,
+                        shape,
+                        resolved,
+                        &chunk_strides,
+                        &result_strides,
+                        elem_size,
+                    )?;
+                }
+            }
+
+            let result_buf = assume_init_u8_vec(result_buf);
+            return self.decode_buffer_with_shape::<T>(
+                &result_buf,
+                resolved.result_elements,
+                &resolved.result_shape,
+            );
         }
 
+        let mut result_buf = self.make_output_buffer(result_total_bytes);
+
         // For each overlapping chunk: decompress and copy matching elements.
-        for entry in overlapping {
+        for entry in &overlapping {
             let cache_key = crate::cache::ChunkKey {
                 dataset_addr: index_address,
                 chunk_offsets: smallvec::SmallVec::from_slice(&entry.offsets),
@@ -809,10 +1059,19 @@ impl<'f> Dataset<'f> {
                 self.chunk_cache.insert(cache_key, decoded)
             };
 
-            // Chunk strides
-            let mut chunk_strides = vec![1usize; ndim];
-            for d in (0..ndim - 1).rev() {
-                chunk_strides[d] = chunk_strides[d + 1] * chunk_shape[d + 1] as usize;
+            if use_unit_stride_fast_path {
+                copy_unit_stride_chunk_overlap(
+                    &chunk_data,
+                    &mut result_buf,
+                    &entry.offsets,
+                    &chunk_shape,
+                    shape,
+                    resolved,
+                    &chunk_strides,
+                    &result_strides,
+                    elem_size,
+                )?;
+                continue;
             }
 
             // For each dimension, compute which elements within this chunk fall
@@ -821,7 +1080,10 @@ impl<'f> Dataset<'f> {
             for d in 0..ndim {
                 let chunk_start = entry.offsets[d];
                 let chunk_end = (chunk_start + chunk_shape[d]).min(shape[d]);
-                let (sel_start, sel_end, sel_step, _) = sel_ranges[d];
+                let dim = &resolved.dims[d];
+                let sel_start = dim.start;
+                let sel_end = dim.end;
+                let sel_step = dim.step;
                 let mut indices = Vec::new();
 
                 // Find first selected index >= chunk_start
@@ -834,9 +1096,10 @@ impl<'f> Dataset<'f> {
 
                 let mut sel_idx = first_sel;
                 while sel_idx < sel_end && sel_idx < chunk_end {
-                    let chunk_local = (sel_idx - chunk_start) as usize;
+                    let chunk_local = checked_usize(sel_idx - chunk_start, "chunk-local index")?;
                     // Compute result-space index for this dimension.
-                    let result_dim_idx = ((sel_idx - sel_ranges[d].0) / sel_step) as usize;
+                    let result_dim_idx =
+                        checked_usize((sel_idx - dim.start) / sel_step, "result index")?;
                     indices.push((chunk_local, result_dim_idx));
                     sel_idx += sel_step;
                 }
@@ -856,21 +1119,11 @@ impl<'f> Dataset<'f> {
             );
         }
 
-        // Decode the result buffer into typed elements.
-        let total = result_elements;
-        let mut elements = Vec::with_capacity(total);
-        for i in 0..total {
-            let start = i * elem_size;
-            let end = start + elem_size;
-            if end <= result_buf.len() {
-                elements.push(T::from_bytes(&result_buf[start..end], &self.datatype)?);
-            } else {
-                elements.push(T::from_bytes(&vec![0u8; elem_size], &self.datatype)?);
-            }
-        }
-
-        ArrayD::from_shape_vec(IxDyn(&result_shape), elements)
-            .map_err(|e| Error::InvalidData(format!("slice shape error: {e}")))
+        self.decode_buffer_with_shape::<T>(
+            &result_buf,
+            resolved.result_elements,
+            &resolved.result_shape,
+        )
     }
 
     /// Parallel variant of `read_chunked_slice`: decompresses overlapping chunks
@@ -885,118 +1138,149 @@ impl<'f> Dataset<'f> {
         chunk_dims: &[u32],
         _element_size: u32,
         chunk_indexing: Option<&ChunkIndexing>,
-        selection: &SliceInfo,
+        _selection: &SliceInfo,
+        resolved: &ResolvedSelection,
     ) -> Result<ArrayD<T>> {
+        if resolved.result_elements == 0 {
+            return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
+        }
+
         if Cursor::is_undefined_offset(index_address, self.offset_size) {
-            let full = self.make_fill_array::<T>()?;
-            return slice_array(&full, selection, &self.dataspace.dims);
+            return self
+                .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-
-        // Resolve each selection dimension to (start, end_exclusive, step, count).
-        let mut sel_ranges: Vec<(u64, u64, u64, usize)> = Vec::with_capacity(ndim);
-        let mut result_shape: Vec<usize> = Vec::new();
-
-        for (i, sel) in selection.selections.iter().enumerate() {
-            let dim_size = shape[i];
-            match sel {
-                SliceInfoElem::Index(idx) => {
-                    if *idx >= dim_size {
-                        return Err(Error::SliceOutOfBounds {
-                            dim: i,
-                            index: *idx,
-                            size: dim_size,
-                        });
-                    }
-                    sel_ranges.push((*idx, *idx + 1, 1, 1));
-                }
-                SliceInfoElem::Slice { start, end, step } => {
-                    let actual_end = if *end == u64::MAX {
-                        dim_size
-                    } else {
-                        (*end).min(dim_size)
-                    };
-                    if *step == 0 {
-                        return Err(Error::InvalidData("slice step cannot be 0".into()));
-                    }
-                    let count = (actual_end - *start).div_ceil(*step) as usize;
-                    sel_ranges.push((*start, actual_end, *step, count));
-                    result_shape.push(count);
-                }
-            }
-        }
-
-        // Compute chunk grid range per dimension.
         let mut first_chunk = vec![0u64; ndim];
         let mut last_chunk = vec![0u64; ndim];
         for d in 0..ndim {
-            first_chunk[d] = sel_ranges[d].0 / chunk_shape[d];
-            last_chunk[d] = if sel_ranges[d].1 == 0 {
-                0
-            } else {
-                (sel_ranges[d].1 - 1) / chunk_shape[d]
-            };
+            let (first, last) = resolved.dims[d]
+                .chunk_index_range(chunk_shape[d])
+                .expect("zero-sized result handled above");
+            first_chunk[d] = first;
+            last_chunk[d] = last;
         }
 
         // Collect all chunk entries.
-        let all_entries = self.collect_all_chunk_entries(
+        let overlapping = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
             shape,
             ndim,
             elem_size,
+            Some((&first_chunk, &last_chunk)),
         )?;
 
-        // Filter to only chunks overlapping the selection.
-        let overlapping: Vec<&chunk_index::ChunkEntry> = all_entries
-            .iter()
-            .filter(|entry| {
-                for d in 0..ndim {
-                    let chunk_idx = entry.offsets[d] / chunk_shape[d];
-                    if chunk_idx < first_chunk[d] || chunk_idx > last_chunk[d] {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
         // Allocate result buffer (raw bytes) initialized from fill value.
-        let result_elements: usize = sel_ranges.iter().map(|r| r.3).product();
-        let result_total_bytes = result_elements * elem_size;
-        let mut result_buf = if let Some(ref fv) = self.fill_value {
-            if let Some(ref fill_bytes) = fv.value {
-                let mut buf = vec![0u8; result_total_bytes];
-                if !fill_bytes.is_empty() {
-                    for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
-                        chunk.copy_from_slice(fill_bytes);
-                    }
-                }
-                buf
-            } else {
-                vec![0u8; result_total_bytes]
-            }
-        } else {
-            vec![0u8; result_total_bytes]
-        };
-
+        let result_total_bytes = checked_mul_usize(
+            resolved.result_elements,
+            elem_size,
+            "slice result size in bytes",
+        )?;
         // Compute result strides (including collapsed dims — they have count=1).
-        let result_dims: Vec<usize> = sel_ranges.iter().map(|r| r.3).collect();
+        let result_dims = resolved.result_dims_with_collapsed();
         let mut result_strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            result_strides[d] = result_strides[d + 1] * result_dims[d + 1];
+            result_strides[d] =
+                checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
         }
-
-        // Chunk strides (same for all chunks with identical chunk_shape).
         let mut chunk_strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            chunk_strides[d] = chunk_strides[d + 1] * chunk_shape[d + 1] as usize;
+            chunk_strides[d] = checked_mul_usize(
+                chunk_strides[d + 1],
+                chunk_shape[d + 1] as usize,
+                "chunk stride",
+            )?;
         }
+        let use_unit_stride_fast_path = resolved.is_unit_stride();
+        let fully_covered_unit_stride = use_unit_stride_fast_path
+            && overlapping.len() == expected_chunk_count(&first_chunk, &last_chunk)?;
+
+        if fully_covered_unit_stride {
+            if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
+                let mut result_values: Vec<MaybeUninit<T>> =
+                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
+                        .take(resolved.result_elements)
+                        .collect();
+                let flat = FlatBufferPtr {
+                    ptr: result_values.as_mut_ptr() as *mut u8,
+                    len: checked_mul_usize(
+                        result_values.len(),
+                        std::mem::size_of::<T>(),
+                        "typed slice result size in bytes",
+                    )?,
+                };
+
+                overlapping
+                    .par_iter()
+                    .map(|entry| {
+                        let chunk_data =
+                            self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+
+                        unsafe {
+                            flat.copy_unit_stride_chunk_overlap(
+                                &chunk_data,
+                                &entry.offsets,
+                                &chunk_shape,
+                                shape,
+                                resolved,
+                                &chunk_strides,
+                                &result_strides,
+                                elem_size,
+                            )?;
+                        }
+
+                        Ok(())
+                    })
+                    .collect::<std::result::Result<Vec<_>, Error>>()?;
+
+                let result_values = assume_init_vec(result_values);
+                return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
+                    .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
+            }
+
+            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
+            let flat = FlatBufferPtr {
+                ptr: result_buf.as_mut_ptr() as *mut u8,
+                len: result_buf.len(),
+            };
+
+            overlapping
+                .par_iter()
+                .map(|entry| {
+                    let chunk_data =
+                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+
+                    unsafe {
+                        flat.copy_unit_stride_chunk_overlap(
+                            &chunk_data,
+                            &entry.offsets,
+                            &chunk_shape,
+                            shape,
+                            resolved,
+                            &chunk_strides,
+                            &result_strides,
+                            elem_size,
+                        )?;
+                    }
+
+                    Ok(())
+                })
+                .collect::<std::result::Result<Vec<_>, Error>>()?;
+
+            let result_buf = assume_init_u8_vec(result_buf);
+            return self.decode_buffer_with_shape::<T>(
+                &result_buf,
+                resolved.result_elements,
+                &resolved.result_shape,
+            );
+        }
+
+        let mut result_buf = self.make_output_buffer(result_total_bytes);
 
         let flat = FlatBufferPtr {
             ptr: result_buf.as_mut_ptr(),
@@ -1009,13 +1293,32 @@ impl<'f> Dataset<'f> {
                 let chunk_data =
                     self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
+                if use_unit_stride_fast_path {
+                    unsafe {
+                        flat.copy_unit_stride_chunk_overlap(
+                            &chunk_data,
+                            &entry.offsets,
+                            &chunk_shape,
+                            shape,
+                            resolved,
+                            &chunk_strides,
+                            &result_strides,
+                            elem_size,
+                        )?;
+                    }
+                    return Ok(());
+                }
+
                 // For each dimension, compute which elements within this chunk fall
                 // within the selection.
                 let mut dim_indices: Vec<Vec<(usize, usize)>> = Vec::with_capacity(ndim);
                 for d in 0..ndim {
                     let chunk_start = entry.offsets[d];
                     let chunk_end = (chunk_start + chunk_shape[d]).min(shape[d]);
-                    let (sel_start, sel_end, sel_step, _) = sel_ranges[d];
+                    let dim = &resolved.dims[d];
+                    let sel_start = dim.start;
+                    let sel_end = dim.end;
+                    let sel_step = dim.step;
                     let mut indices = Vec::new();
 
                     let first_sel = if sel_start >= chunk_start {
@@ -1027,8 +1330,10 @@ impl<'f> Dataset<'f> {
 
                     let mut sel_idx = first_sel;
                     while sel_idx < sel_end && sel_idx < chunk_end {
-                        let chunk_local = (sel_idx - chunk_start) as usize;
-                        let result_dim_idx = ((sel_idx - sel_ranges[d].0) / sel_step) as usize;
+                        let chunk_local =
+                            checked_usize(sel_idx - chunk_start, "chunk-local index")?;
+                        let result_dim_idx =
+                            checked_usize((sel_idx - dim.start) / sel_step, "result index")?;
                         indices.push((chunk_local, result_dim_idx));
                         sel_idx += sel_step;
                     }
@@ -1054,21 +1359,11 @@ impl<'f> Dataset<'f> {
             })
             .collect::<std::result::Result<Vec<_>, Error>>()?;
 
-        // Decode the result buffer into typed elements.
-        let total = result_elements;
-        let mut elements = Vec::with_capacity(total);
-        for i in 0..total {
-            let start = i * elem_size;
-            let end = start + elem_size;
-            if end <= result_buf.len() {
-                elements.push(T::from_bytes(&result_buf[start..end], &self.datatype)?);
-            } else {
-                elements.push(T::from_bytes(&vec![0u8; elem_size], &self.datatype)?);
-            }
-        }
-
-        ArrayD::from_shape_vec(IxDyn(&result_shape), elements)
-            .map_err(|e| Error::InvalidData(format!("slice shape error: {e}")))
+        self.decode_buffer_with_shape::<T>(
+            &result_buf,
+            resolved.result_elements,
+            &resolved.result_shape,
+        )
     }
 
     fn read_contiguous_slice<T: H5Type>(
@@ -1076,10 +1371,15 @@ impl<'f> Dataset<'f> {
         address: u64,
         size: u64,
         selection: &SliceInfo,
+        resolved: &ResolvedSelection,
     ) -> Result<ArrayD<T>> {
+        if resolved.result_elements == 0 {
+            return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
+        }
+
         if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
-            let full = self.make_fill_array::<T>()?;
-            return slice_array(&full, selection, &self.dataspace.dims);
+            return self
+                .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
 
         let shape = &self.dataspace.dims;
@@ -1132,15 +1432,26 @@ impl<'f> Dataset<'f> {
                     } else {
                         (*end).min(shape[0])
                     };
-                    let count = actual_end - start;
-                    let mut rs = vec![count as usize];
-                    rs.extend(shape[1..].iter().map(|&d| d as usize));
+                    let count = actual_end.saturating_sub(*start);
+                    let mut rs = vec![checked_usize(count, "contiguous slice row count")?];
+                    for &dim in &shape[1..] {
+                        rs.push(checked_usize(dim, "dataset dimension")?);
+                    }
                     (*start, count, rs)
                 }
             };
 
-            let byte_offset = address as usize + first_row as usize * row_bytes;
-            let total_bytes = num_rows as usize * row_bytes;
+            let byte_offset = checked_usize(address, "contiguous data address")?
+                + checked_mul_usize(
+                    checked_usize(first_row, "slice row offset")?,
+                    row_bytes,
+                    "contiguous byte offset",
+                )?;
+            let total_bytes = checked_mul_usize(
+                checked_usize(num_rows, "contiguous slice row count")?,
+                row_bytes,
+                "contiguous slice size in bytes",
+            )?;
 
             if byte_offset + total_bytes > self.file_data.len() {
                 return Err(Error::OffsetOutOfBounds(address));
@@ -1181,34 +1492,27 @@ impl<'f> Dataset<'f> {
         slice_array(&full, selection, &self.dataspace.dims)
     }
 
-    fn decode_raw_data<T: H5Type>(&self, raw: &[u8]) -> Result<ArrayD<T>> {
-        let n = self.num_elements() as usize;
+    fn decode_buffer_with_shape<T: H5Type>(
+        &self,
+        raw: &[u8],
+        n: usize,
+        shape: &[usize],
+    ) -> Result<ArrayD<T>> {
         let elem_size = dtype_element_size(&self.datatype);
-
-        let shape: Vec<usize> = if self.dataspace.dims.is_empty() {
-            vec![] // scalar
-        } else {
-            self.dataspace.dims.iter().map(|&d| d as usize).collect()
-        };
 
         if let Some(elements) = T::decode_vec(raw, &self.datatype, n) {
             let elements = elements?;
-            if shape.is_empty() {
-                return ArrayD::from_shape_vec(IxDyn(&[]), elements)
-                    .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
-            }
-
-            return ArrayD::from_shape_vec(IxDyn(&shape), elements)
+            return ArrayD::from_shape_vec(IxDyn(shape), elements)
                 .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
         }
 
         let mut elements = Vec::with_capacity(n);
         for i in 0..n {
-            let start = i * elem_size;
-            let end = start + elem_size;
+            let start = checked_mul_usize(i, elem_size, "decoded element byte offset")?;
+            let end = checked_mul_usize(i + 1, elem_size, "decoded element end offset")?;
             if end > raw.len() {
-                // Pad with fill value or zeros if data is short
-                let padded = if end <= raw.len() + elem_size {
+                // Pad with fill value or zeros if data is short.
+                let padded = if end <= raw.len().saturating_add(elem_size) {
                     let mut buf = vec![0u8; elem_size];
                     let available = raw.len().saturating_sub(start);
                     if available > 0 {
@@ -1224,39 +1528,37 @@ impl<'f> Dataset<'f> {
             }
         }
 
-        if shape.is_empty() {
-            // Scalar
-            Ok(ArrayD::from_shape_vec(IxDyn(&[]), elements)
-                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
-        } else {
-            Ok(ArrayD::from_shape_vec(IxDyn(&shape), elements)
-                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
+        ArrayD::from_shape_vec(IxDyn(shape), elements)
+            .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))
+    }
+
+    fn decode_raw_data<T: H5Type>(&self, raw: &[u8]) -> Result<ArrayD<T>> {
+        let n = checked_usize(self.num_elements(), "dataset element count")?;
+        let mut shape = Vec::with_capacity(self.dataspace.dims.len());
+        for &dim in &self.dataspace.dims {
+            shape.push(checked_usize(dim, "dataset dimension")?);
         }
+        self.decode_buffer_with_shape::<T>(raw, n, &shape)
     }
 
     fn make_fill_array<T: H5Type>(&self) -> Result<ArrayD<T>> {
-        let n = self.num_elements() as usize;
+        let n = checked_usize(self.num_elements(), "dataset element count")?;
+        let mut shape = Vec::with_capacity(self.dataspace.dims.len());
+        for &dim in &self.dataspace.dims {
+            shape.push(checked_usize(dim, "dataset dimension")?);
+        }
+        self.make_fill_array_from_shape::<T>(n, &shape)
+    }
+
+    fn make_fill_array_from_shape<T: H5Type>(
+        &self,
+        element_count: usize,
+        shape: &[usize],
+    ) -> Result<ArrayD<T>> {
         let elem_size = dtype_element_size(&self.datatype);
-
-        let fill_bytes = if let Some(ref fv) = self.fill_value {
-            fv.value.clone().unwrap_or(vec![0u8; elem_size])
-        } else {
-            vec![0u8; elem_size]
-        };
-
-        let mut elements = Vec::with_capacity(n);
-        for _ in 0..n {
-            elements.push(T::from_bytes(&fill_bytes, &self.datatype)?);
-        }
-
-        let shape: Vec<usize> = self.dataspace.dims.iter().map(|&d| d as usize).collect();
-        if shape.is_empty() {
-            Ok(ArrayD::from_shape_vec(IxDyn(&[]), elements)
-                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
-        } else {
-            Ok(ArrayD::from_shape_vec(IxDyn(&shape), elements)
-                .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))?)
-        }
+        let total_bytes = checked_mul_usize(element_count, elem_size, "fill result size in bytes")?;
+        let fill = self.make_output_buffer(total_bytes);
+        self.decode_buffer_with_shape::<T>(&fill, element_count, shape)
     }
 
     fn make_output_buffer(&self, total_bytes: usize) -> Vec<u8> {
@@ -1416,6 +1718,189 @@ unsafe fn copy_chunk_to_flat_ptr(
     }
 }
 
+fn checked_product_usize(values: &[usize], context: &str) -> Result<usize> {
+    let mut product = 1usize;
+    for &value in values {
+        product = checked_mul_usize(product, value, context)?;
+    }
+    Ok(product)
+}
+
+fn unit_stride_chunk_overlap_plan(
+    chunk_offsets: &[u64],
+    chunk_shape: &[u64],
+    dataset_shape: &[u64],
+    resolved: &ResolvedSelection,
+) -> Result<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    let ndim = dataset_shape.len();
+    let mut overlap_counts = Vec::with_capacity(ndim);
+    let mut chunk_local_start = Vec::with_capacity(ndim);
+    let mut result_start = Vec::with_capacity(ndim);
+
+    for d in 0..ndim {
+        let chunk_start = chunk_offsets[d];
+        let chunk_end = (chunk_start + chunk_shape[d]).min(dataset_shape[d]);
+        let dim = &resolved.dims[d];
+        let overlap_start = chunk_start.max(dim.start);
+        let overlap_end = chunk_end.min(dim.end);
+        if overlap_start >= overlap_end {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+
+        overlap_counts.push(checked_usize(
+            overlap_end - overlap_start,
+            "chunk overlap size",
+        )?);
+        chunk_local_start.push(checked_usize(
+            overlap_start - chunk_start,
+            "chunk overlap start",
+        )?);
+        result_start.push(checked_usize(
+            overlap_start - dim.start,
+            "slice result overlap start",
+        )?);
+    }
+
+    Ok((overlap_counts, chunk_local_start, result_start))
+}
+
+fn copy_unit_stride_chunk_overlap(
+    chunk_data: &[u8],
+    result_buf: &mut [u8],
+    chunk_offsets: &[u64],
+    chunk_shape: &[u64],
+    dataset_shape: &[u64],
+    resolved: &ResolvedSelection,
+    chunk_strides: &[usize],
+    result_strides: &[usize],
+    elem_size: usize,
+) -> Result<()> {
+    unsafe {
+        copy_unit_stride_chunk_overlap_ptr(
+            chunk_data,
+            result_buf.as_mut_ptr(),
+            result_buf.len(),
+            chunk_offsets,
+            chunk_shape,
+            dataset_shape,
+            resolved,
+            chunk_strides,
+            result_strides,
+            elem_size,
+        )
+    }
+}
+
+/// Copy a unit-step rectangular overlap from a chunk into the result buffer.
+///
+/// This is the hot path for contiguous hyperslab reads over chunked datasets:
+/// rather than copying one element at a time, it copies contiguous runs along
+/// the innermost dimension with a single memcpy per output row.
+///
+/// # Safety
+///
+/// The caller must guarantee that `[result_ptr .. result_ptr + result_len)` is
+/// valid for writes. Concurrent callers must write to disjoint byte ranges.
+#[allow(clippy::too_many_arguments)]
+unsafe fn copy_unit_stride_chunk_overlap_ptr(
+    chunk_data: &[u8],
+    result_ptr: *mut u8,
+    result_len: usize,
+    chunk_offsets: &[u64],
+    chunk_shape: &[u64],
+    dataset_shape: &[u64],
+    resolved: &ResolvedSelection,
+    chunk_strides: &[usize],
+    result_strides: &[usize],
+    elem_size: usize,
+) -> Result<()> {
+    let ndim = dataset_shape.len();
+
+    if ndim == 0 {
+        let bytes = elem_size.min(chunk_data.len()).min(result_len);
+        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), result_ptr, bytes);
+        return Ok(());
+    }
+
+    let (overlap_counts, chunk_local_start, result_start) =
+        unit_stride_chunk_overlap_plan(chunk_offsets, chunk_shape, dataset_shape, resolved)?;
+    if overlap_counts.is_empty() {
+        return Ok(());
+    }
+
+    let row_elems = *overlap_counts.last().unwrap_or(&1);
+    let row_bytes = checked_mul_usize(row_elems, elem_size, "unit-stride slice row bytes")?;
+
+    let mut chunk_origin = 0usize;
+    let mut result_origin = 0usize;
+    for d in 0..ndim {
+        let chunk_term = checked_mul_usize(
+            chunk_local_start[d],
+            chunk_strides[d],
+            "chunk overlap origin",
+        )?;
+        let result_term =
+            checked_mul_usize(result_start[d], result_strides[d], "slice result origin")?;
+        chunk_origin = checked_add_usize(chunk_origin, chunk_term, "chunk overlap origin")?;
+        result_origin = checked_add_usize(result_origin, result_term, "slice result origin")?;
+    }
+
+    if ndim == 1 {
+        let src_start = chunk_origin * elem_size;
+        let dst_start = result_origin * elem_size;
+        let src_end = src_start + row_bytes;
+        let dst_end = dst_start + row_bytes;
+        if src_end <= chunk_data.len() && dst_end <= result_len {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                result_ptr.add(dst_start),
+                row_bytes,
+            );
+        }
+        return Ok(());
+    }
+
+    let outer_counts = &overlap_counts[..ndim - 1];
+    let total_rows = checked_product_usize(outer_counts, "unit-stride slice row count")?;
+    let mut outer_idx = vec![0usize; ndim - 1];
+
+    for _ in 0..total_rows {
+        let mut chunk_row = chunk_origin;
+        let mut result_row = result_origin;
+        for d in 0..outer_idx.len() {
+            chunk_row += outer_idx[d] * chunk_strides[d];
+            result_row += outer_idx[d] * result_strides[d];
+        }
+
+        let src_start = chunk_row * elem_size;
+        let dst_start = result_row * elem_size;
+        let src_end = src_start + row_bytes;
+        let dst_end = dst_start + row_bytes;
+        if src_end <= chunk_data.len() && dst_end <= result_len {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                result_ptr.add(dst_start),
+                row_bytes,
+            );
+        }
+
+        let mut carry = true;
+        for d in (0..outer_idx.len()).rev() {
+            if carry {
+                outer_idx[d] += 1;
+                if outer_idx[d] < outer_counts[d] {
+                    carry = false;
+                } else {
+                    outer_idx[d] = 0;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 /// Copy selected elements from a chunk into the result buffer.
 ///
 /// `dim_indices[d]` is a list of `(chunk_local_idx, result_dim_idx)` pairs for dimension `d`.
@@ -1666,5 +2151,49 @@ mod tests {
         );
 
         assert_eq!(flat, vec![0, 0, 0, 0, 0, 1, 2, 3, 0, 4, 5, 6, 0, 0, 0, 0,]);
+    }
+
+    #[test]
+    fn test_copy_unit_stride_chunk_overlap_2d_partial() {
+        let chunk_data: Vec<u8> = (1..=16).collect();
+        let mut result = vec![0u8; 6];
+        let chunk_offsets = vec![0u64, 0u64];
+        let chunk_shape = vec![4u64, 4u64];
+        let dataset_shape = vec![4u64, 4u64];
+        let resolved = ResolvedSelection {
+            dims: vec![
+                ResolvedSelectionDim {
+                    start: 1,
+                    end: 3,
+                    step: 1,
+                    count: 2,
+                },
+                ResolvedSelectionDim {
+                    start: 1,
+                    end: 4,
+                    step: 1,
+                    count: 3,
+                },
+            ],
+            result_shape: vec![2, 3],
+            result_elements: 6,
+        };
+        let chunk_strides = vec![4usize, 1usize];
+        let result_strides = vec![3usize, 1usize];
+
+        copy_unit_stride_chunk_overlap(
+            &chunk_data,
+            &mut result,
+            &chunk_offsets,
+            &chunk_shape,
+            &dataset_shape,
+            &resolved,
+            &chunk_strides,
+            &result_strides,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(result, vec![6, 7, 8, 10, 11, 12]);
     }
 }

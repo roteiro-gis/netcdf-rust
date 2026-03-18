@@ -27,6 +27,12 @@ pub trait H5Type: Sized + Send + Clone {
     fn decode_vec(_raw: &[u8], _dtype: &Datatype, _count: usize) -> Option<Result<Vec<Self>>> {
         None
     }
+
+    /// Whether raw bytes for this datatype can be copied directly into a `Vec<Self>`
+    /// without any further decoding or byte swapping.
+    fn native_copy_compatible(_dtype: &Datatype) -> bool {
+        false
+    }
 }
 
 /// Read a numeric value from bytes, handling byte-order conversion.
@@ -142,6 +148,17 @@ macro_rules! impl_h5type_int {
                     _ => None,
                 }
             }
+
+            fn native_copy_compatible(dtype: &Datatype) -> bool {
+                matches!(
+                    dtype,
+                    Datatype::FixedPoint {
+                        size,
+                        byte_order,
+                        ..
+                    } if *size as usize == $size && byte_order_is_native(*byte_order)
+                )
+            }
         }
     };
 }
@@ -225,6 +242,14 @@ impl H5Type for f32 {
             _ => None,
         }
     }
+
+    fn native_copy_compatible(dtype: &Datatype) -> bool {
+        matches!(
+            dtype,
+            Datatype::FloatingPoint { size, byte_order }
+                if *size == 4 && byte_order_is_native(*byte_order)
+        )
+    }
 }
 
 impl H5Type for f64 {
@@ -296,6 +321,14 @@ impl H5Type for f64 {
             }
             _ => None,
         }
+    }
+
+    fn native_copy_compatible(dtype: &Datatype) -> bool {
+        matches!(
+            dtype,
+            Datatype::FloatingPoint { size, byte_order }
+                if *size == 8 && byte_order_is_native(*byte_order)
+        )
     }
 }
 

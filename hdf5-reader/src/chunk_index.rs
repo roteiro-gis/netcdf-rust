@@ -24,6 +24,29 @@ pub struct ChunkEntry {
     pub offsets: Vec<u64>,
 }
 
+fn chunk_overlaps_bounds(
+    offsets: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> bool {
+    let Some((first_chunk, last_chunk)) = chunk_bounds else {
+        return true;
+    };
+
+    offsets.iter().enumerate().all(|(dim, offset)| {
+        let chunk_index = *offset / u64::from(chunk_dims[dim]);
+        chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
+    })
+}
+
+fn chunk_linear_index(chunk_indices: &[u64], chunks_per_dim: &[u64]) -> u64 {
+    let mut linear = 0u64;
+    for (dim, chunk_index) in chunk_indices.iter().enumerate() {
+        linear = linear * chunks_per_dim[dim] + chunk_index;
+    }
+    linear
+}
+
 /// Collect chunk entries from a B-tree v2 chunk index.
 pub fn collect_v2_chunk_entries(
     data: &[u8],
@@ -31,6 +54,8 @@ pub fn collect_v2_chunk_entries(
     offset_size: u8,
     length_size: u8,
     ndim: u32,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
     let mut cursor = crate::io::Cursor::new(data);
     cursor.set_position(btree_address);
@@ -42,18 +67,22 @@ pub fn collect_v2_chunk_entries(
         offset_size,
         length_size,
         Some(ndim),
+        chunk_dims,
+        chunk_bounds,
     )?;
 
     let mut entries = Vec::with_capacity(records.len());
     for record in records {
         match record {
             crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets } => {
-                entries.push(ChunkEntry {
-                    address,
-                    size: 0, // caller must compute from chunk dims * elem_size
-                    filter_mask: 0,
-                    offsets,
-                });
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
+                    entries.push(ChunkEntry {
+                        address,
+                        size: 0, // caller must compute from chunk dims * elem_size
+                        filter_mask: 0,
+                        offsets,
+                    });
+                }
             }
             crate::btree_v2::BTreeV2Record::ChunkedFiltered {
                 address,
@@ -61,12 +90,14 @@ pub fn collect_v2_chunk_entries(
                 filter_mask,
                 offsets,
             } => {
-                entries.push(ChunkEntry {
-                    address,
-                    size: chunk_size,
-                    filter_mask,
-                    offsets,
-                });
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
+                    entries.push(ChunkEntry {
+                        address,
+                        size: chunk_size,
+                        filter_mask,
+                        offsets,
+                    });
+                }
             }
             _ => {
                 // Skip non-chunk records
@@ -86,6 +117,7 @@ pub fn collect_implicit_chunk_entries(
     dataset_shape: &[u64],
     chunk_dims: &[u32],
     elem_size: usize,
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Vec<ChunkEntry> {
     let chunk_bytes: u64 = chunk_dims.iter().map(|&d| d as u64).product::<u64>() * elem_size as u64;
     let ndim = dataset_shape.len();
@@ -95,17 +127,41 @@ pub fn collect_implicit_chunk_entries(
         .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
         .collect();
 
-    let total_chunks: u64 = chunks_per_dim.iter().product();
-    let mut entries = Vec::with_capacity(total_chunks as usize);
+    if ndim == 0 {
+        return vec![ChunkEntry {
+            address: start_address,
+            size: chunk_bytes,
+            filter_mask: 0,
+            offsets: Vec::new(),
+        }];
+    }
 
-    for chunk_idx in 0..total_chunks {
-        // Convert linear chunk index to multi-dimensional offsets
-        let mut remaining = chunk_idx;
-        let mut offsets = vec![0u64; ndim];
-        for d in (0..ndim).rev() {
-            offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
-            remaining /= chunks_per_dim[d];
-        }
+    let (first_chunk, last_chunk): (Vec<u64>, Vec<u64>) = match chunk_bounds {
+        Some((first, last)) => (first.to_vec(), last.to_vec()),
+        None => (
+            vec![0u64; ndim],
+            chunks_per_dim
+                .iter()
+                .map(|count| count.saturating_sub(1))
+                .collect(),
+        ),
+    };
+
+    let mut chunk_counts = Vec::with_capacity(ndim);
+    for dim in 0..ndim {
+        chunk_counts.push(last_chunk[dim] - first_chunk[dim] + 1);
+    }
+    let total_selected_chunks: u64 = chunk_counts.iter().product();
+    let mut entries = Vec::with_capacity(total_selected_chunks as usize);
+    let mut chunk_indices = first_chunk.clone();
+
+    loop {
+        let chunk_idx = chunk_linear_index(&chunk_indices, &chunks_per_dim);
+        let offsets = chunk_indices
+            .iter()
+            .enumerate()
+            .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
+            .collect();
 
         entries.push(ChunkEntry {
             address: start_address + chunk_idx * chunk_bytes,
@@ -113,6 +169,22 @@ pub fn collect_implicit_chunk_entries(
             filter_mask: 0,
             offsets,
         });
+
+        let mut advanced = false;
+        for dim in (0..ndim).rev() {
+            if chunk_indices[dim] < last_chunk[dim] {
+                chunk_indices[dim] += 1;
+                for reset_dim in dim + 1..ndim {
+                    chunk_indices[reset_dim] = first_chunk[reset_dim];
+                }
+                advanced = true;
+                break;
+            }
+        }
+
+        if !advanced {
+            break;
+        }
     }
 
     entries
@@ -154,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_implicit_chunk_entries() {
-        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4);
+        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None);
         // 2 chunks along dim 0, 2 chunks along dim 1 = 4 total
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].address, 1000);

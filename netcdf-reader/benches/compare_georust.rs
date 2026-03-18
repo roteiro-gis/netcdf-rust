@@ -181,6 +181,7 @@ struct GeneratedFixtures {
     large_cdf5: PathBuf,
     large_nc4_compressed: PathBuf,
     nested_nc4_groups: PathBuf,
+    sparse_huge_logical_nc4: PathBuf,
 }
 
 static GENERATED_FIXTURES: OnceLock<GeneratedFixtures> = OnceLock::new();
@@ -201,16 +202,19 @@ fn generated_fixtures() -> &'static GeneratedFixtures {
         let large_cdf5 = temp_dir.path().join("bench_large_cdf5.nc");
         let large_nc4_compressed = temp_dir.path().join("bench_large_nc4_compressed.nc");
         let nested_nc4_groups = temp_dir.path().join("bench_nested_nc4_groups.nc");
+        let sparse_huge_logical_nc4 = temp_dir.path().join("bench_sparse_huge_logical_nc4.nc");
 
         create_large_cdf5_fixture(&large_cdf5);
         create_large_nc4_compressed_fixture(&large_nc4_compressed);
         create_nested_nc4_groups_fixture(&nested_nc4_groups);
+        create_sparse_huge_logical_nc4_fixture(&sparse_huge_logical_nc4);
 
         GeneratedFixtures {
             _temp_dir: temp_dir,
             large_cdf5,
             large_nc4_compressed,
             nested_nc4_groups,
+            sparse_huge_logical_nc4,
         }
     })
 }
@@ -293,6 +297,20 @@ fn create_nested_nc4_groups_fixture(path: &Path) {
         let pressure_data = ndarray::Array1::from_vec(vec![1013.25_f64, 1012.0, 1014.5]);
         pressure.put(pressure_data.view(), (..,)).unwrap();
     }
+}
+
+fn create_sparse_huge_logical_nc4_fixture(path: &Path) {
+    const HUGE_DIM: usize = 1 << 20;
+
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("row", HUGE_DIM).unwrap();
+    file.add_dimension("col", HUGE_DIM).unwrap();
+    {
+        let mut variable = file.add_variable::<f32>("sparse", &["row", "col"]).unwrap();
+        variable.set_chunking(&[1024, 1024]).unwrap();
+        variable.set_fill_value(42.5_f32).unwrap();
+    }
+    file.enddef().unwrap();
 }
 
 fn case_path(case: &BenchCase) -> PathBuf {
@@ -813,9 +831,70 @@ fn parallel_slice_batch_georust(
     })
 }
 
+fn selected_case_filters() -> Vec<String> {
+    let mut filters = Vec::new();
+    let mut positional_mode = false;
+
+    for arg in std::env::args().skip(1) {
+        if positional_mode {
+            filters.push(arg);
+            continue;
+        }
+
+        if arg == "--" {
+            positional_mode = true;
+            continue;
+        }
+
+        if !arg.starts_with('-') {
+            filters.push(arg);
+        }
+    }
+
+    filters
+}
+
+fn benchmark_group_selected(group_name: &str) -> bool {
+    let filters = selected_case_filters();
+    if filters.is_empty() {
+        return true;
+    }
+
+    const GROUP_NAMES: &[&str] = &[
+        "open_only",
+        "metadata_reuse_handle",
+        "read_full_reuse_handle",
+        "open_and_read_full",
+        "slice_reuse_handle_hdf5_backend",
+        "parallel_open_and_read",
+        "parallel_read_shared_netcdf_rust",
+        "parallel_metadata_batch",
+        "sparse_huge_logical_slice",
+        "parallel_slice_batch",
+        "read_full_internal_parallel",
+        "read_full_internal_parallel_nocache",
+        "cf_conventions_overhead",
+        "slice_selectivity",
+        "memory_profile",
+    ];
+
+    let has_group_filter = GROUP_NAMES
+        .iter()
+        .any(|candidate| filters.iter().any(|filter| filter.contains(candidate)));
+
+    !has_group_filter || filters.iter().any(|filter| filter.contains(group_name))
+}
+
 fn validate_cases() {
     VALIDATION_ONCE.get_or_init(|| {
-        for case in CASES {
+        let case_filters = selected_case_filters();
+        let has_specific_case_filter = CASES
+            .iter()
+            .any(|case| case_filters.iter().any(|filter| filter.contains(case.id)));
+
+        for case in CASES.iter().filter(|case| {
+            !has_specific_case_filter || case_filters.iter().any(|filter| filter.contains(case.id))
+        }) {
             let path = case_path(case);
             let netcdf_rust_full = full_read_checksum_netcdf_rust(&path, case);
             let georust_full = full_read_checksum_georust(&path, case);
@@ -861,6 +940,9 @@ fn validate_cases() {
 }
 
 fn bench_open_only(c: &mut Criterion) {
+    if !benchmark_group_selected("open_only") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("open_only");
 
@@ -884,6 +966,9 @@ fn bench_open_only(c: &mut Criterion) {
 }
 
 fn bench_metadata_reuse_handle(c: &mut Criterion) {
+    if !benchmark_group_selected("metadata_reuse_handle") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("metadata_reuse_handle");
 
@@ -905,6 +990,9 @@ fn bench_metadata_reuse_handle(c: &mut Criterion) {
 }
 
 fn bench_read_full_reuse_handle(c: &mut Criterion) {
+    if !benchmark_group_selected("read_full_reuse_handle") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("read_full_reuse_handle");
 
@@ -927,6 +1015,9 @@ fn bench_read_full_reuse_handle(c: &mut Criterion) {
 }
 
 fn bench_open_and_read_full(c: &mut Criterion) {
+    if !benchmark_group_selected("open_and_read_full") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("open_and_read_full");
 
@@ -955,6 +1046,9 @@ fn bench_open_and_read_full(c: &mut Criterion) {
 }
 
 fn bench_slice_reuse_handle(c: &mut Criterion) {
+    if !benchmark_group_selected("slice_reuse_handle_hdf5_backend") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("slice_reuse_handle_hdf5_backend");
 
@@ -987,6 +1081,9 @@ fn bench_slice_reuse_handle(c: &mut Criterion) {
 }
 
 fn bench_parallel_open_and_read(c: &mut Criterion) {
+    if !benchmark_group_selected("parallel_open_and_read") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("parallel_open_and_read");
 
@@ -1023,6 +1120,9 @@ fn bench_parallel_open_and_read(c: &mut Criterion) {
 }
 
 fn bench_parallel_read_shared_netcdf_rust(c: &mut Criterion) {
+    if !benchmark_group_selected("parallel_read_shared_netcdf_rust") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("parallel_read_shared_netcdf_rust");
 
@@ -1051,6 +1151,9 @@ fn bench_parallel_read_shared_netcdf_rust(c: &mut Criterion) {
 }
 
 fn bench_parallel_metadata_batch(c: &mut Criterion) {
+    if !benchmark_group_selected("parallel_metadata_batch") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("parallel_metadata_batch");
     let iterations = hot_ops_per_thread();
@@ -1092,7 +1195,68 @@ fn bench_parallel_metadata_batch(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sparse_huge_logical_slice(c: &mut Criterion) {
+    if !benchmark_group_selected("sparse_huge_logical_slice") {
+        return;
+    }
+    let mut group = c.benchmark_group("sparse_huge_logical_slice");
+    let path = generated_fixtures().sparse_huge_logical_nc4.clone();
+    let netcdf_rust = NcFile::open(&path).unwrap();
+    let georust = netcdf::open(&path).unwrap();
+    let selection = netcdf_reader::NcSliceInfo {
+        selections: vec![
+            netcdf_reader::NcSliceInfoElem::Index(((1 << 20) - 1) as u64),
+            netcdf_reader::NcSliceInfoElem::Index(((1 << 20) - 1) as u64),
+        ],
+    };
+    let georust_start = &[(1 << 20) - 1, (1 << 20) - 1];
+    let georust_count = &[1usize, 1usize];
+
+    let rust_value = checksum_f32(
+        &netcdf_rust
+            .read_variable_slice::<f32>("sparse", &selection)
+            .unwrap(),
+    );
+    let georust_value = {
+        let variable = georust.variable("sparse").unwrap();
+        checksum_f32(
+            &variable
+                .get::<f32, _>((georust_start, georust_count))
+                .unwrap(),
+        )
+    };
+    assert_eq!(rust_value, georust_value);
+
+    group.throughput(Throughput::Bytes(4));
+
+    group.bench_function("netcdf_rust", |b| {
+        b.iter(|| {
+            black_box(
+                netcdf_rust
+                    .read_variable_slice::<f32>("sparse", &selection)
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.bench_function("georust", |b| {
+        b.iter(|| {
+            let variable = georust.variable("sparse").unwrap();
+            black_box(
+                variable
+                    .get::<f32, _>((georust_start, georust_count))
+                    .unwrap(),
+            )
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_parallel_slice_batch(c: &mut Criterion) {
+    if !benchmark_group_selected("parallel_slice_batch") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("parallel_slice_batch");
     let iterations = hot_ops_per_thread();
@@ -1138,6 +1302,9 @@ fn bench_parallel_slice_batch(c: &mut Criterion) {
 }
 
 fn bench_read_full_internal_parallel(c: &mut Criterion) {
+    if !benchmark_group_selected("read_full_internal_parallel") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("read_full_internal_parallel");
 
@@ -1183,6 +1350,9 @@ fn bench_read_full_internal_parallel(c: &mut Criterion) {
 }
 
 fn bench_read_full_internal_parallel_nocache(c: &mut Criterion) {
+    if !benchmark_group_selected("read_full_internal_parallel_nocache") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("read_full_internal_parallel_nocache");
 
@@ -1231,6 +1401,9 @@ fn bench_read_full_internal_parallel_nocache(c: &mut Criterion) {
 }
 
 fn bench_cf_conventions_overhead(c: &mut Criterion) {
+    if !benchmark_group_selected("cf_conventions_overhead") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("cf_conventions_overhead");
 
@@ -1277,6 +1450,9 @@ fn bench_cf_conventions_overhead(c: &mut Criterion) {
 }
 
 fn bench_slice_selectivity(c: &mut Criterion) {
+    if !benchmark_group_selected("slice_selectivity") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("slice_selectivity");
 
@@ -1336,6 +1512,9 @@ fn bench_slice_selectivity(c: &mut Criterion) {
 
 #[cfg(feature = "bench-memory-profile")]
 fn bench_memory_profile(c: &mut Criterion) {
+    if !benchmark_group_selected("memory_profile") {
+        return;
+    }
     validate_cases();
     let mut group = c.benchmark_group("memory_profile");
 
@@ -1398,6 +1577,7 @@ criterion_group!(
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
     bench_parallel_slice_batch,
+    bench_sparse_huge_logical_slice,
     bench_cf_conventions_overhead,
     bench_slice_selectivity,
     bench_memory_profile,
@@ -1416,6 +1596,7 @@ criterion_group!(
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
     bench_parallel_slice_batch,
+    bench_sparse_huge_logical_slice,
     bench_cf_conventions_overhead,
     bench_slice_selectivity,
 );

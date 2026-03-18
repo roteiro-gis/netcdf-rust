@@ -173,6 +173,8 @@ pub fn collect_btree_v1_leaves(
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<(BTreeV1Key, u64)>> {
     let mut results = Vec::new();
     collect_recursive(
@@ -181,6 +183,8 @@ pub fn collect_btree_v1_leaves(
         offset_size,
         length_size,
         ndims,
+        chunk_dims,
+        chunk_bounds,
         &mut results,
     )?;
     Ok(results)
@@ -193,6 +197,8 @@ fn collect_recursive(
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
     results: &mut Vec<(BTreeV1Key, u64)>,
 ) -> Result<()> {
     if Cursor::is_undefined_offset(address, offset_size) {
@@ -211,12 +217,37 @@ fn collect_recursive(
     if node.level == 0 {
         // Leaf node — collect (key[i], child[i]) pairs.
         for (i, child_addr) in node.children.iter().enumerate() {
-            results.push((node.keys[i].clone(), *child_addr));
+            let include = match &node.keys[i] {
+                BTreeV1Key::RawData { offsets, .. } => {
+                    chunk_bounds.map_or(true, |(first, last)| {
+                        offsets.iter().zip(chunk_dims.iter()).enumerate().all(
+                            |(dim, (offset, chunk_dim))| {
+                                let chunk_index = *offset / u64::from(*chunk_dim);
+                                chunk_index >= first[dim] && chunk_index <= last[dim]
+                            },
+                        )
+                    })
+                }
+                _ => true,
+            };
+
+            if include {
+                results.push((node.keys[i].clone(), *child_addr));
+            }
         }
     } else {
         // Internal node — recurse into each child.
         for child_addr in &node.children {
-            collect_recursive(data, *child_addr, offset_size, length_size, ndims, results)?;
+            collect_recursive(
+                data,
+                *child_addr,
+                offset_size,
+                length_size,
+                ndims,
+                chunk_dims,
+                chunk_bounds,
+                results,
+            )?;
         }
     }
 
@@ -440,7 +471,7 @@ mod tests {
         // Put the leaf node at offset 0 in our fake file data.
         let node_data = build_group_node(0, 2, undef8, undef8, &[0, 5, 10], &[0x100, 0x200], 8, 8);
 
-        let results = collect_btree_v1_leaves(&node_data, 0, 8, 8, None).unwrap();
+        let results = collect_btree_v1_leaves(&node_data, 0, 8, 8, None, &[], None).unwrap();
 
         assert_eq!(results.len(), 2);
         match &results[0].0 {
@@ -482,7 +513,7 @@ mod tests {
         file_data[1000..1000 + leaf_a.len()].copy_from_slice(&leaf_a);
         file_data[2000..2000 + leaf_b.len()].copy_from_slice(&leaf_b);
 
-        let results = collect_btree_v1_leaves(&file_data, 0, 8, 8, None).unwrap();
+        let results = collect_btree_v1_leaves(&file_data, 0, 8, 8, None, &[], None).unwrap();
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1, 0xA00);
@@ -493,7 +524,7 @@ mod tests {
     fn test_collect_undefined_root() {
         // Undefined root address should produce empty results.
         let data = vec![0u8; 100];
-        let results = collect_btree_v1_leaves(&data, u64::MAX, 8, 8, None).unwrap();
+        let results = collect_btree_v1_leaves(&data, u64::MAX, 8, 8, None, &[], None).unwrap();
         assert!(results.is_empty());
     }
 }

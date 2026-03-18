@@ -59,33 +59,38 @@ fn build_group_recursive(
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
 ) -> Result<NcGroup> {
+    let (hdf5_children, datasets) = hdf5_group.members()?;
+
     // Extract dimensions declared locally in this group, then combine them
     // with dimensions inherited from ancestor groups for lookups and variable
     // reconstruction.
-    let (local_dimensions, local_dim_addr_map) = dimensions::extract_dimensions(hdf5_group)?;
+    let (local_dimensions, local_dim_addr_map) =
+        dimensions::extract_dimensions_from_datasets(&datasets)?;
     let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
     let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
 
     // Extract variables (non-dimension-scale datasets).
-    let variables =
-        variables::extract_variables(hdf5_group, &visible_dimensions, &visible_dim_addr_map)?;
+    let variables = variables::extract_variables_from_datasets(
+        &datasets,
+        hdf5_group,
+        &visible_dimensions,
+        &visible_dim_addr_map,
+    )?;
 
     // Extract group-level attributes, filtering internal NetCDF-4 attributes.
     let nc_attributes = attributes::extract_group_attributes(hdf5_group)?;
 
     // Recurse into child groups.
     let mut child_groups = Vec::new();
-    if let Ok(hdf5_children) = hdf5_group.groups() {
-        for child in &hdf5_children {
-            let child_name = leaf_name(child.name()).to_string();
-            let nc_child = build_group_recursive(
-                child,
-                &child_name,
-                &visible_dimensions,
-                &visible_dim_addr_map,
-            )?;
-            child_groups.push(nc_child);
-        }
+    for child in &hdf5_children {
+        let child_name = leaf_name(child.name()).to_string();
+        let nc_child = build_group_recursive(
+            child,
+            &child_name,
+            &visible_dimensions,
+            &visible_dim_addr_map,
+        )?;
+        child_groups.push(nc_child);
     }
 
     Ok(NcGroup {
