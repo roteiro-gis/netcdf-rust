@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-03-19
+
+Patch release to move the public `ndarray` dependency to `0.17` for better compatibility with zarr-oriented downstream code.
+
 ## 0.1.0 - 2026-03-18
 
 Initial public release.
