@@ -5,7 +5,6 @@ use std::thread;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdf5_reader::{Hdf5File, OpenOptions, SliceInfo, SliceInfoElem};
-use ndarray::ArrayD;
 #[cfg(feature = "bench-memory-profile")]
 use peak_alloc::PeakAlloc;
 use rayon::ThreadPoolBuilder;
@@ -282,20 +281,20 @@ fn create_nested_nc4_groups_fixture(path: &Path) {
 
     {
         let mut root = file.variable_mut("root_series").unwrap();
-        let root_data = ndarray::Array1::from_vec(vec![0.0_f32, 1.0, 2.0, 3.0]);
-        root.put(root_data.view(), (..,)).unwrap();
+        let root_data = [0.0_f32, 1.0, 2.0, 3.0];
+        root.put_values(&root_data, (..,)).unwrap();
     }
     {
         let mut obs = file.group_mut("obs").unwrap().unwrap();
         let mut temperature = obs.variable_mut("temperature").unwrap();
-        let temperature_data = ndarray::Array1::from_vec(vec![20.5_f32, 21.0, 19.8]);
-        temperature.put(temperature_data.view(), (..,)).unwrap();
+        let temperature_data = [20.5_f32, 21.0, 19.8];
+        temperature.put_values(&temperature_data, (..,)).unwrap();
     }
     {
         let mut surface = file.group_mut("obs/surface").unwrap().unwrap();
         let mut pressure = surface.variable_mut("pressure").unwrap();
-        let pressure_data = ndarray::Array1::from_vec(vec![1013.25_f64, 1012.0, 1014.5]);
-        pressure.put(pressure_data.view(), (..,)).unwrap();
+        let pressure_data = [1013.25_f64, 1012.0, 1014.5];
+        pressure.put_values(&pressure_data, (..,)).unwrap();
     }
 }
 
@@ -399,22 +398,28 @@ fn hot_ops_per_thread() -> usize {
         .unwrap_or(256)
 }
 
-fn checksum_f32(array: &ArrayD<f32>) -> u64 {
-    let sum = array
-        .iter()
-        .fold(0.0_f64, |acc, value| acc + f64::from(*value));
-    sum.to_bits() ^ array.len() as u64
+fn checksum_f32<'a>(values: impl IntoIterator<Item = &'a f32>) -> u64 {
+    let mut len = 0usize;
+    let sum = values.into_iter().fold(0.0_f64, |acc, value| {
+        len += 1;
+        acc + f64::from(*value)
+    });
+    sum.to_bits() ^ len as u64
 }
 
-fn checksum_f64(array: &ArrayD<f64>) -> u64 {
-    let sum = array.iter().copied().sum::<f64>();
-    sum.to_bits() ^ array.len() as u64
+fn checksum_f64<'a>(values: impl IntoIterator<Item = &'a f64>) -> u64 {
+    let mut len = 0usize;
+    let sum = values.into_iter().fold(0.0_f64, |acc, value| {
+        len += 1;
+        acc + *value
+    });
+    sum.to_bits() ^ len as u64
 }
 
 fn full_read_checksum_netcdf_rust_file(file: &NcFile, case: &BenchCase) -> u64 {
     match case.kind {
-        NumericKind::F32 => checksum_f32(&file.read_variable::<f32>(case.variable).unwrap()),
-        NumericKind::F64 => checksum_f64(&file.read_variable::<f64>(case.variable).unwrap()),
+        NumericKind::F32 => checksum_f32(file.read_variable::<f32>(case.variable).unwrap().iter()),
+        NumericKind::F64 => checksum_f64(file.read_variable::<f64>(case.variable).unwrap().iter()),
     }
 }
 
@@ -425,14 +430,14 @@ fn full_read_checksum_netcdf_rust_file_in_pool(
 ) -> u64 {
     match case.kind {
         NumericKind::F32 => checksum_f32(
-            &file
-                .read_variable_in_pool::<f32>(case.variable, pool)
-                .unwrap(),
+            file.read_variable_in_pool::<f32>(case.variable, pool)
+                .unwrap()
+                .iter(),
         ),
         NumericKind::F64 => checksum_f64(
-            &file
-                .read_variable_in_pool::<f64>(case.variable, pool)
-                .unwrap(),
+            file.read_variable_in_pool::<f64>(case.variable, pool)
+                .unwrap()
+                .iter(),
         ),
     }
 }
@@ -445,8 +450,8 @@ fn full_read_checksum_netcdf_rust(path: &Path, case: &BenchCase) -> u64 {
 fn full_read_checksum_georust_file(file: &netcdf::File, case: &BenchCase) -> u64 {
     let variable = file.variable(case.variable).unwrap();
     match case.kind {
-        NumericKind::F32 => checksum_f32(&variable.get::<f32, _>(..).unwrap()),
-        NumericKind::F64 => checksum_f64(&variable.get::<f64, _>(..).unwrap()),
+        NumericKind::F32 => checksum_f32(variable.get_values::<f32, _>(..).unwrap().iter()),
+        NumericKind::F64 => checksum_f64(variable.get_values::<f64, _>(..).unwrap().iter()),
     }
 }
 
@@ -479,8 +484,8 @@ fn slice_checksum_netcdf_rust(path: &Path, case: &BenchCase, slice: SliceSpec) -
     let dataset = file.dataset(&variable_hdf5_path(case.variable)).unwrap();
     let selection = slice_selection(slice);
     match case.kind {
-        NumericKind::F32 => checksum_f32(&dataset.read_slice::<f32>(&selection).unwrap()),
-        NumericKind::F64 => checksum_f64(&dataset.read_slice::<f64>(&selection).unwrap()),
+        NumericKind::F32 => checksum_f32(dataset.read_slice::<f32>(&selection).unwrap().iter()),
+        NumericKind::F64 => checksum_f64(dataset.read_slice::<f64>(&selection).unwrap().iter()),
     }
 }
 
@@ -491,8 +496,8 @@ fn slice_checksum_netcdf_rust_dataset(
 ) -> u64 {
     let selection = slice_selection(slice);
     match case.kind {
-        NumericKind::F32 => checksum_f32(&dataset.read_slice::<f32>(&selection).unwrap()),
-        NumericKind::F64 => checksum_f64(&dataset.read_slice::<f64>(&selection).unwrap()),
+        NumericKind::F32 => checksum_f32(dataset.read_slice::<f32>(&selection).unwrap().iter()),
+        NumericKind::F64 => checksum_f64(dataset.read_slice::<f64>(&selection).unwrap().iter()),
     }
 }
 
@@ -501,8 +506,8 @@ fn full_read_checksum_netcdf_rust_dataset(
     case: &BenchCase,
 ) -> u64 {
     match case.kind {
-        NumericKind::F32 => checksum_f32(&dataset.read_array::<f32>().unwrap()),
-        NumericKind::F64 => checksum_f64(&dataset.read_array::<f64>().unwrap()),
+        NumericKind::F32 => checksum_f32(dataset.read_array::<f32>().unwrap().iter()),
+        NumericKind::F64 => checksum_f64(dataset.read_array::<f64>().unwrap().iter()),
     }
 }
 
@@ -512,8 +517,8 @@ fn full_read_checksum_netcdf_rust_dataset_in_pool(
     pool: &rayon::ThreadPool,
 ) -> u64 {
     match case.kind {
-        NumericKind::F32 => checksum_f32(&dataset.read_array_in_pool::<f32>(pool).unwrap()),
-        NumericKind::F64 => checksum_f64(&dataset.read_array_in_pool::<f64>(pool).unwrap()),
+        NumericKind::F32 => checksum_f32(dataset.read_array_in_pool::<f32>(pool).unwrap().iter()),
+        NumericKind::F64 => checksum_f64(dataset.read_array_in_pool::<f64>(pool).unwrap().iter()),
     }
 }
 
@@ -525,12 +530,18 @@ fn slice_checksum_georust(path: &Path, case: &BenchCase, slice: SliceSpec) -> u6
 fn slice_checksum_georust_file(file: &netcdf::File, case: &BenchCase, slice: SliceSpec) -> u64 {
     let variable = file.variable(case.variable).unwrap();
     match case.kind {
-        NumericKind::F32 => {
-            checksum_f32(&variable.get::<f32, _>((slice.start, slice.count)).unwrap())
-        }
-        NumericKind::F64 => {
-            checksum_f64(&variable.get::<f64, _>((slice.start, slice.count)).unwrap())
-        }
+        NumericKind::F32 => checksum_f32(
+            variable
+                .get_values::<f32, _>((slice.start, slice.count))
+                .unwrap()
+                .iter(),
+        ),
+        NumericKind::F64 => checksum_f64(
+            variable
+                .get_values::<f64, _>((slice.start, slice.count))
+                .unwrap()
+                .iter(),
+        ),
     }
 }
 
@@ -1213,16 +1224,18 @@ fn bench_sparse_huge_logical_slice(c: &mut Criterion) {
     let georust_count = &[1usize, 1usize];
 
     let rust_value = checksum_f32(
-        &netcdf_rust
+        netcdf_rust
             .read_variable_slice::<f32>("sparse", &selection)
-            .unwrap(),
+            .unwrap()
+            .iter(),
     );
     let georust_value = {
         let variable = georust.variable("sparse").unwrap();
         checksum_f32(
-            &variable
-                .get::<f32, _>((georust_start, georust_count))
-                .unwrap(),
+            variable
+                .get_values::<f32, _>((georust_start, georust_count))
+                .unwrap()
+                .iter(),
         )
     };
     assert_eq!(rust_value, georust_value);

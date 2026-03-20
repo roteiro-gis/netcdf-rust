@@ -415,13 +415,13 @@ dependencies = [
 
 [[package]]
 name = "hdf5-reader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "lru",
  "lz4_flex",
  "memmap2",
- "ndarray",
+ "ndarray 0.17.2",
  "parking_lot",
  "proptest",
  "rayon",
@@ -644,6 +644,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndarray"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rawpointer",
+]
+
+[[package]]
 name = "netcdf"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,20 +666,20 @@ checksum = "032d47fcd93a63a21232184aabfd202e1e50116d31bbd382580503308887d0f9"
 dependencies = [
  "bitflags",
  "libc",
- "ndarray",
+ "ndarray 0.16.1",
  "netcdf-sys",
  "semver",
 ]
 
 [[package]]
 name = "netcdf-reader"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "criterion",
  "hdf5-reader",
  "memmap2",
- "ndarray",
+ "ndarray 0.17.2",
  "netcdf",
  "peak_alloc",
  "proptest",
