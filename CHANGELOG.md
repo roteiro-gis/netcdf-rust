@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 - 2026-03-22
+
+Patch release to upgrade the HDF5 caching layer from `lru 0.12` to the fixed `lru 0.16.3` line.
+
 ## 0.1.1 - 2026-03-19
 
 Patch release to move the public `ndarray` dependency to `0.17` for better compatibility with zarr-oriented downstream code.

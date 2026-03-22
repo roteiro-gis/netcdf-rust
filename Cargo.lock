@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-reader"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "lru",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "netcdf-reader"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "criterion",
