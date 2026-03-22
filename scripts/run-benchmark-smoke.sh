@@ -56,7 +56,8 @@ run_compare_bench() {
   )
 }
 
-INSTALL_FIXTURE_DEPS=0 "$base_worktree/scripts/generate-fixtures.sh"
+REPO_ROOT="$base_worktree" INSTALL_FIXTURE_DEPS=0 \
+  "$repo_root/scripts/generate-fixtures.sh"
 run_compare_bench "$base_worktree" base
 run_compare_bench "$repo_root" pr
 
