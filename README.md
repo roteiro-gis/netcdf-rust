@@ -136,41 +136,13 @@ scripts/generate-fixtures.sh
 cargo test --workspace
 ```
 
+For reference comparisons and current benchmark results against
+`georust/netcdf`, see [docs/benchmark-report.md](docs/benchmark-report.md).
+
 ## Releasing
 
 See [RELEASING.md](RELEASING.md) for the release checklist and the required
 publish order for `hdf5-reader` and `netcdf-reader`.
-
-## Benchmarks
-
-`netcdf-reader` includes a Criterion benchmark that compares this implementation
-against the C-backed [`netcdf`](https://github.com/georust/netcdf) crate on the
-checked-in fixtures plus larger generated benchmark fixtures.
-
-```sh
-# Full benchmark matrix plus Criterion summary
-scripts/run-reference-benchmarks.sh
-
-# PR smoke benchmark gate against a base branch
-BENCH_BASE_REF=origin/main scripts/run-benchmark-smoke.sh
-
-# Summarize the latest Criterion results
-python3 scripts/criterion_summary.py
-
-# Include x1-relative speedup for threaded workloads
-python3 scripts/criterion_summary.py --speedup \
-  --group parallel_metadata_batch \
-  --group parallel_slice_batch \
-  --group read_full_internal_parallel \
-  --group parallel_open_and_read
-```
-
-Notes:
-- The benchmark uses `netcdf` with its `static` feature, so it builds a bundled `netcdf-c` stack.
-- The suite separates open cost, metadata walks, warm full reads, end-to-end reads, slices, and threaded workloads.
-- Larger benchmark fixtures are generated at runtime.
-- In the `netcdf 0.12.0` baseline used for these runs, libnetcdf entry points go through a shared process-global lock. The contention benchmarks are intended to make that visible.
-- The GitHub Actions smoke benchmark is useful for catching obvious regressions, but shared-runner numbers are not authoritative performance claims. Use local runs or the manual `reference-compat` workflow artifacts for real comparisons.
 
 ## Known limitations
 
