@@ -3,12 +3,12 @@ members = ["hdf5-reader", "netcdf-reader"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/i-norden/netcdf-rust"
-homepage = "https://github.com/i-norden/netcdf-rust"
+repository = "https://github.com/roteiro-gis/netcdf-rust"
+homepage = "https://github.com/roteiro-gis/netcdf-rust"
 
 [workspace.dependencies]
 ndarray = "0.17"
