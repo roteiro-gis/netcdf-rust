@@ -50,6 +50,6 @@ cargo publish -p netcdf-reader
 After both publishes succeed:
 
 1. Update `CHANGELOG.md` if needed
-2. Create the git tag, for example `v0.1.0`
+2. Create the git tag, for example `v<version>`
 3. Push the tag
 4. Create the GitHub release notes from the tag
