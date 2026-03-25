@@ -43,6 +43,26 @@ struct ResolvedClassicSelection {
     result_elements: usize,
 }
 
+struct BlockReadContext<'a> {
+    dims: &'a [ResolvedClassicSelectionDim],
+    strides: &'a [u64],
+    file_data: &'a [u8],
+    var_name: &'a str,
+    base_offset: usize,
+    block_elements: usize,
+    block_bytes: usize,
+    elem_size: u64,
+}
+
+struct RecordSliceContext<'a> {
+    file_data: &'a [u8],
+    var_name: &'a str,
+    base_offset: usize,
+    record_stride: usize,
+    inner_shape: &'a [u64],
+    inner_resolved: &'a ResolvedClassicSelection,
+}
+
 impl ClassicFile {
     /// Read a variable's data as an ndarray of the specified type.
     ///
@@ -377,18 +397,19 @@ fn read_record_variable_slice_direct<T: NcReadType>(
     let base_offset = checked_usize_from_u64(var.data_offset, "classic slice data offset")?;
     let record_stride = checked_usize_from_u64(record_stride, "classic record stride")?;
     let mut values = Vec::with_capacity(resolved.result_elements);
+    let context = RecordSliceContext {
+        file_data,
+        var_name: &var.name,
+        base_offset,
+        record_stride,
+        inner_shape,
+        inner_resolved: &inner_resolved,
+    };
 
     match &resolved.dims[0] {
-        ResolvedClassicSelectionDim::Index(record) => append_one_record_slice::<T>(
-            file_data,
-            &var.name,
-            base_offset,
-            record_stride,
-            *record,
-            inner_shape,
-            &inner_resolved,
-            &mut values,
-        )?,
+        ResolvedClassicSelectionDim::Index(record) => {
+            append_one_record_slice::<T>(&context, *record, &mut values)?
+        }
         ResolvedClassicSelectionDim::Slice {
             start, step, count, ..
         } => {
@@ -404,16 +425,7 @@ fn read_record_variable_slice_direct<T: NcReadType>(
                             "classic record slice coordinate exceeds u64".to_string(),
                         )
                     })?;
-                append_one_record_slice::<T>(
-                    file_data,
-                    &var.name,
-                    base_offset,
-                    record_stride,
-                    record,
-                    inner_shape,
-                    &inner_resolved,
-                    &mut values,
-                )?;
+                append_one_record_slice::<T>(&context, record, &mut values)?;
             }
         }
     }
@@ -496,46 +508,40 @@ fn read_contiguous_selection_values<T: NcReadType>(
     )?;
 
     let mut values = Vec::with_capacity(resolved.result_elements);
-    read_selected_blocks_recursive::<T>(
-        0,
-        tail_start,
-        0,
-        &resolved.dims,
-        &strides,
+    let context = BlockReadContext {
+        dims: &resolved.dims,
+        strides: &strides,
         file_data,
         var_name,
         base_offset,
         block_elements,
         block_bytes,
-        &mut values,
-    )?;
+        elem_size: T::element_size() as u64,
+    };
+    read_selected_blocks_recursive::<T>(0, tail_start, 0, &context, &mut values)?;
     Ok(values)
 }
 
 fn append_one_record_slice<T: NcReadType>(
-    file_data: &[u8],
-    var_name: &str,
-    base_offset: usize,
-    record_stride: usize,
+    context: &RecordSliceContext<'_>,
     record: u64,
-    inner_shape: &[u64],
-    inner_resolved: &ResolvedClassicSelection,
     values: &mut Vec<T>,
 ) -> Result<()> {
     let record = checked_usize_from_u64(record, "classic record index")?;
-    let record_offset = base_offset
-        .checked_add(record.checked_mul(record_stride).ok_or_else(|| {
+    let record_offset = context
+        .base_offset
+        .checked_add(record.checked_mul(context.record_stride).ok_or_else(|| {
             Error::InvalidData("classic record byte offset exceeds platform usize".to_string())
         })?)
         .ok_or_else(|| {
             Error::InvalidData("classic record byte offset exceeds platform usize".to_string())
         })?;
     let mut decoded = read_contiguous_selection_values::<T>(
-        file_data,
-        var_name,
+        context.file_data,
+        context.var_name,
         record_offset,
-        inner_shape,
-        inner_resolved,
+        context.inner_shape,
+        context.inner_resolved,
     )?;
     values.append(&mut decoded);
     Ok(())
@@ -545,50 +551,48 @@ fn read_selected_blocks_recursive<T: NcReadType>(
     level: usize,
     tail_start: usize,
     current_offset: u64,
-    dims: &[ResolvedClassicSelectionDim],
-    strides: &[u64],
-    file_data: &[u8],
-    var_name: &str,
-    base_offset: usize,
-    block_elements: usize,
-    block_bytes: usize,
+    context: &BlockReadContext<'_>,
     values: &mut Vec<T>,
 ) -> Result<()> {
     if level == tail_start {
         let byte_offset = checked_usize_from_u64(
             checked_mul_u64(
                 current_offset,
-                T::element_size() as u64,
+                context.elem_size,
                 "classic slice element byte offset",
             )?,
             "classic slice element byte offset",
         )?;
-        let start = base_offset.checked_add(byte_offset).ok_or_else(|| {
-            Error::InvalidData("classic slice byte offset exceeds platform usize".to_string())
-        })?;
-        let end = start.checked_add(block_bytes).ok_or_else(|| {
+        let start = context
+            .base_offset
+            .checked_add(byte_offset)
+            .ok_or_else(|| {
+                Error::InvalidData("classic slice byte offset exceeds platform usize".to_string())
+            })?;
+        let end = start.checked_add(context.block_bytes).ok_or_else(|| {
             Error::InvalidData("classic slice byte range exceeds platform usize".to_string())
         })?;
-        if end > file_data.len() {
+        if end > context.file_data.len() {
             return Err(Error::InvalidData(format!(
                 "variable '{}' slice data extends beyond file",
-                var_name
+                context.var_name
             )));
         }
 
-        let mut decoded = T::decode_bulk_be(&file_data[start..end], block_elements)?;
+        let mut decoded =
+            T::decode_bulk_be(&context.file_data[start..end], context.block_elements)?;
         values.append(&mut decoded);
         return Ok(());
     }
 
-    match &dims[level] {
+    match &context.dims[level] {
         ResolvedClassicSelectionDim::Index(idx) => read_selected_blocks_recursive::<T>(
             level + 1,
             tail_start,
             current_offset
                 .checked_add(checked_mul_u64(
                     *idx,
-                    strides[level],
+                    context.strides[level],
                     "classic slice logical element offset",
                 )?)
                 .ok_or_else(|| {
@@ -596,13 +600,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                         "classic slice logical element offset exceeds u64".to_string(),
                     )
                 })?,
-            dims,
-            strides,
-            file_data,
-            var_name,
-            base_offset,
-            block_elements,
-            block_bytes,
+            context,
             values,
         ),
         ResolvedClassicSelectionDim::Slice {
@@ -627,7 +625,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                     current_offset
                         .checked_add(checked_mul_u64(
                             coord,
-                            strides[level],
+                            context.strides[level],
                             "classic slice logical element offset",
                         )?)
                         .ok_or_else(|| {
@@ -635,13 +633,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                                 "classic slice logical element offset exceeds u64".to_string(),
                             )
                         })?,
-                    dims,
-                    strides,
-                    file_data,
-                    var_name,
-                    base_offset,
-                    block_elements,
-                    block_bytes,
+                    context,
                     values,
                 )?;
             }
