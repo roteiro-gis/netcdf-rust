@@ -51,6 +51,17 @@ jobs:
       - name: Test netcdf-reader no defaults
         run: cargo test -p netcdf-reader --no-default-features
 
+  cf-feature:
+    name: Test CF feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test netcdf-reader with cf
+        run: cargo test -p netcdf-reader --features cf
+
   fixtures:
     name: Integration tests with fixtures
     runs-on: ubuntu-latest
@@ -81,7 +92,7 @@ jobs:
       BENCH_MEASUREMENT_TIME: "0.2"
       BENCH_WARMUP_TIME: "0.2"
       BENCH_REGRESSION_THRESHOLD_PERCENT: "10"
-      BENCH_SMOKE_FILTER: "open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|parallel_open_and_read/netcdf_rust_x(1|4)/large_nc4_compressed|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed"
+      BENCH_SMOKE_FILTER: "open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_classic/netcdf_rust/(large_cdf5|large_record_cdf5)|parallel_open_and_read/netcdf_rust_x(1|4)/large_nc4_compressed|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed"
       BENCH_BASE_REF: origin/${{ github.base_ref }}
     steps:
       - uses: actions/checkout@v4
