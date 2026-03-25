@@ -10,7 +10,7 @@ use peak_alloc::PeakAlloc;
 use rayon::ThreadPoolBuilder;
 use tempfile::TempDir;
 
-use netcdf_reader::{NcFile, NcGroup};
+use netcdf_reader::{NcFile, NcGroup, NcSliceInfo, NcSliceInfoElem};
 
 #[cfg(feature = "bench-memory-profile")]
 #[global_allocator]
@@ -35,6 +35,7 @@ impl NumericKind {
 struct SliceSpec {
     start: &'static [usize],
     count: &'static [usize],
+    stride: &'static [usize],
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +50,7 @@ enum FixtureSource {
 #[derive(Clone, Copy)]
 enum GeneratedFixtureKind {
     LargeCdf5,
+    LargeRecordCdf5,
     LargeNc4Compressed,
     NestedNc4Groups,
 }
@@ -70,31 +72,50 @@ const SHAPE_NC4_COMPRESSED: &[usize] = &[100, 100];
 const SHAPE_NC4_GROUPS_TEMPERATURE: &[usize] = &[3];
 const SHAPE_NESTED_NC4_PRESSURE: &[usize] = &[3];
 const SHAPE_LARGE_CDF5: &[usize] = &[2048, 1024];
+const SHAPE_LARGE_RECORD_CDF5: &[usize] = &[1024, 1024];
 const SHAPE_LARGE_NC4_COMPRESSED: &[usize] = &[2048, 1024];
+
+const UNIT_STRIDE_2D: &[usize] = &[1, 1];
 
 const SLICE_NC4_BASIC: SliceSpec = SliceSpec {
     start: &[1, 2],
     count: &[3, 4],
+    stride: UNIT_STRIDE_2D,
 };
 const HOT_SLICE_NC4_BASIC: SliceSpec = SliceSpec {
     start: &[1, 2],
     count: &[1, 1],
+    stride: UNIT_STRIDE_2D,
 };
 const SLICE_NC4_COMPRESSED: SliceSpec = SliceSpec {
     start: &[12, 18],
     count: &[28, 35],
+    stride: UNIT_STRIDE_2D,
 };
 const HOT_SLICE_NC4_COMPRESSED: SliceSpec = SliceSpec {
     start: &[12, 18],
     count: &[4, 4],
+    stride: UNIT_STRIDE_2D,
 };
 const SLICE_LARGE_NC4_COMPRESSED: SliceSpec = SliceSpec {
     start: &[256, 192],
     count: &[384, 320],
+    stride: UNIT_STRIDE_2D,
 };
 const HOT_SLICE_LARGE_NC4_COMPRESSED: SliceSpec = SliceSpec {
     start: &[256, 192],
     count: &[4, 4],
+    stride: UNIT_STRIDE_2D,
+};
+const SLICE_LARGE_CDF5_STRIDED: SliceSpec = SliceSpec {
+    start: &[256, 0],
+    count: &[384, 1024],
+    stride: &[3, 1],
+};
+const SLICE_LARGE_RECORD_CDF5_STRIDED: SliceSpec = SliceSpec {
+    start: &[32, 16],
+    count: &[160, 224],
+    stride: &[3, 4],
 };
 
 const CASES: &[BenchCase] = &[
@@ -161,7 +182,16 @@ const CASES: &[BenchCase] = &[
         variable: "data",
         kind: NumericKind::F32,
         shape: SHAPE_LARGE_CDF5,
-        slice: None,
+        slice: Some(SLICE_LARGE_CDF5_STRIDED),
+        is_netcdf4: false,
+    },
+    BenchCase {
+        id: "large_record_cdf5",
+        fixture: FixtureSource::Generated(GeneratedFixtureKind::LargeRecordCdf5),
+        variable: "series",
+        kind: NumericKind::F32,
+        shape: SHAPE_LARGE_RECORD_CDF5,
+        slice: Some(SLICE_LARGE_RECORD_CDF5_STRIDED),
         is_netcdf4: false,
     },
     BenchCase {
@@ -178,6 +208,7 @@ const CASES: &[BenchCase] = &[
 struct GeneratedFixtures {
     _temp_dir: TempDir,
     large_cdf5: PathBuf,
+    large_record_cdf5: PathBuf,
     large_nc4_compressed: PathBuf,
     nested_nc4_groups: PathBuf,
     sparse_huge_logical_nc4: PathBuf,
@@ -199,11 +230,13 @@ fn generated_fixtures() -> &'static GeneratedFixtures {
     GENERATED_FIXTURES.get_or_init(|| {
         let temp_dir = tempfile::tempdir().unwrap();
         let large_cdf5 = temp_dir.path().join("bench_large_cdf5.nc");
+        let large_record_cdf5 = temp_dir.path().join("bench_large_record_cdf5.nc");
         let large_nc4_compressed = temp_dir.path().join("bench_large_nc4_compressed.nc");
         let nested_nc4_groups = temp_dir.path().join("bench_nested_nc4_groups.nc");
         let sparse_huge_logical_nc4 = temp_dir.path().join("bench_sparse_huge_logical_nc4.nc");
 
         create_large_cdf5_fixture(&large_cdf5);
+        create_large_record_cdf5_fixture(&large_record_cdf5);
         create_large_nc4_compressed_fixture(&large_nc4_compressed);
         create_nested_nc4_groups_fixture(&nested_nc4_groups);
         create_sparse_huge_logical_nc4_fixture(&sparse_huge_logical_nc4);
@@ -211,6 +244,7 @@ fn generated_fixtures() -> &'static GeneratedFixtures {
         GeneratedFixtures {
             _temp_dir: temp_dir,
             large_cdf5,
+            large_record_cdf5,
             large_nc4_compressed,
             nested_nc4_groups,
             sparse_huge_logical_nc4,
@@ -232,6 +266,28 @@ fn create_large_cdf5_fixture(path: &Path) {
             })
             .collect();
         variable.put_values(&values, (row, ..)).unwrap();
+    }
+}
+
+fn create_large_record_cdf5_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::_64BIT_DATA).unwrap();
+    file.add_unlimited_dimension("time").unwrap();
+    file.add_dimension("col", SHAPE_LARGE_RECORD_CDF5[1])
+        .unwrap();
+    file.add_variable::<f32>("series", &["time", "col"])
+        .unwrap();
+    file.enddef().unwrap();
+
+    let mut variable = file.variable_mut("series").unwrap();
+    for record in 0..SHAPE_LARGE_RECORD_CDF5[0] {
+        let values: Vec<f32> = (0..SHAPE_LARGE_RECORD_CDF5[1])
+            .map(|col| {
+                let coarse = ((record * 13 + col * 7) % 2048) as f32 * 0.125;
+                let fine = ((record + col * 3) % 17) as f32 * 0.03125;
+                coarse + fine
+            })
+            .collect();
+        variable.put_values(&values, (record, ..)).unwrap();
     }
 }
 
@@ -321,6 +377,9 @@ fn case_path(case: &BenchCase) -> PathBuf {
         }
         FixtureSource::Generated(GeneratedFixtureKind::LargeCdf5) => {
             generated_fixtures().large_cdf5.clone()
+        }
+        FixtureSource::Generated(GeneratedFixtureKind::LargeRecordCdf5) => {
+            generated_fixtures().large_record_cdf5.clone()
         }
         FixtureSource::Generated(GeneratedFixtureKind::LargeNc4Compressed) => {
             generated_fixtures().large_nc4_compressed.clone()
@@ -464,16 +523,41 @@ fn variable_hdf5_path(variable: &str) -> String {
     format!("/{}", variable.trim_start_matches('/'))
 }
 
+fn slice_end(start: usize, count: usize, stride: usize) -> usize {
+    if count == 0 {
+        start
+    } else {
+        start + (count - 1) * stride + 1
+    }
+}
+
 fn slice_selection(slice: SliceSpec) -> SliceInfo {
     SliceInfo {
         selections: slice
             .start
             .iter()
             .zip(slice.count.iter())
-            .map(|(start, count)| SliceInfoElem::Slice {
+            .zip(slice.stride.iter())
+            .map(|((start, count), stride)| SliceInfoElem::Slice {
                 start: *start as u64,
-                end: (*start + *count) as u64,
-                step: 1,
+                end: slice_end(*start, *count, *stride) as u64,
+                step: *stride as u64,
+            })
+            .collect(),
+    }
+}
+
+fn nc_slice_selection(slice: SliceSpec) -> NcSliceInfo {
+    NcSliceInfo {
+        selections: slice
+            .start
+            .iter()
+            .zip(slice.count.iter())
+            .zip(slice.stride.iter())
+            .map(|((start, count), stride)| NcSliceInfoElem::Slice {
+                start: *start as u64,
+                end: slice_end(*start, *count, *stride) as u64,
+                step: *stride as u64,
             })
             .collect(),
     }
@@ -486,6 +570,22 @@ fn slice_checksum_netcdf_rust(path: &Path, case: &BenchCase, slice: SliceSpec) -
     match case.kind {
         NumericKind::F32 => checksum_f32(dataset.read_slice::<f32>(&selection).unwrap().iter()),
         NumericKind::F64 => checksum_f64(dataset.read_slice::<f64>(&selection).unwrap().iter()),
+    }
+}
+
+fn slice_checksum_netcdf_rust_file(file: &NcFile, case: &BenchCase, slice: SliceSpec) -> u64 {
+    let selection = nc_slice_selection(slice);
+    match case.kind {
+        NumericKind::F32 => checksum_f32(
+            file.read_variable_slice::<f32>(case.variable, &selection)
+                .unwrap()
+                .iter(),
+        ),
+        NumericKind::F64 => checksum_f64(
+            file.read_variable_slice::<f64>(case.variable, &selection)
+                .unwrap()
+                .iter(),
+        ),
     }
 }
 
@@ -529,16 +629,17 @@ fn slice_checksum_georust(path: &Path, case: &BenchCase, slice: SliceSpec) -> u6
 
 fn slice_checksum_georust_file(file: &netcdf::File, case: &BenchCase, slice: SliceSpec) -> u64 {
     let variable = file.variable(case.variable).unwrap();
+    let strides: Vec<isize> = slice.stride.iter().map(|&stride| stride as isize).collect();
     match case.kind {
         NumericKind::F32 => checksum_f32(
             variable
-                .get_values::<f32, _>((slice.start, slice.count))
+                .get_values::<f32, _>((slice.start, slice.count, strides.as_slice()))
                 .unwrap()
                 .iter(),
         ),
         NumericKind::F64 => checksum_f64(
             variable
-                .get_values::<f64, _>((slice.start, slice.count))
+                .get_values::<f64, _>((slice.start, slice.count, strides.as_slice()))
                 .unwrap()
                 .iter(),
         ),
@@ -877,6 +978,7 @@ fn benchmark_group_selected(group_name: &str) -> bool {
         "read_full_reuse_handle",
         "open_and_read_full",
         "slice_reuse_handle_hdf5_backend",
+        "slice_reuse_handle_classic",
         "parallel_open_and_read",
         "parallel_read_shared_netcdf_rust",
         "parallel_metadata_batch",
@@ -938,13 +1040,23 @@ fn validate_cases() {
             );
 
             if let Some(slice) = case.slice {
-                let netcdf_rust_slice = slice_checksum_netcdf_rust(&path, case, slice);
+                let netcdf_rust_slice =
+                    slice_checksum_netcdf_rust_file(&NcFile::open(&path).unwrap(), case, slice);
                 let georust_slice = slice_checksum_georust(&path, case, slice);
                 assert_eq!(
                     netcdf_rust_slice, georust_slice,
                     "slice checksum mismatch for {}",
                     case.id
                 );
+
+                if case.is_netcdf4 {
+                    let hdf5_slice = slice_checksum_netcdf_rust(&path, case, slice);
+                    assert_eq!(
+                        netcdf_rust_slice, hdf5_slice,
+                        "HDF5 backend slice checksum mismatch for {}",
+                        case.id
+                    );
+                }
             }
         }
     });
@@ -1063,7 +1175,10 @@ fn bench_slice_reuse_handle(c: &mut Criterion) {
     validate_cases();
     let mut group = c.benchmark_group("slice_reuse_handle_hdf5_backend");
 
-    for case in CASES.iter().filter(|case| case.slice.is_some()) {
+    for case in CASES
+        .iter()
+        .filter(|case| case.is_netcdf4 && case.slice.is_some())
+    {
         let path = case_path(case);
         let slice = case.slice.unwrap();
         let netcdf_rust_file = Hdf5File::open(&path).unwrap();
@@ -1081,6 +1196,35 @@ fn bench_slice_reuse_handle(c: &mut Criterion) {
                     slice,
                 ))
             });
+        });
+
+        group.bench_function(BenchmarkId::new("georust", case.id), |b| {
+            b.iter(|| black_box(slice_checksum_georust_file(&georust, case, slice)));
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_classic_slice_reuse_handle(c: &mut Criterion) {
+    if !benchmark_group_selected("slice_reuse_handle_classic") {
+        return;
+    }
+    validate_cases();
+    let mut group = c.benchmark_group("slice_reuse_handle_classic");
+
+    for case in CASES
+        .iter()
+        .filter(|case| !case.is_netcdf4 && case.slice.is_some())
+    {
+        let path = case_path(case);
+        let slice = case.slice.unwrap();
+        let netcdf_rust = NcFile::open(&path).unwrap();
+        let georust = netcdf::open(&path).unwrap();
+        group.throughput(Throughput::Bytes(slice_bytes(case).unwrap() as u64));
+
+        group.bench_function(BenchmarkId::new("netcdf_rust", case.id), |b| {
+            b.iter(|| black_box(slice_checksum_netcdf_rust_file(&netcdf_rust, case, slice)));
         });
 
         group.bench_function(BenchmarkId::new("georust", case.id), |b| {
@@ -1484,6 +1628,7 @@ fn bench_slice_selectivity(c: &mut Criterion) {
                 SliceSpec {
                     start: &[0, 0],
                     count: &[2048, 1024],
+                    stride: UNIT_STRIDE_2D,
                 },
             ),
             (
@@ -1491,6 +1636,7 @@ fn bench_slice_selectivity(c: &mut Criterion) {
                 SliceSpec {
                     start: &[0, 0],
                     count: &[1024, 1024],
+                    stride: UNIT_STRIDE_2D,
                 },
             ),
             (
@@ -1498,6 +1644,7 @@ fn bench_slice_selectivity(c: &mut Criterion) {
                 SliceSpec {
                     start: &[0, 0],
                     count: &[205, 1024],
+                    stride: UNIT_STRIDE_2D,
                 },
             ),
             (
@@ -1505,6 +1652,7 @@ fn bench_slice_selectivity(c: &mut Criterion) {
                 SliceSpec {
                     start: &[512, 256],
                     count: &[20, 1024],
+                    stride: UNIT_STRIDE_2D,
                 },
             ),
         ];
@@ -1561,6 +1709,7 @@ fn bench_memory_profile(c: &mut Criterion) {
             let sel = slice_selection(SliceSpec {
                 start: &[0, 0],
                 count: &[205, 1024],
+                stride: UNIT_STRIDE_2D,
             });
 
             group.bench_function(BenchmarkId::new("slice_10pct", case.id), |b| {
@@ -1586,6 +1735,7 @@ criterion_group!(
     bench_read_full_internal_parallel_nocache,
     bench_open_and_read_full,
     bench_slice_reuse_handle,
+    bench_classic_slice_reuse_handle,
     bench_parallel_open_and_read,
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
@@ -1605,6 +1755,7 @@ criterion_group!(
     bench_read_full_internal_parallel_nocache,
     bench_open_and_read_full,
     bench_slice_reuse_handle,
+    bench_classic_slice_reuse_handle,
     bench_parallel_open_and_read,
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
