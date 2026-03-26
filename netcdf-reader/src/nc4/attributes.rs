@@ -106,6 +106,19 @@ fn convert_attribute_value(attr: &hdf5_reader::Attribute) -> Option<NcAttrValue>
                 attr.read_strings().ok().map(NcAttrValue::Strings)
             }
         }
+        Datatype::VarLen { base }
+            if attr.num_elements() == 1
+                && matches!(
+                    base.as_ref(),
+                    Datatype::FixedPoint {
+                        size: 1,
+                        signed: false,
+                        ..
+                    }
+                ) =>
+        {
+            attr.read_string().ok().map(NcAttrValue::Chars)
+        }
         _ => None,
     }
 }

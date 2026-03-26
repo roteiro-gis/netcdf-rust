@@ -115,46 +115,20 @@ impl NcFile {
     ///
     /// The format is auto-detected from the file's magic bytes.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let file = File::open(path)?;
-        // SAFETY: read-only mapping; caller must not modify the file concurrently.
-        let mmap = unsafe { Mmap::map(&file)? };
-        let format = detect_format(&mmap)?;
-
-        match format {
-            NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
-                let classic = classic::ClassicFile::from_mmap(mmap, format)?;
-                Ok(NcFile {
-                    format,
-                    inner: NcFileInner::Classic(classic),
-                })
-            }
-            NcFormat::Nc4 | NcFormat::Nc4Classic => {
-                #[cfg(feature = "netcdf4")]
-                {
-                    let nc4 = nc4::Nc4File::open(path)?;
-                    let actual_format = if nc4.is_classic_model() {
-                        NcFormat::Nc4Classic
-                    } else {
-                        NcFormat::Nc4
-                    };
-                    Ok(NcFile {
-                        format: actual_format,
-                        inner: NcFileInner::Nc4(nc4),
-                    })
-                }
-                #[cfg(not(feature = "netcdf4"))]
-                {
-                    Err(Error::Nc4NotEnabled)
-                }
-            }
-        }
+        Self::open_with_options(path, NcOpenOptions::default())
     }
 
     /// Open a NetCDF file from in-memory bytes.
     ///
     /// The format is auto-detected from the magic bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        Self::from_bytes_with_options(data, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from in-memory bytes with custom options.
+    ///
+    /// NC4 options are applied when the payload is HDF5-backed.
+    pub fn from_bytes_with_options(data: &[u8], options: NcOpenOptions) -> Result<Self> {
         let format = detect_format(data)?;
 
         match format {
@@ -168,7 +142,7 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
-                    let nc4 = nc4::Nc4File::from_bytes(data)?;
+                    let nc4 = nc4::Nc4File::from_bytes_with_options(data, options)?;
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
@@ -181,6 +155,7 @@ impl NcFile {
                 }
                 #[cfg(not(feature = "netcdf4"))]
                 {
+                    let _ = options;
                     Err(Error::Nc4NotEnabled)
                 }
             }
@@ -311,6 +286,30 @@ impl NcFile {
             NcFileInner::Classic(c) => c.read_variable_as_f64(name),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.read_variable_as_f64(name),
+        }
+    }
+
+    /// Read a string variable as a single string.
+    ///
+    /// Use [`NcFile::read_variable_as_strings`] when the variable contains
+    /// multiple string elements.
+    pub fn read_variable_as_string(&self, name: &str) -> Result<String> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_as_string(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.read_variable_as_string(name),
+        }
+    }
+
+    /// Read a string or char variable as a flat vector of strings.
+    ///
+    /// Classic char arrays interpret the last dimension as the string length
+    /// and flatten the leading dimensions.
+    pub fn read_variable_as_strings(&self, name: &str) -> Result<Vec<String>> {
+        match &self.inner {
+            NcFileInner::Classic(c) => c.read_variable_as_strings(name),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.read_variable_as_strings(name),
         }
     }
 
@@ -514,6 +513,7 @@ impl NcFile {
     pub fn open_with_options(path: impl AsRef<Path>, options: NcOpenOptions) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path)?;
+        // SAFETY: read-only mapping; caller must not modify the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
         let format = detect_format(&mmap)?;
 
@@ -528,12 +528,14 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
-                    let hdf5_opts = hdf5_reader::OpenOptions {
-                        chunk_cache_bytes: options.chunk_cache_bytes,
-                        chunk_cache_slots: options.chunk_cache_slots,
-                        filter_registry: options.filter_registry,
-                    };
-                    let hdf5 = hdf5_reader::Hdf5File::open_with_options(path, hdf5_opts)?;
+                    let hdf5 = hdf5_reader::Hdf5File::from_mmap_with_options(
+                        mmap,
+                        hdf5_reader::OpenOptions {
+                            chunk_cache_bytes: options.chunk_cache_bytes,
+                            chunk_cache_slots: options.chunk_cache_slots,
+                            filter_registry: options.filter_registry,
+                        },
+                    )?;
                     let root_group = nc4::groups::build_root_group(&hdf5)?;
                     let nc4 = nc4::Nc4File::from_hdf5(hdf5, root_group);
                     let actual_format = if nc4.is_classic_model() {

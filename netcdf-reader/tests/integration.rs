@@ -121,6 +121,29 @@ fn test_nc4_basic() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn test_nc4_from_bytes_with_options() {
+    let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
+    let bytes = std::fs::read(&path).unwrap();
+    let file = netcdf_reader::NcFile::from_bytes_with_options(
+        &bytes,
+        netcdf_reader::NcOpenOptions {
+            chunk_cache_bytes: 1024,
+            chunk_cache_slots: 17,
+            filter_registry: None,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        file.format(),
+        netcdf_reader::NcFormat::Nc4 | netcdf_reader::NcFormat::Nc4Classic
+    ));
+    let data: ndarray::ArrayD<f64> = file.read_variable("data").unwrap();
+    assert_eq!(data.shape(), &[5, 10]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn test_nc4_compressed() {
     let path = skip_if_missing!("netcdf4", "nc4_compressed.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
@@ -178,6 +201,19 @@ fn test_nc4_same_size_dims() {
     // (not both matched to the first size-10 dim)
     let dim_names: Vec<&str> = var.dimensions().iter().map(|d| d.name.as_str()).collect();
     assert_eq!(dim_names, vec!["lat", "lon"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_string_variable_reads() {
+    let path = skip_if_missing!("netcdf4", "nc4_string_var.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let strings = file.read_variable_as_strings("names").unwrap();
+    assert_eq!(strings, vec!["alpha", "beta", "gamma", "delta"]);
+
+    let err = file.read_variable_as_string("names").unwrap_err();
+    assert!(matches!(err, netcdf_reader::Error::InvalidData(_)));
 }
 
 #[cfg(feature = "netcdf4")]

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+## 0.1.4 - 2026-03-25
+
+- Added `Hdf5File::{from_bytes_with_options, from_vec_with_options}` and `NcFile::from_bytes_with_options` so custom cache and filter settings also work for in-memory reads.
+- Added string dataset/variable APIs:
+  `hdf5_reader::Dataset::{read_string, read_strings}` and
+  `netcdf_reader::NcFile::{read_variable_as_string, read_variable_as_strings}`.
+- Fixed NetCDF-4 string typing so `NC_STRING` variables backed by HDF5
+  variable-length byte storage are exposed as `NcType::String`.
+- Removed extra open/remap work in the NetCDF open path and restored classic
+  open performance after the detection refactor.
+
 ## 0.1.2 - 2026-03-22
 
 Patch release to upgrade the HDF5 caching layer from `lru 0.12` to the fixed `lru 0.16.3` line.

@@ -23,7 +23,7 @@ use ndarray::ArrayD;
 use rayon::ThreadPool;
 
 use crate::error::{Error, Result};
-use crate::types::NcGroup;
+use crate::types::{NcGroup, NcType};
 
 /// Dispatch on `NcType` to read data and promote to `f64`.
 ///
@@ -111,21 +111,44 @@ pub struct Nc4File {
 }
 
 impl Nc4File {
-    /// Create from an already-opened HDF5 file and pre-built root group.
     pub(crate) fn from_hdf5(hdf5: Hdf5File, root_group: NcGroup) -> Self {
         Nc4File { hdf5, root_group }
     }
 
     /// Open a NetCDF-4 file from disk.
     pub fn open(path: &Path) -> Result<Self> {
-        let hdf5 = Hdf5File::open(path)?;
+        Self::open_with_options(path, crate::NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF-4 file from disk with custom options.
+    pub fn open_with_options(path: &Path, options: crate::NcOpenOptions) -> Result<Self> {
+        let hdf5 = Hdf5File::open_with_options(
+            path,
+            hdf5_reader::OpenOptions {
+                chunk_cache_bytes: options.chunk_cache_bytes,
+                chunk_cache_slots: options.chunk_cache_slots,
+                filter_registry: options.filter_registry,
+            },
+        )?;
         let root_group = groups::build_root_group(&hdf5)?;
         Ok(Nc4File { hdf5, root_group })
     }
 
     /// Open a NetCDF-4 file from in-memory bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let hdf5 = Hdf5File::from_bytes(data)?;
+        Self::from_bytes_with_options(data, crate::NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF-4 file from in-memory bytes with custom options.
+    pub fn from_bytes_with_options(data: &[u8], options: crate::NcOpenOptions) -> Result<Self> {
+        let hdf5 = Hdf5File::from_bytes_with_options(
+            data,
+            hdf5_reader::OpenOptions {
+                chunk_cache_bytes: options.chunk_cache_bytes,
+                chunk_cache_slots: options.chunk_cache_slots,
+                filter_registry: options.filter_registry,
+            },
+        )?;
         let root_group = groups::build_root_group(&hdf5)?;
         Ok(Nc4File { hdf5, root_group })
     }
@@ -155,6 +178,40 @@ impl Nc4File {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
         Ok(dataset.read_array::<T>()?)
+    }
+
+    /// Read a string variable as a single string.
+    pub fn read_variable_as_string(&self, path: &str) -> Result<String> {
+        let mut strings = self.read_variable_as_strings(path)?;
+        match strings.len() {
+            1 => Ok(strings.swap_remove(0)),
+            0 => Err(Error::InvalidData(format!(
+                "variable '{}' contains no string elements",
+                path
+            ))),
+            count => Err(Error::InvalidData(format!(
+                "variable '{}' contains {count} string elements; use read_variable_as_strings()",
+                path
+            ))),
+        }
+    }
+
+    /// Read a string variable as a flat vector of strings.
+    pub fn read_variable_as_strings(&self, path: &str) -> Result<Vec<String>> {
+        let normalized = normalize_dataset_path(path)?;
+        let var = self
+            .root_group
+            .variable(normalized)
+            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
+        if var.dtype != NcType::String {
+            return Err(Error::TypeMismatch {
+                expected: "String".to_string(),
+                actual: format!("{:?}", var.dtype),
+            });
+        }
+
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_strings()?)
     }
 
     #[cfg(feature = "rayon")]

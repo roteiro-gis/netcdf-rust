@@ -116,6 +116,25 @@ impl FileData {
 }
 
 impl Hdf5File {
+    fn from_file_data(data: FileData, options: OpenOptions) -> Result<Self> {
+        let mut cursor = Cursor::new(data.as_slice());
+        let superblock = Superblock::parse(&mut cursor)?;
+        let cache = Arc::new(ChunkCache::new(
+            options.chunk_cache_bytes,
+            options.chunk_cache_slots,
+        ));
+        let registry = options.filter_registry.unwrap_or_default();
+
+        Ok(Hdf5File {
+            data,
+            superblock,
+            chunk_cache: cache,
+            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            filter_registry: Arc::new(registry),
+        })
+    }
+
     /// Open an HDF5 file with default options.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, OpenOptions::default())
@@ -128,47 +147,38 @@ impl Hdf5File {
         // while we hold the mapping. The caller is responsible for not
         // modifying the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
-
-        let mut cursor = Cursor::new(&mmap);
-        let superblock = Superblock::parse(&mut cursor)?;
-
-        let cache = Arc::new(ChunkCache::new(
-            options.chunk_cache_bytes,
-            options.chunk_cache_slots,
-        ));
-
-        let registry = options.filter_registry.unwrap_or_default();
-
-        Ok(Hdf5File {
-            data: FileData::Mmap(mmap),
-            superblock,
-            chunk_cache: cache,
-            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            filter_registry: Arc::new(registry),
-        })
+        Self::from_mmap_with_options(mmap, options)
     }
 
     /// Open an HDF5 file from an in-memory byte slice.
     ///
     /// The data is copied into an owned buffer.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        Self::from_vec(data.to_vec())
+        Self::from_bytes_with_options(data, OpenOptions::default())
+    }
+
+    /// Open an HDF5 file from an in-memory byte slice with custom options.
+    ///
+    /// The data is copied into an owned buffer.
+    pub fn from_bytes_with_options(data: &[u8], options: OpenOptions) -> Result<Self> {
+        Self::from_vec_with_options(data.to_vec(), options)
     }
 
     /// Open an HDF5 file from an owned byte vector without copying.
     pub fn from_vec(data: Vec<u8>) -> Result<Self> {
-        let mut cursor = Cursor::new(&data);
-        let superblock = Superblock::parse(&mut cursor)?;
+        Self::from_vec_with_options(data, OpenOptions::default())
+    }
 
-        Ok(Hdf5File {
-            data: FileData::Bytes(data),
-            superblock,
-            chunk_cache: Arc::new(ChunkCache::default()),
-            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            filter_registry: Arc::new(FilterRegistry::default()),
-        })
+    /// Open an HDF5 file from an owned byte vector with custom options.
+    pub fn from_vec_with_options(data: Vec<u8>, options: OpenOptions) -> Result<Self> {
+        Self::from_file_data(FileData::Bytes(data), options)
+    }
+
+    /// Open an HDF5 file from an existing memory map with custom options.
+    ///
+    /// This avoids remapping when the caller already owns a read-only mapping.
+    pub fn from_mmap_with_options(mmap: Mmap, options: OpenOptions) -> Result<Self> {
+        Self::from_file_data(FileData::Mmap(mmap), options)
     }
 
     /// Get the parsed superblock.

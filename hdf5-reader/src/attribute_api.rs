@@ -416,7 +416,7 @@ fn load_dense_attribute_records(
 }
 
 /// Read one variable-length string from a vlen reference in raw_data.
-fn read_one_vlen_string(
+pub(crate) fn read_one_vlen_string(
     raw_data: &[u8],
     offset: usize,
     file_data: &[u8],
@@ -447,7 +447,7 @@ fn read_one_vlen_string(
 ///
 /// HDF5 supports ASCII and UTF-8 string encodings. Both are valid UTF-8
 /// (ASCII is a strict subset), so we decode uniformly via `from_utf8`.
-fn decode_string(
+pub(crate) fn decode_string(
     bytes: &[u8],
     padding: StringPadding,
     _encoding: StringEncoding,
@@ -475,13 +475,17 @@ fn is_byte_vlen(base: &Datatype) -> bool {
     matches!(base, Datatype::FixedPoint { size: 1, .. })
 }
 
-fn decode_varlen_byte_string(bytes: &[u8]) -> Result<String> {
+pub(crate) fn decode_varlen_byte_string(bytes: &[u8]) -> Result<String> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8(bytes[..end].to_vec())
         .map_err(|e| Error::InvalidData(format!("invalid string data: {e}")))
 }
 
-fn resolve_vlen_bytes(raw_data: &[u8], file_data: &[u8], offset_size: u8) -> Option<Vec<u8>> {
+pub(crate) fn resolve_vlen_bytes(
+    raw_data: &[u8],
+    file_data: &[u8],
+    offset_size: u8,
+) -> Option<Vec<u8>> {
     if raw_data.len() < 4 + offset_size as usize + 4 {
         return None;
     }

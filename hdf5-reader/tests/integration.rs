@@ -202,6 +202,24 @@ fn test_from_vec() {
 }
 
 #[test]
+fn test_from_bytes_with_options() {
+    let path = skip_if_missing!("scalar_dataset.h5");
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_reader::Hdf5File::from_bytes_with_options(
+        &bytes,
+        hdf5_reader::OpenOptions {
+            chunk_cache_bytes: 1024,
+            chunk_cache_slots: 17,
+            filter_registry: None,
+        },
+    )
+    .unwrap();
+    let ds = file.dataset("/value").unwrap();
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    assert!((data[[]] - 42.0).abs() < 1e-10);
+}
+
+#[test]
 fn test_header_cache_reuse() {
     let path = skip_if_missing!("nested_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
@@ -262,6 +280,19 @@ fn test_extensible_array_chunked() {
             );
         }
     }
+}
+
+#[test]
+fn test_vlen_string_dataset() {
+    let path = skip_if_missing!("vlen_strings.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/labels").unwrap();
+
+    let strings = ds.read_strings().unwrap();
+    assert_eq!(strings, vec!["alpha", "beta", "gamma"]);
+
+    let err = ds.read_string().unwrap_err();
+    assert!(matches!(err, hdf5_reader::error::Error::InvalidData(_)));
 }
 
 #[test]

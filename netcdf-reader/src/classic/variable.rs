@@ -153,6 +153,25 @@ impl ClassicFile {
 
     /// Read a char variable as a String (or Vec<String> for multi-dimensional).
     pub fn read_variable_as_string(&self, name: &str) -> Result<String> {
+        let mut strings = self.read_variable_as_strings(name)?;
+        match strings.len() {
+            1 => Ok(strings.swap_remove(0)),
+            0 => Err(Error::InvalidData(format!(
+                "variable '{}' contains no string elements",
+                name
+            ))),
+            count => Err(Error::InvalidData(format!(
+                "variable '{}' contains {count} strings; use read_variable_as_strings()",
+                name
+            ))),
+        }
+    }
+
+    /// Read a char variable as a flat vector of strings.
+    ///
+    /// For 2-D and higher char arrays, the last dimension is interpreted as the
+    /// string length and the leading dimensions are flattened.
+    pub fn read_variable_as_strings(&self, name: &str) -> Result<Vec<String>> {
         let var = self.find_variable(name)?;
         if var.dtype != NcType::Char {
             return Err(Error::TypeMismatch {
@@ -164,10 +183,7 @@ impl ClassicFile {
         let file_data = self.data.as_slice();
         let arr = self.read_typed_variable::<u8>(var, file_data)?;
         let bytes: Vec<u8> = arr.iter().copied().collect();
-        let s = String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .to_string();
-        Ok(s)
+        decode_char_variable_strings(var, &bytes)
     }
 
     /// Read a slice (hyperslab) of a variable.
@@ -261,6 +277,49 @@ impl ClassicFile {
             data::read_non_record_variable(file_data, var)
         }
     }
+}
+
+fn decode_char_variable_strings(var: &NcVariable, bytes: &[u8]) -> Result<Vec<String>> {
+    let shape = var.shape();
+    if shape.len() <= 1 {
+        return Ok(vec![decode_char_string(bytes)]);
+    }
+
+    let string_len = checked_usize_from_u64(
+        *shape
+            .last()
+            .ok_or_else(|| Error::InvalidData("char variable missing string axis".into()))?,
+        "char string length",
+    )?;
+    let string_count_u64 = checked_shape_elements(&shape[..shape.len() - 1], "char string count")?;
+    let string_count = checked_usize_from_u64(string_count_u64, "char string count")?;
+    let expected_bytes = string_count.checked_mul(string_len).ok_or_else(|| {
+        Error::InvalidData("char string byte count exceeds platform usize".to_string())
+    })?;
+
+    if bytes.len() < expected_bytes {
+        return Err(Error::InvalidData(format!(
+            "char variable '{}' data too short: need {} bytes, have {}",
+            var.name,
+            expected_bytes,
+            bytes.len()
+        )));
+    }
+
+    if string_len == 0 {
+        return Ok(vec![String::new(); string_count]);
+    }
+
+    Ok(bytes[..expected_bytes]
+        .chunks_exact(string_len)
+        .map(decode_char_string)
+        .collect())
+}
+
+fn decode_char_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 fn variable_shape_for_selection(var: &NcVariable, numrecs: u64) -> Vec<u64> {
@@ -639,5 +698,46 @@ fn read_selected_blocks_recursive<T: NcReadType>(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::NcDimension;
+
+    fn char_variable(shape: &[u64]) -> NcVariable {
+        NcVariable {
+            name: "chars".to_string(),
+            dimensions: shape
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| NcDimension {
+                    name: format!("d{i}"),
+                    size,
+                    is_unlimited: false,
+                })
+                .collect(),
+            dtype: NcType::Char,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 0,
+        }
+    }
+
+    #[test]
+    fn test_decode_char_variable_strings_1d() {
+        let var = char_variable(&[5]);
+        let strings = decode_char_variable_strings(&var, b"alpha").unwrap();
+        assert_eq!(strings, vec!["alpha"]);
+    }
+
+    #[test]
+    fn test_decode_char_variable_strings_2d() {
+        let var = char_variable(&[2, 5]);
+        let strings = decode_char_variable_strings(&var, b"alphabeta\0").unwrap();
+        assert_eq!(strings, vec!["alpha", "beta"]);
     }
 }

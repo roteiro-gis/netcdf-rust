@@ -20,9 +20,11 @@
 //! | Compound { .. }               | Compound |
 //! | Opaque { .. }                 | Opaque   |
 //! | Array { base, dims }          | Array    |
-//! | VarLen { base }               | VLen     |
+//! | VarLen { base=u8 }            | String*  |
+//! | VarLen { base!=u8 }           | VLen     |
 //!
 //! * Enums are mapped to their base integer type.
+//! * NetCDF-4 `NC_STRING` is stored as HDF5 variable-length bytes.
 
 use hdf5_reader::messages::datatype::Datatype;
 
@@ -83,6 +85,18 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
                 base: Box::new(base_nc),
                 dims: dims.clone(),
             })
+        }
+        Datatype::VarLen { base }
+            if matches!(
+                base.as_ref(),
+                Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    ..
+                }
+            ) =>
+        {
+            Ok(NcType::String)
         }
         Datatype::VarLen { base } => {
             let base_nc = hdf5_to_nc_type(base)?;
@@ -161,6 +175,22 @@ mod tests {
             })
             .unwrap(),
             NcType::Double
+        );
+    }
+
+    #[test]
+    fn test_varlen_u8_maps_to_string() {
+        let bo = ByteOrder::LittleEndian;
+        assert_eq!(
+            hdf5_to_nc_type(&Datatype::VarLen {
+                base: Box::new(Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    byte_order: bo,
+                }),
+            })
+            .unwrap(),
+            NcType::String
         );
     }
 }

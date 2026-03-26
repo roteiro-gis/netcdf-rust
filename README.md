@@ -27,6 +27,9 @@ let temp: ndarray::ArrayD<f32> = file.read_variable("temperature")?;
 // Type-promoting read (any numeric type → f64)
 let data = file.read_variable_as_f64("temperature")?;
 
+// String variables (classic char arrays and NetCDF-4 NC_STRING)
+let names = file.read_variable_as_strings("station_name")?;
+
 // CF conventions: unpack packed integer data (scale_factor + add_offset)
 let unpacked = file.read_variable_unpacked("temperature")?;
 
@@ -49,6 +52,15 @@ for slice in file.iter_slices::<f32>("temperature", 0)? {
     let data = slice?;
     println!("  step shape: {:?}", data.shape());
 }
+
+// In-memory open with custom NC4 cache/filter options
+let bytes = std::fs::read("era5.nc")?;
+let file = NcFile::from_bytes_with_options(&bytes, netcdf_reader::NcOpenOptions {
+    chunk_cache_bytes: 8 * 1024 * 1024,
+    chunk_cache_slots: 257,
+    #[cfg(feature = "netcdf4")]
+    filter_registry: None,
+})?;
 ```
 
 Using `hdf5-reader` directly:
@@ -69,6 +81,9 @@ let sel = SliceInfo {
     ],
 };
 let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
+
+// String datasets
+let labels = file.dataset("/labels")?.read_strings()?;
 ```
 
 ## Features
@@ -79,6 +94,7 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 - All chunk index types: v1/v2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
 - Deflate, shuffle, Fletcher-32, and optional LZ4 filters
 - Custom filters via `FilterRegistry`
+- Fixed-length strings, HDF5 variable-length strings, and byte-vlen string datasets
 - Dense-link resolution, soft-link resolution, committed datatypes, global heap strings, and object references
 - Parallel chunk decoding, chunk caching, and object-header caching
 
@@ -86,9 +102,10 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 - CDF-1, CDF-2, CDF-5, and NetCDF-4
 - Automatic format detection
 - Unified typed reads across formats
+- Unified string reads for classic char arrays and NetCDF-4 string variables
 - Type promotion to `f64`, unpacking, masking, and combined CF helpers
 - Slice reads, lazy slice iteration, and parallel NC4 slice reads
-- Cache and filter configuration through `NcOpenOptions`
+- Cache and filter configuration through `NcOpenOptions`, including in-memory opens
 
 ## Feature flags
 

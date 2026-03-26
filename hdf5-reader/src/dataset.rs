@@ -9,7 +9,10 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
-use crate::attribute_api::{collect_attribute_messages, Attribute};
+use crate::attribute_api::{
+    collect_attribute_messages, decode_string, decode_varlen_byte_string, read_one_vlen_string,
+    resolve_vlen_bytes, Attribute,
+};
 use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
@@ -18,7 +21,7 @@ use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
-use crate::messages::datatype::Datatype;
+use crate::messages::datatype::{Datatype, StringSize};
 use crate::messages::fill_value::{FillTime, FillValueMessage};
 use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::messages::layout::{ChunkIndexing, DataLayout};
@@ -549,6 +552,126 @@ impl<'f> Dataset<'f> {
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
     }
 
+    /// Read a scalar string dataset or single string element.
+    ///
+    /// Use [`Dataset::read_strings`] when the dataset contains multiple strings.
+    pub fn read_string(&self) -> Result<String> {
+        let mut strings = self.read_strings()?;
+        match strings.len() {
+            1 => Ok(strings.swap_remove(0)),
+            0 => Err(Error::InvalidData(format!(
+                "dataset '{}' contains no string elements",
+                self.name
+            ))),
+            count => Err(Error::InvalidData(format!(
+                "dataset '{}' contains {count} string elements; use read_strings()",
+                self.name
+            ))),
+        }
+    }
+
+    /// Read all string elements from a string-typed dataset.
+    pub fn read_strings(&self) -> Result<Vec<String>> {
+        match &self.datatype {
+            Datatype::String {
+                size: StringSize::Fixed(len),
+                encoding,
+                padding,
+            } => {
+                let raw = self.read_raw_bytes()?;
+                let elem_size = *len as usize;
+                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let expected_bytes =
+                    checked_mul_usize(count, elem_size, "dataset string byte size")?;
+                if raw.len() < expected_bytes {
+                    return Err(Error::InvalidData(format!(
+                        "dataset '{}' string data too short: need {} bytes, have {}",
+                        self.name,
+                        expected_bytes,
+                        raw.len()
+                    )));
+                }
+
+                let mut strings = Vec::with_capacity(count);
+                for i in 0..count {
+                    let start = i * elem_size;
+                    let end = start + elem_size;
+                    strings.push(decode_string(&raw[start..end], *padding, *encoding)?);
+                }
+                Ok(strings)
+            }
+            Datatype::String {
+                size: StringSize::Variable,
+                encoding,
+                padding,
+            } => {
+                let raw = self.read_raw_bytes()?;
+                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let ref_size = 4 + self.offset_size as usize + 4;
+                let expected_bytes =
+                    checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
+                if raw.len() < expected_bytes {
+                    return Err(Error::InvalidData(format!(
+                        "dataset '{}' vlen string data too short: need {} bytes, have {}",
+                        self.name,
+                        expected_bytes,
+                        raw.len()
+                    )));
+                }
+
+                let mut strings = Vec::with_capacity(count);
+                for i in 0..count {
+                    let offset = i * ref_size;
+                    strings.push(read_one_vlen_string(
+                        &raw,
+                        offset,
+                        self.file_data,
+                        self.offset_size,
+                        *padding,
+                        *encoding,
+                    )?);
+                }
+                Ok(strings)
+            }
+            Datatype::VarLen { base } => {
+                if !matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) {
+                    return Err(Error::TypeMismatch {
+                        expected: "String dataset".into(),
+                        actual: format!("{:?}", self.datatype),
+                    });
+                }
+
+                let raw = self.read_raw_bytes()?;
+                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let ref_size = 4 + self.offset_size as usize + 4;
+                let expected_bytes =
+                    checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
+                if raw.len() < expected_bytes {
+                    return Err(Error::InvalidData(format!(
+                        "dataset '{}' vlen byte string data too short: need {} bytes, have {}",
+                        self.name,
+                        expected_bytes,
+                        raw.len()
+                    )));
+                }
+
+                let mut strings = Vec::with_capacity(count);
+                for i in 0..count {
+                    let offset = i * ref_size;
+                    let ref_bytes = &raw[offset..offset + ref_size];
+                    let value = resolve_vlen_bytes(ref_bytes, self.file_data, self.offset_size)
+                        .unwrap_or_default();
+                    strings.push(decode_varlen_byte_string(&value)?);
+                }
+                Ok(strings)
+            }
+            _ => Err(Error::TypeMismatch {
+                expected: "String dataset".into(),
+                actual: format!("{:?}", self.datatype),
+            }),
+        }
+    }
+
     /// Total number of elements in the dataset.
     pub fn num_elements(&self) -> u64 {
         if self.dataspace.dims.is_empty() {
@@ -676,6 +799,27 @@ impl<'f> Dataset<'f> {
         self.decode_raw_data::<T>(data)
     }
 
+    fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+        let elem_size = dtype_element_size(&self.datatype);
+        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
+
+        let result = match &self.layout {
+            DataLayout::Compact { data } => Ok(self.normalize_raw_bytes(data, total_bytes)),
+            DataLayout::Contiguous { address, size } => {
+                self.read_contiguous_bytes(*address, *size, total_bytes)
+            }
+            DataLayout::Chunked {
+                address,
+                dims,
+                element_size: _,
+                chunk_indexing,
+            } => self.read_chunked_bytes(*address, dims, chunk_indexing.as_ref(), total_bytes),
+        };
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
         if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
             // Dataset with no data written — return fill values
@@ -690,6 +834,25 @@ impl<'f> Dataset<'f> {
 
         let raw = &self.file_data[addr..addr + sz];
         self.decode_raw_data::<T>(raw)
+    }
+
+    fn read_contiguous_bytes(
+        &self,
+        address: u64,
+        size: u64,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
+            return Ok(self.make_output_buffer(total_bytes));
+        }
+
+        let addr = address as usize;
+        let sz = size as usize;
+        if addr + sz > self.file_data.len() {
+            return Err(Error::OffsetOutOfBounds(address));
+        }
+
+        Ok(self.normalize_raw_bytes(&self.file_data[addr..addr + sz], total_bytes))
     }
 
     fn read_chunked<T: H5Type>(
@@ -842,6 +1005,67 @@ impl<'f> Dataset<'f> {
         }
 
         self.decode_raw_data::<T>(&flat_data)
+    }
+
+    fn read_chunked_bytes(
+        &self,
+        index_address: u64,
+        chunk_dims: &[u32],
+        chunk_indexing: Option<&ChunkIndexing>,
+        total_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+            return Ok(self.make_output_buffer(total_bytes));
+        }
+
+        let ndim = self.ndim();
+        let shape = &self.dataspace.dims;
+        let elem_size = dtype_element_size(&self.datatype);
+        let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        let dataset_strides = row_major_strides(shape, "dataset stride")?;
+        let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
+
+        let entries = self.collect_chunk_entries(
+            index_address,
+            chunk_dims,
+            chunk_indexing,
+            ChunkEntrySelection {
+                shape,
+                ndim,
+                elem_size,
+                chunk_bounds: None,
+            },
+        )?;
+
+        let full_chunk_coverage = entries.len() == full_dataset_chunk_count(shape, &chunk_shape)?;
+        if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if let Some(cached_bytes) = self.full_dataset_bytes.get() {
+                return Ok(cached_bytes.as_ref().clone());
+            }
+        }
+
+        let mut flat_data = self.make_output_buffer(total_bytes);
+        for entry in &entries {
+            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+            copy_chunk_to_flat_with_strides(
+                &chunk_data,
+                &mut flat_data,
+                ChunkCopyLayout {
+                    chunk_offsets: &entry.offsets,
+                    chunk_shape: &chunk_shape,
+                    dataset_shape: shape,
+                    dataset_strides: &dataset_strides,
+                    chunk_strides: &chunk_strides,
+                    elem_size,
+                },
+            );
+        }
+
+        if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
+        }
+
+        Ok(flat_data)
     }
 
     #[cfg(feature = "rayon")]
@@ -1915,6 +2139,16 @@ impl<'f> Dataset<'f> {
             }
         } else {
             vec![0u8; total_bytes]
+        }
+    }
+
+    fn normalize_raw_bytes(&self, raw: &[u8], total_bytes: usize) -> Vec<u8> {
+        if raw.len() >= total_bytes {
+            raw[..total_bytes].to_vec()
+        } else {
+            let mut normalized = self.make_output_buffer(total_bytes);
+            normalized[..raw.len()].copy_from_slice(raw);
+            normalized
         }
     }
 }
