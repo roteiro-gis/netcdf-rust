@@ -10,8 +10,8 @@
   `netcdf_reader::NcFile::{read_variable_as_string, read_variable_as_strings}`.
 - Fixed NetCDF-4 string typing so `NC_STRING` variables backed by HDF5
   variable-length byte storage are exposed as `NcType::String`.
-- Removed an unnecessary extra file open/memory-map in the NetCDF open path for
-  NetCDF-4 files.
+- Removed extra open/remap work in the NetCDF open path and restored classic
+  open performance after the detection refactor.
 
 ## 0.1.2 - 2026-03-22
 

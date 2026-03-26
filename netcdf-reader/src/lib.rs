@@ -34,9 +34,9 @@ pub use error::{Error, Result};
 pub use types::*;
 
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
+use memmap2::Mmap;
 use ndarray::ArrayD;
 #[cfg(feature = "rayon")]
 use rayon::ThreadPool;
@@ -108,13 +108,6 @@ fn detect_format(data: &[u8]) -> Result<NcFormat> {
     }
 
     Err(Error::InvalidMagic)
-}
-
-fn detect_format_from_path(path: &Path) -> Result<NcFormat> {
-    let mut file = File::open(path)?;
-    let mut header = [0u8; 8];
-    let bytes_read = file.read(&mut header)?;
-    detect_format(&header[..bytes_read])
 }
 
 impl NcFile {
@@ -519,11 +512,14 @@ impl NcFile {
     /// Open a NetCDF file with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: NcOpenOptions) -> Result<Self> {
         let path = path.as_ref();
-        let format = detect_format_from_path(path)?;
+        let file = File::open(path)?;
+        // SAFETY: read-only mapping; caller must not modify the file concurrently.
+        let mmap = unsafe { Mmap::map(&file)? };
+        let format = detect_format(&mmap)?;
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
-                let classic = classic::ClassicFile::open(path, format)?;
+                let classic = classic::ClassicFile::from_mmap(mmap, format)?;
                 Ok(NcFile {
                     format,
                     inner: NcFileInner::Classic(classic),
@@ -532,7 +528,16 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
-                    let nc4 = nc4::Nc4File::open_with_options(path, options)?;
+                    let hdf5 = hdf5_reader::Hdf5File::from_mmap_with_options(
+                        mmap,
+                        hdf5_reader::OpenOptions {
+                            chunk_cache_bytes: options.chunk_cache_bytes,
+                            chunk_cache_slots: options.chunk_cache_slots,
+                            filter_registry: options.filter_registry,
+                        },
+                    )?;
+                    let root_group = nc4::groups::build_root_group(&hdf5)?;
+                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, root_group);
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {

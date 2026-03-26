@@ -147,7 +147,7 @@ impl Hdf5File {
         // while we hold the mapping. The caller is responsible for not
         // modifying the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_file_data(FileData::Mmap(mmap), options)
+        Self::from_mmap_with_options(mmap, options)
     }
 
     /// Open an HDF5 file from an in-memory byte slice.
@@ -172,6 +172,13 @@ impl Hdf5File {
     /// Open an HDF5 file from an owned byte vector with custom options.
     pub fn from_vec_with_options(data: Vec<u8>, options: OpenOptions) -> Result<Self> {
         Self::from_file_data(FileData::Bytes(data), options)
+    }
+
+    /// Open an HDF5 file from an existing memory map with custom options.
+    ///
+    /// This avoids remapping when the caller already owns a read-only mapping.
+    pub fn from_mmap_with_options(mmap: Mmap, options: OpenOptions) -> Result<Self> {
+        Self::from_file_data(FileData::Mmap(mmap), options)
     }
 
     /// Get the parsed superblock.

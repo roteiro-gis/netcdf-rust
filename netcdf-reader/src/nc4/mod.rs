@@ -111,6 +111,10 @@ pub struct Nc4File {
 }
 
 impl Nc4File {
+    pub(crate) fn from_hdf5(hdf5: Hdf5File, root_group: NcGroup) -> Self {
+        Nc4File { hdf5, root_group }
+    }
+
     /// Open a NetCDF-4 file from disk.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_options(path, crate::NcOpenOptions::default())
