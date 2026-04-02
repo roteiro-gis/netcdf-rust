@@ -111,8 +111,8 @@ let labels = file.dataset("/labels")?.read_strings()?;
 
 ```toml
 [dependencies]
-netcdf-reader = "0.1"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.1", default-features = false }  # CDF-1/2/5 only
+netcdf-reader = "0.2"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.2", default-features = false }  # CDF-1/2/5 only
 ```
 
 | Flag | Default | Description |

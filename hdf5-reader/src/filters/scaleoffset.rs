@@ -155,6 +155,12 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
             filter_error("scaleoffset payload is shorter than the expected output")
         })?;
         out.copy_from_slice(payload);
+
+        if params.order != native_order() {
+            swap_endian_in_place(&mut out, params.size);
+        }
+
+        return Ok(out);
     } else if minbits != 0 {
         let packed = PackedParams {
             size: params.size,
@@ -236,7 +242,7 @@ fn unpack_packed(
             }
             ORDER_BE => {
                 let begin = (dtype_len - packed.minbits) / 8;
-                for k in begin..packed.size {
+                for (k, byte) in slice.iter_mut().enumerate().take(packed.size).skip(begin) {
                     let bit_count = if k == begin {
                         let remainder = (dtype_len - packed.minbits) % 8;
                         if remainder == 0 {
@@ -247,7 +253,7 @@ fn unpack_packed(
                     } else {
                         8
                     };
-                    slice[k] = bits.read_bits(bit_count)?;
+                    *byte = bits.read_bits(bit_count)?;
                 }
             }
             _ => {
@@ -752,5 +758,41 @@ mod tests {
             .map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![1.25, 1.5, 2.0]);
+    }
+
+    #[test]
+    fn full_precision_integer_payload_skips_postprocess() {
+        let raw_values = vec![300u16.to_ne_bytes(), 511u16.to_ne_bytes()];
+        let payload: Vec<u8> = raw_values.iter().flat_map(|v| v.iter().copied()).collect();
+        let input = header_with_minval(16, 700, &payload);
+        let client_data = vec![
+            SCALE_INT,
+            0,
+            2,
+            CLASS_INTEGER,
+            2,
+            SIGN_UNSIGNED,
+            native_order(),
+            FILL_UNDEFINED,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+
+        let decoded = decompress(&input, &client_data).unwrap();
+        let values: Vec<u16> = decoded
+            .chunks_exact(2)
+            .map(|chunk| u16::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![300, 511]);
     }
 }

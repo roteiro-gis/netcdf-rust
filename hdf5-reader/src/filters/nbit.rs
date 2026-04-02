@@ -265,8 +265,8 @@ fn decode_atomic(
     };
 
     if ascending {
-        for k in begin..=end_idx {
-            slice[k] = read_atomic_byte(bits, desc, datatype_len, begin, end_idx, k)?;
+        for (k, byte) in slice.iter_mut().enumerate().take(end_idx + 1).skip(begin) {
+            *byte = read_atomic_byte(bits, desc, datatype_len, begin, end_idx, k)?;
         }
     } else {
         for k in (end_idx..=begin).rev() {

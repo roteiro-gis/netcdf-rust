@@ -18,6 +18,13 @@ cargo test --workspace
 cargo test -p hdf5-reader --no-default-features
 cargo test -p netcdf-reader --no-default-features
 cargo package -p hdf5-reader
+```
+
+`netcdf-reader` packaging still depends on the new `hdf5-reader` version being
+visible in the crates.io index, so run its packaging check only after
+`hdf5-reader` has been published and the index has updated:
+
+```sh
 cargo package -p netcdf-reader --no-verify
 ```
 
