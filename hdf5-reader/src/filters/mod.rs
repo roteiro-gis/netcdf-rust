@@ -2,6 +2,8 @@ pub mod deflate;
 pub mod fletcher32;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+pub mod nbit;
+pub mod scaleoffset;
 pub mod shuffle;
 
 use std::collections::HashMap;
@@ -21,8 +23,9 @@ pub const FILTER_LZ4: u16 = 32004;
 
 /// A user-supplied filter function.
 ///
-/// Takes the input data and element size, returns the decoded output.
-pub type FilterFn = Box<dyn Fn(&[u8], usize) -> Result<Vec<u8>> + Send + Sync>;
+/// Takes the filter description, input data, and element size, then returns
+/// the decoded output.
+pub type FilterFn = Box<dyn Fn(&FilterDescription, &[u8], usize) -> Result<Vec<u8>> + Send + Sync>;
 
 /// A registry of filter implementations.
 ///
@@ -40,18 +43,26 @@ impl FilterRegistry {
         };
         registry.register(
             FILTER_DEFLATE,
-            Box::new(|data, _| deflate::decompress(data)),
+            Box::new(|_, data, _| deflate::decompress(data)),
         );
         registry.register(
             FILTER_SHUFFLE,
-            Box::new(|data, elem_size| Ok(shuffle::unshuffle(data, elem_size))),
+            Box::new(|_, data, elem_size| Ok(shuffle::unshuffle(data, elem_size))),
         );
         registry.register(
             FILTER_FLETCHER32,
-            Box::new(|data, _| fletcher32::verify_and_strip(data)),
+            Box::new(|_, data, _| fletcher32::verify_and_strip(data)),
+        );
+        registry.register(
+            FILTER_NBIT,
+            Box::new(|filter, data, _| nbit::decompress(data, &filter.client_data)),
+        );
+        registry.register(
+            FILTER_SCALEOFFSET,
+            Box::new(|filter, data, _| scaleoffset::decompress(data, &filter.client_data)),
         );
         #[cfg(feature = "lz4")]
-        registry.register(FILTER_LZ4, Box::new(|data, _| lz4::decompress(data)));
+        registry.register(FILTER_LZ4, Box::new(|_, data, _| lz4::decompress(data)));
         registry
     }
 
@@ -63,10 +74,15 @@ impl FilterRegistry {
     }
 
     /// Apply a single filter by ID.
-    pub fn apply(&self, id: u16, data: &[u8], element_size: usize) -> Result<Vec<u8>> {
-        match self.filters.get(&id) {
-            Some(f) => f(data, element_size),
-            None => Err(Error::UnsupportedFilter(format!("filter id {}", id))),
+    pub fn apply(
+        &self,
+        filter: &FilterDescription,
+        data: &[u8],
+        element_size: usize,
+    ) -> Result<Vec<u8>> {
+        match self.filters.get(&filter.id) {
+            Some(f) => f(filter, data, element_size),
+            None => Err(Error::UnsupportedFilter(format!("filter id {}", filter.id))),
         }
     }
 }
@@ -111,7 +127,7 @@ pub fn apply_pipeline(
                 continue;
             }
             return if let Some(reg) = registry {
-                reg.apply(filter.id, data, element_size)
+                reg.apply(filter, data, element_size)
             } else {
                 apply_builtin_filter(filter, data, element_size)
             };
@@ -135,7 +151,7 @@ pub fn apply_pipeline(
         };
 
         owned = Some(if let Some(reg) = registry {
-            reg.apply(filter.id, input, element_size)?
+            reg.apply(filter, input, element_size)?
         } else {
             apply_builtin_filter(filter, input, element_size)?
         });
@@ -154,8 +170,8 @@ fn apply_builtin_filter(
         FILTER_SHUFFLE => Ok(shuffle::unshuffle(data, element_size)),
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
         FILTER_SZIP => Err(Error::UnsupportedFilter("szip".into())),
-        FILTER_NBIT => Err(Error::UnsupportedFilter("nbit".into())),
-        FILTER_SCALEOFFSET => Err(Error::UnsupportedFilter("scaleoffset".into())),
+        FILTER_NBIT => nbit::decompress(data, &filter.client_data),
+        FILTER_SCALEOFFSET => scaleoffset::decompress(data, &filter.client_data),
         #[cfg(feature = "lz4")]
         FILTER_LZ4 => lz4::decompress(data),
         id => Err(Error::UnsupportedFilter(format!("filter id {}", id))),
@@ -173,21 +189,33 @@ mod tests {
         assert!(registry.filters.contains_key(&FILTER_DEFLATE));
         assert!(registry.filters.contains_key(&FILTER_SHUFFLE));
         assert!(registry.filters.contains_key(&FILTER_FLETCHER32));
+        assert!(registry.filters.contains_key(&FILTER_NBIT));
+        assert!(registry.filters.contains_key(&FILTER_SCALEOFFSET));
     }
 
     #[test]
     fn test_filter_registry_custom() {
         let mut registry = FilterRegistry::new();
         // Register a no-op custom filter
-        registry.register(32000, Box::new(|data, _| Ok(data.to_vec())));
-        let result = registry.apply(32000, &[1, 2, 3], 1).unwrap();
+        registry.register(32000, Box::new(|_, data, _| Ok(data.to_vec())));
+        let filter = FilterDescription {
+            id: 32000,
+            name: None,
+            client_data: Vec::new(),
+        };
+        let result = registry.apply(&filter, &[1, 2, 3], 1).unwrap();
         assert_eq!(result, vec![1, 2, 3]);
     }
 
     #[test]
     fn test_filter_registry_unknown() {
         let registry = FilterRegistry::new();
-        let err = registry.apply(9999, &[1, 2, 3], 1).unwrap_err();
+        let filter = FilterDescription {
+            id: 9999,
+            name: None,
+            client_data: Vec::new(),
+        };
+        let err = registry.apply(&filter, &[1, 2, 3], 1).unwrap_err();
         assert!(matches!(err, Error::UnsupportedFilter(_)));
     }
 }

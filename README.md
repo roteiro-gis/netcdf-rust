@@ -92,7 +92,7 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Superblock v0-v3 and object header v1/v2 with checksum verification
 - Compact, contiguous, and chunked layouts
 - All chunk index types: v1/v2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
-- Deflate, shuffle, Fletcher-32, and optional LZ4 filters
+- Deflate, shuffle, Fletcher-32, N-Bit, ScaleOffset, and optional LZ4 filters
 - Custom filters via `FilterRegistry`
 - Fixed-length strings, HDF5 variable-length strings, and byte-vlen string datasets
 - Dense-link resolution, soft-link resolution, committed datatypes, global heap strings, and object references
@@ -131,7 +131,7 @@ use hdf5_reader::{Hdf5File, OpenOptions};
 use hdf5_reader::filters::FilterRegistry;
 
 let mut registry = FilterRegistry::new();
-registry.register(32001, Box::new(|data, _elem_size| {
+registry.register(32001, Box::new(|_filter, data, _elem_size| {
     // Custom decompression logic
     Ok(data.to_vec())
 }));
@@ -164,7 +164,8 @@ publish order for `hdf5-reader` and `netcdf-reader`.
 ## Known limitations
 
 - External HDF5 links are skipped (soft links are resolved)
-- SZIP, N-Bit, and ScaleOffset filters are not built in (register via `FilterRegistry`)
+- SZIP is not built in (register via `FilterRegistry` if needed)
+- ScaleOffset floating-point E-scale mode is not supported by the HDF5 decoder path
 - SOHM (shared object header message table) resolution returns a descriptive error
 - Fractal heap huge/tiny objects are not yet supported (managed objects work)
 - CF time decoding uses Gregorian approximation for non-standard calendars (noleap, 360_day)
