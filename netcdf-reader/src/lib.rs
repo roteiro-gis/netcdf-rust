@@ -13,7 +13,7 @@
 //!
 //! let file = NcFile::open("example.nc").unwrap();
 //! println!("format: {:?}", file.format());
-//! for var in file.variables() {
+//! for var in file.variables().unwrap() {
 //!     println!("  variable: {} shape={:?}", var.name(), var.shape());
 //! }
 //! ```
@@ -69,6 +69,16 @@ pub enum NcFormat {
     Nc4,
     /// NetCDF-4 classic model (HDF5-backed, restricted data model).
     Nc4Classic,
+}
+
+/// NetCDF-4 metadata reconstruction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NcMetadataMode {
+    /// Fail the open if NetCDF-4 metadata cannot be reconstructed exactly.
+    #[default]
+    Strict,
+    /// Allow heuristic reconstruction for malformed or partially-supported files.
+    Lossy,
 }
 
 /// An opened NetCDF file.
@@ -172,53 +182,53 @@ impl NcFile {
     /// Classic files have a single implicit root group containing all
     /// dimensions, variables, and global attributes. NetCDF-4 files
     /// can have nested sub-groups.
-    pub fn root_group(&self) -> &NcGroup {
+    pub fn root_group(&self) -> Result<&NcGroup> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.root_group(),
+            NcFileInner::Classic(c) => Ok(c.root_group()),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.root_group(),
         }
     }
 
     /// Convenience: dimensions in the root group.
-    pub fn dimensions(&self) -> &[NcDimension] {
-        &self.root_group().dimensions
+    pub fn dimensions(&self) -> Result<&[NcDimension]> {
+        Ok(&self.root_group()?.dimensions)
     }
 
     /// Convenience: variables in the root group.
-    pub fn variables(&self) -> &[NcVariable] {
-        &self.root_group().variables
+    pub fn variables(&self) -> Result<&[NcVariable]> {
+        Ok(&self.root_group()?.variables)
     }
 
     /// Convenience: global attributes (attributes of the root group).
-    pub fn global_attributes(&self) -> &[NcAttribute] {
-        &self.root_group().attributes
+    pub fn global_attributes(&self) -> Result<&[NcAttribute]> {
+        Ok(&self.root_group()?.attributes)
     }
 
     /// Find a group by path relative to the root group.
     pub fn group(&self, path: &str) -> Result<&NcGroup> {
-        self.root_group()
+        self.root_group()?
             .group(path)
             .ok_or_else(|| Error::GroupNotFound(path.to_string()))
     }
 
     /// Find a variable by name or path relative to the root group.
     pub fn variable(&self, name: &str) -> Result<&NcVariable> {
-        self.root_group()
+        self.root_group()?
             .variable(name)
             .ok_or_else(|| Error::VariableNotFound(name.to_string()))
     }
 
     /// Find a dimension by name or path relative to the root group.
     pub fn dimension(&self, name: &str) -> Result<&NcDimension> {
-        self.root_group()
+        self.root_group()?
             .dimension(name)
             .ok_or_else(|| Error::DimensionNotFound(name.to_string()))
     }
 
     /// Find a group attribute by name or path relative to the root group.
     pub fn global_attribute(&self, name: &str) -> Result<&NcAttribute> {
-        self.root_group()
+        self.root_group()?
             .attribute(name)
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
     }
@@ -492,6 +502,8 @@ pub struct NcOpenOptions {
     pub chunk_cache_bytes: usize,
     /// Maximum number of chunk cache slots (NC4 only). Default: 521.
     pub chunk_cache_slots: usize,
+    /// NetCDF-4 metadata reconstruction policy. Default: strict.
+    pub metadata_mode: NcMetadataMode,
     /// Custom filter registry (NC4 only).
     #[cfg(feature = "netcdf4")]
     pub filter_registry: Option<hdf5_reader::FilterRegistry>,
@@ -502,6 +514,7 @@ impl Default for NcOpenOptions {
         NcOpenOptions {
             chunk_cache_bytes: 64 * 1024 * 1024,
             chunk_cache_slots: 521,
+            metadata_mode: NcMetadataMode::Strict,
             #[cfg(feature = "netcdf4")]
             filter_registry: None,
         }
@@ -536,8 +549,7 @@ impl NcFile {
                             filter_registry: options.filter_registry,
                         },
                     )?;
-                    let root_group = nc4::groups::build_root_group(&hdf5)?;
-                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, root_group);
+                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, options.metadata_mode);
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
@@ -673,9 +685,9 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert!(file.dimensions().is_empty());
-        assert!(file.variables().is_empty());
-        assert!(file.global_attributes().is_empty());
+        assert!(file.dimensions().unwrap().is_empty());
+        assert!(file.variables().unwrap().is_empty());
+        assert!(file.global_attributes().unwrap().is_empty());
     }
 
     #[test]
@@ -736,18 +748,18 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert_eq!(file.dimensions().len(), 1);
-        assert_eq!(file.dimensions()[0].name, "x");
-        assert_eq!(file.dimensions()[0].size, 3);
+        assert_eq!(file.dimensions().unwrap().len(), 1);
+        assert_eq!(file.dimensions().unwrap()[0].name, "x");
+        assert_eq!(file.dimensions().unwrap()[0].size, 3);
 
-        assert_eq!(file.global_attributes().len(), 1);
-        assert_eq!(file.global_attributes()[0].name, "title");
+        assert_eq!(file.global_attributes().unwrap().len(), 1);
+        assert_eq!(file.global_attributes().unwrap()[0].name, "title");
         assert_eq!(
-            file.global_attributes()[0].value.as_string().unwrap(),
+            file.global_attributes().unwrap()[0].value.as_string().unwrap(),
             "test"
         );
 
-        assert_eq!(file.variables().len(), 1);
+        assert_eq!(file.variables().unwrap().len(), 1);
         let var = file.variable("vals").unwrap();
         assert_eq!(var.dtype(), &NcType::Float);
         assert_eq!(var.shape(), vec![3]);

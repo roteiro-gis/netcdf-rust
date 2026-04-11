@@ -15,6 +15,7 @@ pub mod types;
 pub mod variables;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use hdf5_reader::datatype_api::H5Type;
 use hdf5_reader::Hdf5File;
@@ -107,12 +108,17 @@ macro_rules! dispatch_read_as_f64 {
 /// An opened NetCDF-4 file (backed by HDF5).
 pub struct Nc4File {
     hdf5: Hdf5File,
-    root_group: NcGroup,
+    metadata_mode: crate::NcMetadataMode,
+    root_group: OnceLock<NcGroup>,
 }
 
 impl Nc4File {
-    pub(crate) fn from_hdf5(hdf5: Hdf5File, root_group: NcGroup) -> Self {
-        Nc4File { hdf5, root_group }
+    pub(crate) fn from_hdf5(hdf5: Hdf5File, metadata_mode: crate::NcMetadataMode) -> Self {
+        Nc4File {
+            hdf5,
+            metadata_mode,
+            root_group: OnceLock::new(),
+        }
     }
 
     /// Open a NetCDF-4 file from disk.
@@ -130,8 +136,7 @@ impl Nc4File {
                 filter_registry: options.filter_registry,
             },
         )?;
-        let root_group = groups::build_root_group(&hdf5)?;
-        Ok(Nc4File { hdf5, root_group })
+        Ok(Nc4File::from_hdf5(hdf5, options.metadata_mode))
     }
 
     /// Open a NetCDF-4 file from in-memory bytes.
@@ -149,13 +154,21 @@ impl Nc4File {
                 filter_registry: options.filter_registry,
             },
         )?;
-        let root_group = groups::build_root_group(&hdf5)?;
-        Ok(Nc4File { hdf5, root_group })
+        Ok(Nc4File::from_hdf5(hdf5, options.metadata_mode))
     }
 
     /// The root group.
-    pub fn root_group(&self) -> &NcGroup {
-        &self.root_group
+    pub fn root_group(&self) -> Result<&NcGroup> {
+        if let Some(group) = self.root_group.get() {
+            return Ok(group);
+        }
+
+        let root_group = groups::build_root_group(&self.hdf5, self.metadata_mode)?;
+        let _ = self.root_group.set(root_group);
+        Ok(self
+            .root_group
+            .get()
+            .expect("root group must be initialized after successful build"))
     }
 
     /// Check if this file uses the classic data model (`_nc3_strict`).
@@ -199,18 +212,14 @@ impl Nc4File {
     /// Read a string variable as a flat vector of strings.
     pub fn read_variable_as_strings(&self, path: &str) -> Result<Vec<String>> {
         let normalized = normalize_dataset_path(path)?;
-        let var = self
-            .root_group
-            .variable(normalized)
-            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
-        if var.dtype != NcType::String {
+        let dataset = self.hdf5.dataset(normalized)?;
+        let dtype = dataset_nc_type(&dataset)?;
+        if dtype != NcType::String {
             return Err(Error::TypeMismatch {
                 expected: "String".to_string(),
-                actual: format!("{:?}", var.dtype),
+                actual: format!("{dtype:?}"),
             });
         }
-
-        let dataset = self.hdf5.dataset(normalized)?;
         Ok(dataset.read_strings()?)
     }
 
@@ -239,15 +248,9 @@ impl Nc4File {
     /// Reads in the native HDF5 type and promotes to f64 via `mapv`.
     pub fn read_variable_as_f64(&self, path: &str) -> Result<ArrayD<f64>> {
         let normalized = normalize_dataset_path(path)?;
-        let var = self
-            .root_group
-            .variable(normalized)
-            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
         let dataset = self.hdf5.dataset(normalized)?;
-
-        debug_assert_eq!(dataset.shape(), &var.shape()[..]);
-
-        dispatch_read_as_f64!(&var.dtype, |T| dataset.read_array::<T>())
+        let dtype = dataset_nc_type(&dataset)?;
+        dispatch_read_as_f64!(&dtype, |T| dataset.read_array::<T>())
     }
 
     /// Read a slice of a variable with automatic type promotion to f64.
@@ -257,14 +260,10 @@ impl Nc4File {
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<f64>> {
         let normalized = normalize_dataset_path(path)?;
-        let var = self
-            .root_group
-            .variable(normalized)
-            .ok_or_else(|| Error::VariableNotFound(path.to_string()))?;
         let dataset = self.hdf5.dataset(normalized)?;
         let hdf5_sel = selection.to_hdf5_slice_info();
-
-        dispatch_read_as_f64!(&var.dtype, |T| dataset.read_slice::<T>(&hdf5_sel))
+        let dtype = dataset_nc_type(&dataset)?;
+        dispatch_read_as_f64!(&dtype, |T| dataset.read_slice::<T>(&hdf5_sel))
     }
 
     /// Read a typed slice of a variable (NC4 delegation).
@@ -302,4 +301,13 @@ fn normalize_dataset_path(path: &str) -> Result<&str> {
         return Err(Error::VariableNotFound(path.to_string()));
     }
     Ok(trimmed)
+}
+
+fn dataset_nc_type(dataset: &hdf5_reader::Dataset<'_>) -> Result<NcType> {
+    self::types::hdf5_to_nc_type(dataset.dtype()).map_err(|err| {
+        Error::InvalidData(format!(
+            "dataset '{}' cannot be mapped to a NetCDF-4 type: {err}",
+            dataset.name()
+        ))
+    })
 }

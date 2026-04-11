@@ -209,6 +209,20 @@ fn checked_add_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
         .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
 }
 
+fn checked_shape_elements_usize(shape: &[u64], context: &str) -> Result<usize> {
+    let mut total = 1usize;
+    for &dim in shape {
+        total = checked_mul_usize(total, checked_usize(dim, context)?, context)?;
+    }
+    Ok(total)
+}
+
+fn checked_byte_range(start: u64, len: usize, context: &str) -> Result<(usize, usize)> {
+    let start = checked_usize(start, context)?;
+    let end = checked_add_usize(start, len, context)?;
+    Ok((start, end))
+}
+
 fn expected_chunk_count(first_chunk: &[u64], last_chunk: &[u64]) -> Result<usize> {
     let mut total = 1usize;
     for (&first, &last) in first_chunk.iter().zip(last_chunk.iter()) {
@@ -826,13 +840,13 @@ impl<'f> Dataset<'f> {
             return self.make_fill_array::<T>();
         }
 
-        let addr = address as usize;
-        let sz = size as usize;
-        if addr + sz > self.file_data.len() {
+        let sz = checked_usize(size, "contiguous dataset size")?;
+        let (addr, end) = checked_byte_range(address, sz, "contiguous dataset byte range")?;
+        if end > self.file_data.len() {
             return Err(Error::OffsetOutOfBounds(address));
         }
 
-        let raw = &self.file_data[addr..addr + sz];
+        let raw = &self.file_data[addr..end];
         self.decode_raw_data::<T>(raw)
     }
 
@@ -846,13 +860,13 @@ impl<'f> Dataset<'f> {
             return Ok(self.make_output_buffer(total_bytes));
         }
 
-        let addr = address as usize;
-        let sz = size as usize;
-        if addr + sz > self.file_data.len() {
+        let sz = checked_usize(size, "contiguous dataset size")?;
+        let (addr, end) = checked_byte_range(address, sz, "contiguous dataset byte range")?;
+        if end > self.file_data.len() {
             return Err(Error::OffsetOutOfBounds(address));
         }
 
-        Ok(self.normalize_raw_bytes(&self.file_data[addr..addr + sz], total_bytes))
+        Ok(self.normalize_raw_bytes(&self.file_data[addr..end], total_bytes))
     }
 
     fn read_chunked<T: H5Type>(
@@ -1395,34 +1409,32 @@ impl<'f> Dataset<'f> {
             chunk_offsets: smallvec::SmallVec::from_slice(&entry.offsets),
         };
 
-        if let Some(cached) = self.chunk_cache.get(&cache_key) {
-            return Ok(cached);
-        }
+        self.chunk_cache.get_or_insert_with(cache_key, || {
+            let size = if entry.size > 0 {
+                checked_usize(entry.size, "encoded chunk size")?
+            } else {
+                let chunk_elements =
+                    checked_shape_elements_usize(chunk_shape, "chunk element count")?;
+                checked_mul_usize(chunk_elements, elem_size, "chunk byte size")?
+            };
+            let (addr, end) = checked_byte_range(entry.address, size, "chunk byte range")?;
+            if end > self.file_data.len() {
+                return Err(Error::OffsetOutOfBounds(entry.address));
+            }
+            let raw = &self.file_data[addr..end];
 
-        let addr = entry.address as usize;
-        let size = if entry.size > 0 {
-            entry.size as usize
-        } else {
-            chunk_shape.iter().product::<u64>() as usize * elem_size
-        };
-        if addr + size > self.file_data.len() {
-            return Err(Error::OffsetOutOfBounds(entry.address));
-        }
-        let raw = &self.file_data[addr..addr + size];
-
-        let decoded = if let Some(ref pipeline) = self.filters {
-            filters::apply_pipeline(
-                raw,
-                &pipeline.filters,
-                entry.filter_mask,
-                elem_size,
-                Some(&self.filter_registry),
-            )?
-        } else {
-            raw.to_vec()
-        };
-
-        Ok(self.chunk_cache.insert(cache_key, decoded))
+            if let Some(ref pipeline) = self.filters {
+                filters::apply_pipeline(
+                    raw,
+                    &pipeline.filters,
+                    entry.filter_mask,
+                    elem_size,
+                    Some(&self.filter_registry),
+                )
+            } else {
+                Ok(raw.to_vec())
+            }
+        })
     }
 
     /// Chunked slice: only read chunks that overlap the selection.
@@ -1580,37 +1592,7 @@ impl<'f> Dataset<'f> {
 
         // For each overlapping chunk: decompress and copy matching elements.
         for entry in &overlapping {
-            let cache_key = crate::cache::ChunkKey {
-                dataset_addr: index_address,
-                chunk_offsets: smallvec::SmallVec::from_slice(&entry.offsets),
-            };
-
-            let chunk_data = if let Some(cached) = self.chunk_cache.get(&cache_key) {
-                cached
-            } else {
-                let addr = entry.address as usize;
-                let size = if entry.size > 0 {
-                    entry.size as usize
-                } else {
-                    chunk_shape.iter().product::<u64>() as usize * elem_size
-                };
-                if addr + size > self.file_data.len() {
-                    return Err(Error::OffsetOutOfBounds(entry.address));
-                }
-                let raw = &self.file_data[addr..addr + size];
-                let decoded = if let Some(ref pipeline) = self.filters {
-                    filters::apply_pipeline(
-                        raw,
-                        &pipeline.filters,
-                        entry.filter_mask,
-                        elem_size,
-                        Some(&self.filter_registry),
-                    )?
-                } else {
-                    raw.to_vec()
-                };
-                self.chunk_cache.insert(cache_key, decoded)
-            };
+            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
             if use_unit_stride_fast_path {
                 copy_unit_stride_chunk_overlap(
@@ -1933,7 +1915,7 @@ impl<'f> Dataset<'f> {
         &self,
         address: u64,
         size: u64,
-        selection: &SliceInfo,
+        _selection: &SliceInfo,
         resolved: &ResolvedSelection,
     ) -> Result<ArrayD<T>> {
         if resolved.result_elements == 0 {
@@ -1948,102 +1930,123 @@ impl<'f> Dataset<'f> {
         let shape = &self.dataspace.dims;
         let ndim = shape.len();
         let elem_size = dtype_element_size(&self.datatype);
-
-        // Check if this is a simple contiguous sub-range where we can compute
-        // byte offsets directly (all Slice selections with step=1 and the
-        // selection is contiguous in memory — i.e., all dimensions except the
-        // outermost select the full range).
-        let can_direct_extract = ndim > 0
-            && selection.selections.iter().enumerate().all(|(d, sel)| {
-                match sel {
-                    SliceInfoElem::Slice { step, start, end } => {
-                        if *step != 1 {
-                            return false;
-                        }
-                        // Inner dimensions (d > 0) must select the full range
-                        // for the data to be contiguous in memory.
-                        if d > 0 {
-                            *start == 0 && (*end == u64::MAX || *end >= shape[d])
-                        } else {
-                            true
-                        }
-                    }
-                    SliceInfoElem::Index(_) => {
-                        // Index on the outermost dim is fine (single row),
-                        // but on inner dims it breaks contiguity.
-                        d == 0
-                    }
-                }
-            });
-
-        if can_direct_extract {
-            // Compute the byte range to read from the mmap.
-            let row_stride: u64 = shape[1..].iter().product::<u64>().max(1);
-            let row_bytes = row_stride as usize * elem_size;
-
-            let (first_row, num_rows, result_shape) = match &selection.selections[0] {
-                SliceInfoElem::Index(idx) => {
-                    let mut rs: Vec<usize> = shape[1..].iter().map(|&d| d as usize).collect();
-                    if rs.is_empty() {
-                        rs = vec![];
-                    }
-                    (*idx, 1u64, rs)
-                }
-                SliceInfoElem::Slice { start, end, .. } => {
-                    let actual_end = if *end == u64::MAX {
-                        shape[0]
-                    } else {
-                        (*end).min(shape[0])
-                    };
-                    let count = actual_end.saturating_sub(*start);
-                    let mut rs = vec![checked_usize(count, "contiguous slice row count")?];
-                    for &dim in &shape[1..] {
-                        rs.push(checked_usize(dim, "dataset dimension")?);
-                    }
-                    (*start, count, rs)
-                }
-            };
-
-            let byte_offset = checked_usize(address, "contiguous data address")?
-                + checked_mul_usize(
-                    checked_usize(first_row, "slice row offset")?,
-                    row_bytes,
-                    "contiguous byte offset",
-                )?;
-            let total_bytes = checked_mul_usize(
-                checked_usize(num_rows, "contiguous slice row count")?,
-                row_bytes,
-                "contiguous slice size in bytes",
-            )?;
-
-            if byte_offset + total_bytes > self.file_data.len() {
-                return Err(Error::OffsetOutOfBounds(address));
-            }
-
-            let raw = &self.file_data[byte_offset..byte_offset + total_bytes];
-            let n = (total_bytes) / elem_size;
-
-            let elements = if let Some(decoded) = T::decode_vec(raw, &self.datatype, n) {
-                decoded?
-            } else {
-                let mut elements = Vec::with_capacity(n);
-                for i in 0..n {
-                    let start = i * elem_size;
-                    elements.push(T::from_bytes(
-                        &raw[start..start + elem_size],
-                        &self.datatype,
-                    )?);
-                }
-                elements
-            };
-
-            return ArrayD::from_shape_vec(IxDyn(&result_shape), elements)
-                .map_err(|e| Error::InvalidData(format!("contiguous slice shape error: {e}")));
+        let result_total_bytes = checked_mul_usize(
+            resolved.result_elements,
+            elem_size,
+            "contiguous slice result size in bytes",
+        )?;
+        let storage_len = checked_usize(size, "contiguous dataset size")?;
+        let (storage_start, storage_end) =
+            checked_byte_range(address, storage_len, "contiguous dataset byte range")?;
+        if storage_end > self.file_data.len() {
+            return Err(Error::OffsetOutOfBounds(address));
+        }
+        let raw = &self.file_data[storage_start..storage_end];
+        let dataset_strides = row_major_strides(shape, "contiguous dataset stride")?;
+        let result_dims = resolved.result_dims_with_collapsed();
+        let zero_offsets = vec![0u64; ndim];
+        let mut result_strides = vec![1usize; ndim];
+        for d in (0..ndim.saturating_sub(1)).rev() {
+            result_strides[d] =
+                checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
         }
 
-        // Fallback: read full data then slice.
-        let full = self.read_contiguous::<T>(address, size)?;
-        slice_array(&full, selection, &self.dataspace.dims)
+        if resolved.is_unit_stride() {
+            if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
+                let mut result_values: Vec<MaybeUninit<T>> =
+                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
+                        .take(resolved.result_elements)
+                        .collect();
+                let flat = FlatBufferPtr {
+                    ptr: result_values.as_mut_ptr() as *mut u8,
+                    len: checked_mul_usize(
+                        result_values.len(),
+                        std::mem::size_of::<T>(),
+                        "typed contiguous slice size in bytes",
+                    )?,
+                };
+
+                unsafe {
+                    copy_unit_stride_chunk_overlap_ptr(
+                        raw,
+                        flat,
+                        UnitStrideCopyLayout {
+                            chunk_offsets: &zero_offsets,
+                            chunk_shape: shape,
+                            dataset_shape: shape,
+                            resolved,
+                            chunk_strides: &dataset_strides,
+                            result_strides: &result_strides,
+                            elem_size,
+                        },
+                    )?;
+                }
+
+                let result_values = assume_init_vec(result_values);
+                return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
+                    .map_err(|e| Error::InvalidData(format!("contiguous slice shape error: {e}")));
+            }
+
+            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
+            unsafe {
+                copy_unit_stride_chunk_overlap_ptr(
+                    raw,
+                    FlatBufferPtr {
+                        ptr: result_buf.as_mut_ptr() as *mut u8,
+                        len: result_buf.len(),
+                    },
+                    UnitStrideCopyLayout {
+                        chunk_offsets: &zero_offsets,
+                        chunk_shape: shape,
+                        dataset_shape: shape,
+                        resolved,
+                        chunk_strides: &dataset_strides,
+                        result_strides: &result_strides,
+                        elem_size,
+                    },
+                )?;
+            }
+
+            let result_buf = assume_init_u8_vec(result_buf);
+            return self.decode_buffer_with_shape::<T>(
+                &result_buf,
+                resolved.result_elements,
+                &resolved.result_shape,
+            );
+        }
+
+        let mut result_buf = self.make_output_buffer(result_total_bytes);
+        let mut dim_indices: Vec<Vec<(usize, usize)>> = Vec::with_capacity(ndim);
+        for dim in &resolved.dims {
+            let mut indices = Vec::with_capacity(dim.count);
+            let mut sel_idx = dim.start;
+            while sel_idx < dim.end {
+                let src_idx = checked_usize(sel_idx, "contiguous selection source index")?;
+                let result_idx = checked_usize(
+                    (sel_idx - dim.start) / dim.step,
+                    "contiguous selection result index",
+                )?;
+                indices.push((src_idx, result_idx));
+                sel_idx = sel_idx.saturating_add(dim.step);
+            }
+            dim_indices.push(indices);
+        }
+
+        copy_selected_elements(
+            raw,
+            &mut result_buf,
+            &dim_indices,
+            &dataset_strides,
+            &result_strides,
+            elem_size,
+            ndim,
+        );
+
+        self.decode_buffer_with_shape::<T>(
+            &result_buf,
+            resolved.result_elements,
+            &resolved.result_shape,
+        )
     }
 
     fn read_compact_slice<T: H5Type>(

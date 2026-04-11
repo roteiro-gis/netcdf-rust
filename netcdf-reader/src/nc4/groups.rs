@@ -47,9 +47,9 @@ fn visible_dim_addr_map(
 }
 
 /// Build the root NcGroup from an HDF5 file.
-pub fn build_root_group(hdf5: &Hdf5File) -> Result<NcGroup> {
+pub fn build_root_group(hdf5: &Hdf5File, metadata_mode: crate::NcMetadataMode) -> Result<NcGroup> {
     let root = hdf5.root_group()?;
-    build_group_recursive(&root, "/", &[], &HashMap::new())
+    build_group_recursive(&root, "/", &[], &HashMap::new(), metadata_mode)
 }
 
 /// Recursively build an NcGroup from an HDF5 Group.
@@ -58,6 +58,7 @@ fn build_group_recursive(
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<NcGroup> {
     let (hdf5_children, datasets) = hdf5_group.members()?;
 
@@ -65,7 +66,7 @@ fn build_group_recursive(
     // with dimensions inherited from ancestor groups for lookups and variable
     // reconstruction.
     let (local_dimensions, local_dim_addr_map) =
-        dimensions::extract_dimensions_from_datasets(&datasets)?;
+        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
     let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
     let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
 
@@ -75,10 +76,11 @@ fn build_group_recursive(
         hdf5_group,
         &visible_dimensions,
         &visible_dim_addr_map,
+        metadata_mode,
     )?;
 
     // Extract group-level attributes, filtering internal NetCDF-4 attributes.
-    let nc_attributes = attributes::extract_group_attributes(hdf5_group)?;
+    let nc_attributes = attributes::extract_group_attributes(hdf5_group, metadata_mode)?;
 
     // Recurse into child groups.
     let mut child_groups = Vec::new();
@@ -89,6 +91,7 @@ fn build_group_recursive(
             &child_name,
             &visible_dimensions,
             &visible_dim_addr_map,
+            metadata_mode,
         )?;
         child_groups.push(nc_child);
     }

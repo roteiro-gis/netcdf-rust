@@ -50,6 +50,61 @@ fn test_simple_contiguous() {
 }
 
 #[test]
+fn test_simple_contiguous_inner_window_slice() {
+    let path = skip_if_missing!("simple_contiguous.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 4,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 4,
+                step: 1,
+            },
+        ],
+    };
+
+    let sliced: ndarray::ArrayD<f64> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.shape(), &[3, 3]);
+    assert_eq!(sliced[[0, 0]], 6.0);
+    assert_eq!(sliced[[0, 2]], 8.0);
+    assert_eq!(sliced[[2, 2]], 18.0);
+}
+
+#[test]
+fn test_simple_contiguous_strided_slice() {
+    let path = skip_if_missing!("simple_contiguous.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 0,
+                end: 4,
+                step: 2,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 5,
+                step: 2,
+            },
+        ],
+    };
+
+    let sliced: ndarray::ArrayD<f64> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.shape(), &[2, 2]);
+    assert_eq!(sliced[[0, 0]], 1.0);
+    assert_eq!(sliced[[0, 1]], 3.0);
+    assert_eq!(sliced[[1, 0]], 11.0);
+    assert_eq!(sliced[[1, 1]], 13.0);
+}
+
+#[test]
 fn test_simple_chunked_deflate() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
