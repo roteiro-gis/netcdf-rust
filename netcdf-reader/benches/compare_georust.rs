@@ -590,7 +590,7 @@ fn slice_checksum_netcdf_rust_file(file: &NcFile, case: &BenchCase, slice: Slice
 }
 
 fn slice_checksum_netcdf_rust_dataset(
-    dataset: &hdf5_reader::Dataset<'_>,
+    dataset: &hdf5_reader::Dataset,
     case: &BenchCase,
     slice: SliceSpec,
 ) -> u64 {
@@ -601,10 +601,7 @@ fn slice_checksum_netcdf_rust_dataset(
     }
 }
 
-fn full_read_checksum_netcdf_rust_dataset(
-    dataset: &hdf5_reader::Dataset<'_>,
-    case: &BenchCase,
-) -> u64 {
+fn full_read_checksum_netcdf_rust_dataset(dataset: &hdf5_reader::Dataset, case: &BenchCase) -> u64 {
     match case.kind {
         NumericKind::F32 => checksum_f32(dataset.read_array::<f32>().unwrap().iter()),
         NumericKind::F64 => checksum_f64(dataset.read_array::<f64>().unwrap().iter()),
@@ -612,7 +609,7 @@ fn full_read_checksum_netcdf_rust_dataset(
 }
 
 fn full_read_checksum_netcdf_rust_dataset_in_pool(
-    dataset: &hdf5_reader::Dataset<'_>,
+    dataset: &hdf5_reader::Dataset,
     case: &BenchCase,
     pool: &rayon::ThreadPool,
 ) -> u64 {
@@ -867,7 +864,7 @@ fn parallel_metadata_batch_georust(path: &Path, threads: usize, iterations: usiz
 }
 
 fn slice_batch_netcdf_rust_dataset(
-    dataset: &hdf5_reader::Dataset<'_>,
+    dataset: &hdf5_reader::Dataset,
     case: &BenchCase,
     slice: SliceSpec,
     iterations: usize,

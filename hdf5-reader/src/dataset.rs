@@ -27,6 +27,7 @@ use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::messages::layout::{ChunkIndexing, DataLayout};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
+use crate::FileContext;
 
 const HOT_FULL_DATASET_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
@@ -57,12 +58,8 @@ struct UnitStrideCopyLayout<'a> {
     elem_size: usize,
 }
 
-pub(crate) struct DatasetParseContext<'f> {
-    pub(crate) file_data: &'f [u8],
-    pub(crate) offset_size: u8,
-    pub(crate) length_size: u8,
-    pub(crate) chunk_cache: Arc<ChunkCache>,
-    pub(crate) filter_registry: Arc<FilterRegistry>,
+pub(crate) struct DatasetParseContext {
+    pub(crate) context: Arc<FileContext>,
 }
 
 #[derive(Clone, Copy)]
@@ -217,12 +214,6 @@ fn checked_shape_elements_usize(shape: &[u64], context: &str) -> Result<usize> {
     Ok(total)
 }
 
-fn checked_byte_range(start: u64, len: usize, context: &str) -> Result<(usize, usize)> {
-    let start = checked_usize(start, context)?;
-    let end = checked_add_usize(start, len, context)?;
-    Ok((start, end))
-}
-
 fn expected_chunk_count(first_chunk: &[u64], last_chunk: &[u64]) -> Result<usize> {
     let mut total = 1usize;
     for (&first, &last) in first_chunk.iter().zip(last_chunk.iter()) {
@@ -347,10 +338,8 @@ fn normalize_selection(selection: &SliceInfo, shape: &[u64]) -> Result<ResolvedS
 }
 
 /// A dataset within an HDF5 file.
-pub struct Dataset<'f> {
-    file_data: &'f [u8],
-    offset_size: u8,
-    length_size: u8,
+pub struct Dataset {
+    context: Arc<FileContext>,
     pub(crate) name: String,
     pub(crate) data_address: u64,
     pub(crate) dataspace: DataspaceMessage,
@@ -380,19 +369,12 @@ pub(crate) struct DatasetTemplate {
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
 }
 
-impl<'f> Dataset<'f> {
-    pub(crate) fn from_template(
-        file_data: &'f [u8],
-        offset_size: u8,
-        length_size: u8,
-        template: Arc<DatasetTemplate>,
-        chunk_cache: Arc<ChunkCache>,
-        filter_registry: Arc<FilterRegistry>,
-    ) -> Self {
+impl Dataset {
+    pub(crate) fn from_template(context: Arc<FileContext>, template: Arc<DatasetTemplate>) -> Self {
         Dataset {
-            file_data,
-            offset_size,
-            length_size,
+            chunk_cache: context.chunk_cache.clone(),
+            filter_registry: context.filter_registry.clone(),
+            context,
             name: template.name.clone(),
             data_address: template.data_address,
             dataspace: template.dataspace.clone(),
@@ -401,11 +383,9 @@ impl<'f> Dataset<'f> {
             fill_value: template.fill_value.clone(),
             filters: template.filters.clone(),
             attributes: template.attributes.clone(),
-            chunk_cache,
             chunk_entry_cache: template.chunk_entry_cache.clone(),
             full_chunk_entries: template.full_chunk_entries.clone(),
             full_dataset_bytes: template.full_dataset_bytes.clone(),
-            filter_registry,
         }
     }
 
@@ -426,7 +406,7 @@ impl<'f> Dataset<'f> {
     }
 
     pub(crate) fn from_parsed_header(
-        context: DatasetParseContext<'f>,
+        context: DatasetParseContext,
         address: u64,
         name: String,
         header: &ObjectHeader,
@@ -436,11 +416,12 @@ impl<'f> Dataset<'f> {
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
+        let file_data = context.context.full_file_data()?;
         let attributes = collect_attribute_messages(
             header,
-            context.file_data,
-            context.offset_size,
-            context.length_size,
+            file_data.as_ref(),
+            context.context.superblock.offset_size,
+            context.context.superblock.length_size,
         )?;
 
         for msg in &header.messages {
@@ -474,9 +455,7 @@ impl<'f> Dataset<'f> {
         };
 
         Ok(Dataset {
-            file_data: context.file_data,
-            offset_size: context.offset_size,
-            length_size: context.length_size,
+            context: context.context.clone(),
             name,
             data_address: address,
             dataspace,
@@ -485,11 +464,11 @@ impl<'f> Dataset<'f> {
             fill_value,
             filters: filter_pipeline,
             attributes,
-            chunk_cache: context.chunk_cache,
+            chunk_cache: context.context.chunk_cache.clone(),
             chunk_entry_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap()))),
             full_chunk_entries: Arc::new(OnceLock::new()),
             full_dataset_bytes: Arc::new(OnceLock::new()),
-            filter_registry: context.filter_registry,
+            filter_registry: context.context.filter_registry.clone(),
         })
     }
 
@@ -519,6 +498,14 @@ impl<'f> Dataset<'f> {
         self.dataspace.dims.len()
     }
 
+    fn offset_size(&self) -> u8 {
+        self.context.superblock.offset_size
+    }
+
+    fn length_size(&self) -> u8 {
+        self.context.superblock.length_size
+    }
+
     /// Maximum dimension sizes, if defined. `u64::MAX` indicates unlimited.
     pub fn max_dims(&self) -> Option<&[u64]> {
         self.dataspace.max_dims.as_deref()
@@ -539,13 +526,14 @@ impl<'f> Dataset<'f> {
 
     /// Dataset attributes.
     pub fn attributes(&self) -> Vec<Attribute> {
+        let file_data = self.context.full_file_data().ok();
         self.attributes
             .iter()
             .map(|a| {
                 Attribute::from_message_with_context(
                     a.clone(),
-                    Some(self.file_data),
-                    self.offset_size,
+                    file_data.as_ref().map(|data| data.as_ref()),
+                    self.offset_size(),
                 )
             })
             .collect()
@@ -553,14 +541,15 @@ impl<'f> Dataset<'f> {
 
     /// Find an attribute by name.
     pub fn attribute(&self, name: &str) -> Result<Attribute> {
+        let file_data = self.context.full_file_data().ok();
         self.attributes
             .iter()
             .find(|a| a.name == name)
             .map(|a| {
                 Attribute::from_message_with_context(
                     a.clone(),
-                    Some(self.file_data),
-                    self.offset_size,
+                    file_data.as_ref().map(|data| data.as_ref()),
+                    self.offset_size(),
                 )
             })
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
@@ -621,7 +610,7 @@ impl<'f> Dataset<'f> {
             } => {
                 let raw = self.read_raw_bytes()?;
                 let count = checked_usize(self.num_elements(), "dataset string element count")?;
-                let ref_size = 4 + self.offset_size as usize + 4;
+                let ref_size = 4 + self.offset_size() as usize + 4;
                 let expected_bytes =
                     checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
                 if raw.len() < expected_bytes {
@@ -634,13 +623,14 @@ impl<'f> Dataset<'f> {
                 }
 
                 let mut strings = Vec::with_capacity(count);
+                let file_data = self.context.full_file_data()?;
                 for i in 0..count {
                     let offset = i * ref_size;
                     strings.push(read_one_vlen_string(
                         &raw,
                         offset,
-                        self.file_data,
-                        self.offset_size,
+                        file_data.as_ref(),
+                        self.offset_size(),
                         *padding,
                         *encoding,
                     )?);
@@ -657,7 +647,7 @@ impl<'f> Dataset<'f> {
 
                 let raw = self.read_raw_bytes()?;
                 let count = checked_usize(self.num_elements(), "dataset string element count")?;
-                let ref_size = 4 + self.offset_size as usize + 4;
+                let ref_size = 4 + self.offset_size() as usize + 4;
                 let expected_bytes =
                     checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
                 if raw.len() < expected_bytes {
@@ -670,11 +660,13 @@ impl<'f> Dataset<'f> {
                 }
 
                 let mut strings = Vec::with_capacity(count);
+                let file_data = self.context.full_file_data()?;
                 for i in 0..count {
                     let offset = i * ref_size;
                     let ref_bytes = &raw[offset..offset + ref_size];
-                    let value = resolve_vlen_bytes(ref_bytes, self.file_data, self.offset_size)
-                        .unwrap_or_default();
+                    let value =
+                        resolve_vlen_bytes(ref_bytes, file_data.as_ref(), self.offset_size())
+                            .unwrap_or_default();
                     strings.push(decode_varlen_byte_string(&value)?);
                 }
                 Ok(strings)
@@ -835,19 +827,14 @@ impl<'f> Dataset<'f> {
     }
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
-        if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
+        if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
             // Dataset with no data written — return fill values
             return self.make_fill_array::<T>();
         }
 
         let sz = checked_usize(size, "contiguous dataset size")?;
-        let (addr, end) = checked_byte_range(address, sz, "contiguous dataset byte range")?;
-        if end > self.file_data.len() {
-            return Err(Error::OffsetOutOfBounds(address));
-        }
-
-        let raw = &self.file_data[addr..end];
-        self.decode_raw_data::<T>(raw)
+        let raw = self.context.read_range(address, sz)?;
+        self.decode_raw_data::<T>(raw.as_ref())
     }
 
     fn read_contiguous_bytes(
@@ -856,17 +843,13 @@ impl<'f> Dataset<'f> {
         size: u64,
         total_bytes: usize,
     ) -> Result<Vec<u8>> {
-        if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
+        if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
             return Ok(self.make_output_buffer(total_bytes));
         }
 
         let sz = checked_usize(size, "contiguous dataset size")?;
-        let (addr, end) = checked_byte_range(address, sz, "contiguous dataset byte range")?;
-        if end > self.file_data.len() {
-            return Err(Error::OffsetOutOfBounds(address));
-        }
-
-        Ok(self.normalize_raw_bytes(&self.file_data[addr..end], total_bytes))
+        let raw = self.context.read_range(address, sz)?;
+        Ok(self.normalize_raw_bytes(raw.as_ref(), total_bytes))
     }
 
     fn read_chunked<T: H5Type>(
@@ -876,7 +859,7 @@ impl<'f> Dataset<'f> {
         _element_size: u32,
         chunk_indexing: Option<&ChunkIndexing>,
     ) -> Result<ArrayD<T>> {
-        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size()) {
             return self.make_fill_array::<T>();
         }
 
@@ -1028,7 +1011,7 @@ impl<'f> Dataset<'f> {
         chunk_indexing: Option<&ChunkIndexing>,
         total_bytes: usize,
     ) -> Result<Vec<u8>> {
-        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size()) {
             return Ok(self.make_output_buffer(total_bytes));
         }
 
@@ -1090,7 +1073,7 @@ impl<'f> Dataset<'f> {
         _element_size: u32,
         chunk_indexing: Option<&ChunkIndexing>,
     ) -> Result<ArrayD<T>> {
-        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size()) {
             return self.make_fill_array::<T>();
         }
 
@@ -1304,15 +1287,18 @@ impl<'f> Dataset<'f> {
                 *filters,
                 selection.ndim,
             )]),
-            Some(ChunkIndexing::BTreeV2) => chunk_index::collect_v2_chunk_entries(
-                self.file_data,
-                index_address,
-                self.offset_size,
-                self.length_size,
-                selection.ndim as u32,
-                chunk_dims,
-                selection.chunk_bounds,
-            ),
+            Some(ChunkIndexing::BTreeV2) => {
+                let file_data = self.context.full_file_data()?;
+                chunk_index::collect_v2_chunk_entries(
+                    file_data.as_ref(),
+                    index_address,
+                    self.offset_size(),
+                    self.length_size(),
+                    selection.ndim as u32,
+                    chunk_dims,
+                    selection.chunk_bounds,
+                )
+            }
             Some(ChunkIndexing::Implicit) => Ok(chunk_index::collect_implicit_chunk_entries(
                 index_address,
                 selection.shape,
@@ -1321,22 +1307,24 @@ impl<'f> Dataset<'f> {
                 selection.chunk_bounds,
             )),
             Some(ChunkIndexing::FixedArray { .. }) => {
+                let file_data = self.context.full_file_data()?;
                 crate::fixed_array::collect_fixed_array_chunk_entries(
-                    self.file_data,
+                    file_data.as_ref(),
                     index_address,
-                    self.offset_size,
-                    self.length_size,
+                    self.offset_size(),
+                    self.length_size(),
                     selection.shape,
                     chunk_dims,
                     selection.chunk_bounds,
                 )
             }
             Some(ChunkIndexing::ExtensibleArray { .. }) => {
+                let file_data = self.context.full_file_data()?;
                 crate::extensible_array::collect_extensible_array_chunk_entries(
-                    self.file_data,
+                    file_data.as_ref(),
                     index_address,
-                    self.offset_size,
-                    self.length_size,
+                    self.offset_size(),
+                    self.length_size(),
                     selection.shape,
                     chunk_dims,
                     selection.chunk_bounds,
@@ -1362,11 +1350,12 @@ impl<'f> Dataset<'f> {
         chunk_dims: &[u32],
         chunk_bounds: Option<(&[u64], &[u64])>,
     ) -> Result<Vec<chunk_index::ChunkEntry>> {
+        let file_data = self.context.full_file_data()?;
         let leaves = crate::btree_v1::collect_btree_v1_leaves(
-            self.file_data,
+            file_data.as_ref(),
             btree_address,
-            self.offset_size,
-            self.length_size,
+            self.offset_size(),
+            self.length_size(),
             Some(ndim as u32),
             chunk_dims,
             chunk_bounds,
@@ -1417,15 +1406,11 @@ impl<'f> Dataset<'f> {
                     checked_shape_elements_usize(chunk_shape, "chunk element count")?;
                 checked_mul_usize(chunk_elements, elem_size, "chunk byte size")?
             };
-            let (addr, end) = checked_byte_range(entry.address, size, "chunk byte range")?;
-            if end > self.file_data.len() {
-                return Err(Error::OffsetOutOfBounds(entry.address));
-            }
-            let raw = &self.file_data[addr..end];
+            let raw = self.context.read_range(entry.address, size)?;
 
             if let Some(ref pipeline) = self.filters {
                 filters::apply_pipeline(
-                    raw,
+                    raw.as_ref(),
                     &pipeline.filters,
                     entry.filter_mask,
                     elem_size,
@@ -1454,7 +1439,7 @@ impl<'f> Dataset<'f> {
             return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
         }
 
-        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size()) {
             return self
                 .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
@@ -1682,7 +1667,7 @@ impl<'f> Dataset<'f> {
             return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
         }
 
-        if Cursor::is_undefined_offset(index_address, self.offset_size) {
+        if Cursor::is_undefined_offset(index_address, self.offset_size()) {
             return self
                 .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
@@ -1922,7 +1907,7 @@ impl<'f> Dataset<'f> {
             return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
         }
 
-        if Cursor::is_undefined_offset(address, self.offset_size) || size == 0 {
+        if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
             return self
                 .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
@@ -1936,12 +1921,7 @@ impl<'f> Dataset<'f> {
             "contiguous slice result size in bytes",
         )?;
         let storage_len = checked_usize(size, "contiguous dataset size")?;
-        let (storage_start, storage_end) =
-            checked_byte_range(address, storage_len, "contiguous dataset byte range")?;
-        if storage_end > self.file_data.len() {
-            return Err(Error::OffsetOutOfBounds(address));
-        }
-        let raw = &self.file_data[storage_start..storage_end];
+        let raw = self.context.read_range(address, storage_len)?;
         let dataset_strides = row_major_strides(shape, "contiguous dataset stride")?;
         let result_dims = resolved.result_dims_with_collapsed();
         let zero_offsets = vec![0u64; ndim];
@@ -1968,7 +1948,7 @@ impl<'f> Dataset<'f> {
 
                 unsafe {
                     copy_unit_stride_chunk_overlap_ptr(
-                        raw,
+                        raw.as_ref(),
                         flat,
                         UnitStrideCopyLayout {
                             chunk_offsets: &zero_offsets,
@@ -1990,7 +1970,7 @@ impl<'f> Dataset<'f> {
             let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
             unsafe {
                 copy_unit_stride_chunk_overlap_ptr(
-                    raw,
+                    raw.as_ref(),
                     FlatBufferPtr {
                         ptr: result_buf.as_mut_ptr() as *mut u8,
                         len: result_buf.len(),
@@ -2033,7 +2013,7 @@ impl<'f> Dataset<'f> {
         }
 
         copy_selected_elements(
-            raw,
+            raw.as_ref(),
             &mut result_buf,
             &dim_indices,
             &dataset_strides,

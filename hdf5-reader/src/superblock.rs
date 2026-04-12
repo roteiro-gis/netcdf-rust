@@ -1,6 +1,7 @@
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 use crate::symbol_table::SymbolTableEntry;
 
 /// HDF5 magic bytes: `\x89HDF\r\n\x1a\n`
@@ -53,6 +54,23 @@ impl Superblock {
         match version {
             0 | 1 => Self::parse_v0_v1(cursor, version),
             2 | 3 => Self::parse_v2_v3(cursor, version, magic_offset),
+            v => Err(Error::UnsupportedSuperblockVersion(v)),
+        }
+    }
+
+    /// Parse the superblock from random-access storage.
+    pub fn parse_from_storage(storage: &dyn Storage) -> Result<Self> {
+        let magic_offset = find_magic_in_storage(storage)?;
+        let remaining = storage.len().saturating_sub(magic_offset);
+        let header_len = remaining.min(256) as usize;
+        let header = storage.read_range(magic_offset, header_len)?;
+        let mut cursor = Cursor::new(header.as_ref());
+        cursor.set_position(8);
+
+        let version = cursor.read_u8()?;
+        match version {
+            0 | 1 => Self::parse_v0_v1(&mut cursor, version),
+            2 | 3 => Self::parse_v2_v3(&mut cursor, version, 0),
             v => Err(Error::UnsupportedSuperblockVersion(v)),
         }
     }
@@ -198,6 +216,26 @@ fn find_magic(cursor: &Cursor<'_>) -> Result<u64> {
         let c = cursor.at_offset(offset)?;
         let bytes = c.peek_bytes(8)?;
         if bytes == HDF5_MAGIC {
+            return Ok(offset);
+        }
+        offset *= 2;
+    }
+
+    Err(Error::InvalidMagic)
+}
+
+fn find_magic_in_storage(storage: &dyn Storage) -> Result<u64> {
+    if storage.len() >= 8 {
+        let bytes = storage.read_range(0, 8)?;
+        if bytes.as_ref() == HDF5_MAGIC {
+            return Ok(0);
+        }
+    }
+
+    let mut offset: u64 = 512;
+    while offset + 8 <= storage.len() {
+        let bytes = storage.read_range(offset, 8)?;
+        if bytes.as_ref() == HDF5_MAGIC {
             return Ok(offset);
         }
         offset *= 2;

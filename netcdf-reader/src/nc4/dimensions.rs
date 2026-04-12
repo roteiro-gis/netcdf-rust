@@ -30,7 +30,7 @@ fn leaf_name(name: &str) -> &str {
 /// The address map is used by `extract_variables` to resolve `DIMENSION_LIST`
 /// references back to the correct dimension by address rather than by size.
 pub fn extract_dimensions(
-    group: &Group<'_>,
+    group: &Group,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let datasets = group.datasets()?;
@@ -38,7 +38,7 @@ pub fn extract_dimensions(
 }
 
 pub fn extract_dimensions_from_datasets(
-    datasets: &[hdf5_reader::Dataset<'_>],
+    datasets: &[hdf5_reader::Dataset],
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();

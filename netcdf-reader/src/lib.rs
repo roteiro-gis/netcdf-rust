@@ -34,6 +34,7 @@ pub use error::{Error, Result};
 pub use types::*;
 
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -557,13 +558,16 @@ impl NcFile {
     /// Open a NetCDF file with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: NcOpenOptions) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path)?;
-        // SAFETY: read-only mapping; caller must not modify the file concurrently.
-        let mmap = unsafe { Mmap::map(&file)? };
-        let format = detect_format(&mmap)?;
+        let mut file = File::open(path)?;
+        let mut magic = [0u8; 8];
+        let n = file.read(&mut magic)?;
+        let format = detect_format(&magic[..n])?;
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
+                let file = File::open(path)?;
+                // SAFETY: read-only mapping; caller must not modify the file concurrently.
+                let mmap = unsafe { Mmap::map(&file)? };
                 let classic = classic::ClassicFile::from_mmap(mmap, format)?;
                 Ok(NcFile {
                     format,
@@ -573,8 +577,8 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
-                    let hdf5 = hdf5_reader::Hdf5File::from_mmap_with_options(
-                        mmap,
+                    let hdf5 = hdf5_reader::Hdf5File::open_with_options(
+                        path,
                         hdf5_reader::OpenOptions {
                             chunk_cache_bytes: options.chunk_cache_bytes,
                             chunk_cache_slots: options.chunk_cache_slots,
