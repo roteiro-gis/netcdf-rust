@@ -26,7 +26,7 @@ fn leaf_name(name: &str) -> &str {
 /// `dim_addr_map` maps dimension-scale dataset addresses to their `NcDimension`,
 /// used to resolve `DIMENSION_LIST` object references.
 pub fn extract_variables(
-    group: &Group<'_>,
+    group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
@@ -36,8 +36,8 @@ pub fn extract_variables(
 }
 
 pub fn extract_variables_from_datasets(
-    datasets: &[hdf5_reader::Dataset<'_>],
-    group: &Group<'_>,
+    datasets: &[hdf5_reader::Dataset],
+    group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
@@ -56,8 +56,8 @@ pub fn extract_variables_from_datasets(
 }
 
 pub fn extract_variable(
-    ds: &hdf5_reader::Dataset<'_>,
-    group: &Group<'_>,
+    ds: &hdf5_reader::Dataset,
+    group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
@@ -119,8 +119,8 @@ pub fn extract_variable(
 /// datasets. We parse the raw attribute data to extract these references.
 ///
 fn resolve_variable_dimensions(
-    ds: &hdf5_reader::Dataset<'_>,
-    group: &Group<'_>,
+    ds: &hdf5_reader::Dataset,
+    group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
@@ -129,8 +129,8 @@ fn resolve_variable_dimensions(
 }
 
 fn resolve_variable_dimensions_with_mode(
-    ds: &hdf5_reader::Dataset<'_>,
-    group: &Group<'_>,
+    ds: &hdf5_reader::Dataset,
+    group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
@@ -146,8 +146,8 @@ fn resolve_variable_dimensions_with_mode(
 
 /// Resolve variable dimensions via the `DIMENSION_LIST` attribute.
 fn resolve_variable_dimensions_from_dimlist(
-    ds: &hdf5_reader::Dataset<'_>,
-    group: &Group<'_>,
+    ds: &hdf5_reader::Dataset,
+    group: &Group,
     dim_addr_map: &HashMap<u64, NcDimension>,
 ) -> Result<Vec<NcDimension>> {
     let attr = ds.attribute("DIMENSION_LIST").map_err(|_| {
@@ -159,7 +159,7 @@ fn resolve_variable_dimensions_from_dimlist(
     let raw_data = &attr.raw_data;
     let ndim = ds.ndim();
     let offset_size = group.offset_size();
-    let file_data = group.file_data();
+    let file_data = group.file_data()?;
 
     if ndim == 0 {
         return Ok(Vec::new());
@@ -214,7 +214,7 @@ fn resolve_variable_dimensions_from_dimlist(
         }
 
         // Parse the global heap collection at heap_addr.
-        let mut heap_cursor = hdf5_reader::io::Cursor::new(file_data);
+        let mut heap_cursor = hdf5_reader::io::Cursor::new(file_data.as_ref());
         heap_cursor.set_position(heap_addr);
         let collection = hdf5_reader::global_heap::GlobalHeapCollection::parse(
             &mut heap_cursor,
@@ -300,7 +300,7 @@ fn compute_storage_sizes(shape: &[u64], elem_size: u64, is_unlimited: bool) -> R
 /// Resolve dimensions for a variable by matching its shape against the
 /// group's dimensions. Falls back to anonymous dimensions from the shape.
 fn resolve_variable_dimensions_by_size(
-    ds: &hdf5_reader::Dataset<'_>,
+    ds: &hdf5_reader::Dataset,
     dimensions: &[NcDimension],
 ) -> Vec<NcDimension> {
     let shape = ds.shape();

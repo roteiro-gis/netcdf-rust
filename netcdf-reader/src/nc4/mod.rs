@@ -475,7 +475,7 @@ fn split_parent_path_required<'a>(path: &'a str, kind: &str) -> Result<(&'a str,
     })
 }
 
-fn dataset_nc_type(dataset: &hdf5_reader::Dataset<'_>) -> Result<NcType> {
+fn dataset_nc_type(dataset: &hdf5_reader::Dataset) -> Result<NcType> {
     self::types::hdf5_to_nc_type(dataset.dtype()).map_err(|err| {
         Error::InvalidData(format!(
             "dataset '{}' cannot be mapped to a NetCDF-4 type: {err}",

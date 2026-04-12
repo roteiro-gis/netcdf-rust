@@ -37,7 +37,7 @@ pub fn is_internal_attribute(name: &str) -> bool {
 /// Extract user-visible attributes from an HDF5 group, filtering out
 /// internal NetCDF-4 attributes.
 pub fn extract_group_attributes(
-    group: &Group<'_>,
+    group: &Group,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcAttribute>> {
     collect_visible_attributes(&group.attributes()?, metadata_mode)
@@ -46,7 +46,7 @@ pub fn extract_group_attributes(
 /// Extract user-visible attributes from an HDF5 dataset, filtering out
 /// internal attributes.
 pub fn extract_variable_attributes(
-    dataset: &hdf5_reader::Dataset<'_>,
+    dataset: &hdf5_reader::Dataset,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcAttribute>> {
     collect_visible_attributes(&dataset.attributes(), metadata_mode)

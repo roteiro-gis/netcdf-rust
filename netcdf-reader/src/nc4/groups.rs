@@ -15,8 +15,8 @@ use super::attributes;
 use super::dimensions;
 use super::variables;
 
-pub(crate) struct GroupContext<'f> {
-    pub(crate) group: hdf5_reader::group::Group<'f>,
+pub(crate) struct GroupContext {
+    pub(crate) group: hdf5_reader::group::Group,
     pub(crate) visible_dimensions: Vec<NcDimension>,
     pub(crate) visible_dim_addr_map: HashMap<u64, NcDimension>,
 }
@@ -114,11 +114,11 @@ pub fn build_group_at_path(
     }
 }
 
-pub(crate) fn group_context_at_path<'f>(
-    hdf5: &'f Hdf5File,
+pub(crate) fn group_context_at_path(
+    hdf5: &Hdf5File,
     path: &str,
     metadata_mode: crate::NcMetadataMode,
-) -> Result<GroupContext<'f>> {
+) -> Result<GroupContext> {
     let normalized = normalize_group_path(path);
     let root = hdf5.root_group()?;
     let mut group = root;
@@ -151,7 +151,7 @@ pub(crate) fn group_context_at_path<'f>(
 
 /// Recursively build an NcGroup from an HDF5 Group.
 fn build_group_recursive(
-    hdf5_group: &hdf5_reader::group::Group<'_>,
+    hdf5_group: &hdf5_reader::group::Group,
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
@@ -203,7 +203,7 @@ fn build_group_recursive(
 }
 
 fn build_group_metadata(
-    hdf5_group: &hdf5_reader::group::Group<'_>,
+    hdf5_group: &hdf5_reader::group::Group,
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,

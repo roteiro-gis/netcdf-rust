@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::messages::shared::SharedMessage;
 use crate::messages::{parse_message, HdfMessage};
+use crate::storage::Storage;
 
 /// Magic signature for v2 object headers.
 const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
@@ -65,6 +66,29 @@ impl ObjectHeader {
         }
     }
 
+    /// Parse an object header from random-access storage.
+    pub fn parse_at_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let prefix = storage.read_range(address, 64)?;
+        if prefix.len() < 5 {
+            return Err(Error::UnexpectedEof {
+                offset: address,
+                needed: 5,
+                available: prefix.len() as u64,
+            });
+        }
+
+        if prefix.as_ref()[..4] == OHDR_SIGNATURE {
+            Self::parse_v2_storage(storage, address, offset_size, length_size)
+        } else {
+            Self::parse_v1_storage(storage, address, offset_size, length_size)
+        }
+    }
+
     /// Resolve shared messages by following references to other object headers.
     ///
     /// For `SharedInOhdr`, the referenced object header is parsed and the first
@@ -99,6 +123,51 @@ impl ObjectHeader {
                         }
                         Err(_) => {
                             // If we can't parse the target, keep the shared ref
+                            resolved
+                                .push(HdfMessage::Shared(SharedMessage::SharedInOhdr { address }));
+                        }
+                    }
+                }
+                HdfMessage::Shared(SharedMessage::SharedInSohm { .. }) => {
+                    self.messages = resolved;
+                    return Err(Error::Other(
+                        "SOHM table lookup not yet supported — file uses shared object header messages".to_string(),
+                    ));
+                }
+                other => resolved.push(other),
+            }
+        }
+        self.messages = resolved;
+        Ok(())
+    }
+
+    /// Resolve shared messages by following references via random-access storage.
+    pub fn resolve_shared_messages_storage(
+        &mut self,
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<()> {
+        let old_messages = std::mem::take(&mut self.messages);
+        let mut resolved = Vec::with_capacity(old_messages.len());
+        for msg in old_messages {
+            match msg {
+                HdfMessage::Shared(SharedMessage::SharedInOhdr { address }) => {
+                    match Self::parse_at_storage(storage, address, offset_size, length_size) {
+                        Ok(target_header) => {
+                            for target_msg in target_header.messages {
+                                match target_msg {
+                                    HdfMessage::Nil
+                                    | HdfMessage::ObjectHeaderContinuation
+                                    | HdfMessage::Shared(_) => continue,
+                                    other => {
+                                        resolved.push(other);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
                             resolved
                                 .push(HdfMessage::Shared(SharedMessage::SharedInOhdr { address }));
                         }
@@ -170,6 +239,56 @@ impl ObjectHeader {
                 base,
                 cont_offset,
                 cont_end,
+                offset_size,
+                length_size,
+                &mut messages,
+                &mut continuations,
+            )?;
+        }
+
+        Ok(ObjectHeader {
+            version: 1,
+            messages,
+            reference_count,
+            modification_time: None,
+        })
+    }
+
+    fn parse_v1_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let header = storage.read_range(address, 16)?;
+        let mut cursor = Cursor::new(header.as_ref());
+
+        let version = cursor.read_u8()?;
+        if version != 1 {
+            return Err(Error::UnsupportedObjectHeaderVersion(version));
+        }
+
+        let _reserved = cursor.read_u8()?;
+        let num_messages = cursor.read_u16_le()?;
+        let reference_count = cursor.read_u32_le()?;
+        let header_data_size = cursor.read_u32_le()? as u64;
+        let _reserved2 = cursor.read_u32_le()?;
+
+        let first_chunk = storage.read_range(address, (16 + header_data_size) as usize)?;
+        let mut messages = Vec::with_capacity(num_messages as usize);
+        let mut continuations = Vec::new();
+        Self::read_v1_messages_from_slice(
+            &first_chunk.as_ref()[16..],
+            offset_size,
+            length_size,
+            &mut messages,
+            &mut continuations,
+        )?;
+
+        while let Some((cont_offset, cont_length)) = continuations.pop() {
+            let chunk = storage.read_range(cont_offset, cont_length as usize)?;
+            Self::read_v1_messages_from_slice(
+                chunk.as_ref(),
                 offset_size,
                 length_size,
                 &mut messages,
@@ -372,6 +491,92 @@ impl ObjectHeader {
         })
     }
 
+    fn parse_v2_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let prefix = storage.read_range(address, 64)?;
+        let mut cursor = Cursor::new(prefix.as_ref());
+
+        let sig = cursor.read_bytes(4)?;
+        if sig != OHDR_SIGNATURE {
+            return Err(Error::InvalidObjectHeaderSignature);
+        }
+        let version = cursor.read_u8()?;
+        if version != 2 {
+            return Err(Error::UnsupportedObjectHeaderVersion(version));
+        }
+        let flags = cursor.read_u8()?;
+
+        let modification_time = if (flags & 0x20) != 0 {
+            let _access_time = cursor.read_u32_le()?;
+            let mod_time = cursor.read_u32_le()?;
+            let _change_time = cursor.read_u32_le()?;
+            let _birth_time = cursor.read_u32_le()?;
+            Some(mod_time)
+        } else {
+            None
+        };
+
+        if (flags & 0x10) != 0 {
+            let _max_compact = cursor.read_u16_le()?;
+            let _min_dense = cursor.read_u16_le()?;
+        }
+
+        let size_field_width = 1usize << (flags & 0x03);
+        let chunk0_data_size = cursor.read_uvar(size_field_width)?;
+        let creation_order_tracked = (flags & 0x04) != 0;
+        let messages_start = cursor.position() as usize;
+        let chunk0_end = messages_start + chunk0_data_size as usize;
+
+        let chunk = storage.read_range(address, chunk0_end + 4)?;
+        let stored_checksum = u32::from_le_bytes(
+            chunk.as_ref()[chunk0_end..chunk0_end + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let computed = jenkins_lookup3(&chunk.as_ref()[..chunk0_end]);
+        if computed != stored_checksum {
+            return Err(Error::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed,
+            });
+        }
+
+        let mut messages = Vec::new();
+        let mut continuations = Vec::new();
+        Self::read_v2_messages_from_slice(
+            &chunk.as_ref()[messages_start..chunk0_end],
+            offset_size,
+            length_size,
+            creation_order_tracked,
+            &mut messages,
+            &mut continuations,
+        )?;
+
+        while let Some((cont_offset, cont_length)) = continuations.pop() {
+            Self::read_v2_continuation_chunk_storage(
+                storage,
+                cont_offset,
+                cont_length,
+                offset_size,
+                length_size,
+                creation_order_tracked,
+                &mut messages,
+                &mut continuations,
+            )?;
+        }
+
+        Ok(ObjectHeader {
+            version: 2,
+            messages,
+            reference_count: 0,
+            modification_time,
+        })
+    }
+
     /// Read v2 messages from `start..end`.
     #[allow(clippy::too_many_arguments)]
     fn read_v2_messages(
@@ -452,6 +657,179 @@ impl ObjectHeader {
         }
 
         Ok(())
+    }
+
+    fn read_v1_messages_from_slice(
+        data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+        messages: &mut Vec<HdfMessage>,
+        continuations: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let mut cursor = Cursor::new(data);
+        while cursor.remaining() >= 8 {
+            let msg_type = cursor.read_u16_le()?;
+            let msg_data_size = cursor.read_u16_le()? as usize;
+            let msg_flags = cursor.read_u8()?;
+            let _reserved = cursor.read_bytes(3)?;
+
+            if cursor.remaining() < msg_data_size as u64 {
+                return Err(Error::InvalidData(format!(
+                    "v1 message data ({} bytes) extends past header chunk end",
+                    msg_data_size
+                )));
+            }
+
+            if msg_type == MSG_TYPE_NIL {
+                cursor.skip(msg_data_size)?;
+                messages.push(HdfMessage::Nil);
+                continue;
+            }
+
+            let msg_data = cursor.read_bytes(msg_data_size)?;
+            let is_shared = (msg_flags & 0x02) != 0;
+            if is_shared {
+                let shared_msg = crate::messages::shared::parse(
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                    msg_data_size,
+                )?;
+                messages.push(HdfMessage::Shared(shared_msg));
+            } else if msg_type == MSG_TYPE_CONTINUATION {
+                let cont = crate::messages::continuation::parse(
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                    msg_data_size,
+                )?;
+                continuations.push((cont.offset, cont.length));
+                messages.push(HdfMessage::ObjectHeaderContinuation);
+            } else {
+                let parsed = parse_message(
+                    msg_type,
+                    msg_data.len(),
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                )?;
+                messages.push(parsed);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_v2_messages_from_slice(
+        data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+        creation_order_tracked: bool,
+        messages: &mut Vec<HdfMessage>,
+        continuations: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let mut cursor = Cursor::new(data);
+        let min_envelope = if creation_order_tracked { 6 } else { 4 };
+
+        while cursor.remaining() >= min_envelope as u64 {
+            let msg_type = cursor.read_u8()? as u16;
+            let msg_data_size = cursor.read_u16_le()? as usize;
+            let msg_flags = cursor.read_u8()?;
+
+            if creation_order_tracked {
+                let _creation_order = cursor.read_u16_le()?;
+            }
+
+            if msg_type == MSG_TYPE_NIL {
+                if msg_data_size == 0
+                    && data[cursor.position() as usize..]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    break;
+                }
+                cursor.skip(msg_data_size)?;
+                messages.push(HdfMessage::Nil);
+                continue;
+            }
+
+            if cursor.remaining() < msg_data_size as u64 {
+                return Err(Error::InvalidData(format!(
+                    "v2 message data ({} bytes) extends past chunk end",
+                    msg_data_size
+                )));
+            }
+
+            let msg_data = cursor.read_bytes(msg_data_size)?;
+            let is_shared = (msg_flags & 0x02) != 0;
+            if is_shared {
+                let shared_msg = crate::messages::shared::parse(
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                    msg_data_size,
+                )?;
+                messages.push(HdfMessage::Shared(shared_msg));
+            } else if msg_type == MSG_TYPE_CONTINUATION {
+                let cont = crate::messages::continuation::parse(
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                    msg_data_size,
+                )?;
+                continuations.push((cont.offset, cont.length));
+                messages.push(HdfMessage::ObjectHeaderContinuation);
+            } else {
+                let parsed = parse_message(
+                    msg_type,
+                    msg_data.len(),
+                    &mut Cursor::new(msg_data),
+                    offset_size,
+                    length_size,
+                )?;
+                messages.push(parsed);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_v2_continuation_chunk_storage(
+        storage: &dyn Storage,
+        cont_offset: u64,
+        cont_length: u64,
+        offset_size: u8,
+        length_size: u8,
+        creation_order_tracked: bool,
+        messages: &mut Vec<HdfMessage>,
+        continuations: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let chunk = storage.read_range(cont_offset, cont_length as usize)?;
+        if chunk.len() < 8 || chunk.as_ref()[..4] != OCHK_SIGNATURE {
+            return Err(Error::InvalidObjectHeaderSignature);
+        }
+        let messages_end = chunk.len() - 4;
+        let stored_checksum = u32::from_le_bytes(
+            chunk.as_ref()[messages_end..messages_end + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let computed = jenkins_lookup3(&chunk.as_ref()[..messages_end]);
+        if computed != stored_checksum {
+            return Err(Error::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed,
+            });
+        }
+
+        Self::read_v2_messages_from_slice(
+            &chunk.as_ref()[4..messages_end],
+            offset_size,
+            length_size,
+            creation_order_tracked,
+            messages,
+            continuations,
+        )
     }
 
     /// Read and verify a v2 continuation chunk (`OCHK`).

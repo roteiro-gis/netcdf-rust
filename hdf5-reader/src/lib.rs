@@ -26,6 +26,7 @@ pub mod dataset;
 pub mod datatype_api;
 pub mod group;
 pub mod reference;
+pub mod storage;
 
 // Filters
 pub mod filters;
@@ -35,7 +36,7 @@ pub mod cache;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use memmap2::Mmap;
 // parking_lot::Mutex used via fully-qualified paths in HeaderCache and constructors.
@@ -43,8 +44,8 @@ use memmap2::Mmap;
 use cache::ChunkCache;
 use error::{Error, Result};
 use group::Group;
-use io::Cursor;
 use object_header::ObjectHeader;
+use storage::DynStorage;
 use superblock::Superblock;
 
 // Re-exports
@@ -58,6 +59,7 @@ pub use datatype_api::{
 pub use error::ByteOrder;
 pub use filters::FilterRegistry;
 pub use messages::datatype::Datatype;
+pub use storage::{BytesStorage, FileStorage, MmapStorage, Storage, StorageBuffer};
 
 /// Configuration options for opening an HDF5 file.
 pub struct OpenOptions {
@@ -84,41 +86,74 @@ pub type HeaderCache = Arc<parking_lot::Mutex<HashMap<u64, Arc<ObjectHeader>>>>;
 
 /// An opened HDF5 file.
 ///
-/// This is the main entry point for reading HDF5 files. The file data is
-/// memory-mapped for efficient access.
+/// This is the main entry point for reading HDF5 files. Storage is random-
+/// access and range-based, so metadata and data reads do not require an eager
+/// whole-file mapping.
 pub struct Hdf5File {
-    /// Memory-mapped file data (or owned bytes for `from_bytes`).
-    data: FileData,
-    /// Parsed superblock.
-    superblock: Superblock,
-    /// Shared chunk cache.
-    chunk_cache: Arc<ChunkCache>,
-    /// Object header cache — avoids re-parsing the same header.
-    header_cache: HeaderCache,
-    /// Dataset path cache — avoids repeated path traversal and metadata rebuilds.
-    dataset_path_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<DatasetTemplate>>>>,
-    /// Filter registry for decompression — users can register custom filters.
-    filter_registry: Arc<FilterRegistry>,
+    context: Arc<FileContext>,
 }
 
-enum FileData {
-    Mmap(Mmap),
-    Bytes(Vec<u8>),
+pub(crate) struct FileContext {
+    pub(crate) storage: DynStorage,
+    pub(crate) superblock: Superblock,
+    pub(crate) chunk_cache: Arc<ChunkCache>,
+    pub(crate) header_cache: HeaderCache,
+    pub(crate) dataset_path_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<DatasetTemplate>>>>,
+    pub(crate) filter_registry: Arc<FilterRegistry>,
+    full_file_cache: OnceLock<StorageBuffer>,
 }
 
-impl FileData {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            FileData::Mmap(m) => m,
-            FileData::Bytes(b) => b,
+impl FileContext {
+    pub(crate) fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
+        self.storage.read_range(offset, len)
+    }
+
+    pub(crate) fn full_file_data(&self) -> Result<StorageBuffer> {
+        if let Some(buffer) = self.full_file_cache.get() {
+            return Ok(buffer.clone());
         }
+
+        let len = usize::try_from(self.storage.len()).map_err(|_| {
+            Error::InvalidData("file size exceeds platform usize capacity".to_string())
+        })?;
+        let buffer = self.storage.read_range(0, len)?;
+        let _ = self.full_file_cache.set(buffer);
+        Ok(self
+            .full_file_cache
+            .get()
+            .expect("full-file buffer must exist after successful initialization")
+            .clone())
+    }
+
+    pub(crate) fn get_or_parse_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
+        {
+            let cache = self.header_cache.lock();
+            if let Some(hdr) = cache.get(&addr) {
+                return Ok(Arc::clone(hdr));
+            }
+        }
+
+        let mut hdr = ObjectHeader::parse_at_storage(
+            self.storage.as_ref(),
+            addr,
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )?;
+        hdr.resolve_shared_messages_storage(
+            self.storage.as_ref(),
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )?;
+        let arc = Arc::new(hdr);
+        let mut cache = self.header_cache.lock();
+        cache.insert(addr, Arc::clone(&arc));
+        Ok(arc)
     }
 }
 
 impl Hdf5File {
-    fn from_file_data(data: FileData, options: OpenOptions) -> Result<Self> {
-        let mut cursor = Cursor::new(data.as_slice());
-        let superblock = Superblock::parse(&mut cursor)?;
+    fn from_storage_impl(storage: DynStorage, options: OpenOptions) -> Result<Self> {
+        let superblock = Superblock::parse_from_storage(storage.as_ref())?;
         let cache = Arc::new(ChunkCache::new(
             options.chunk_cache_bytes,
             options.chunk_cache_slots,
@@ -126,12 +161,15 @@ impl Hdf5File {
         let registry = options.filter_registry.unwrap_or_default();
 
         Ok(Hdf5File {
-            data,
-            superblock,
-            chunk_cache: cache,
-            header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            filter_registry: Arc::new(registry),
+            context: Arc::new(FileContext {
+                storage,
+                superblock,
+                chunk_cache: cache,
+                header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+                filter_registry: Arc::new(registry),
+                full_file_cache: OnceLock::new(),
+            }),
         })
     }
 
@@ -142,12 +180,7 @@ impl Hdf5File {
 
     /// Open an HDF5 file with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
-        let file = std::fs::File::open(path.as_ref())?;
-        // SAFETY: We only read from the mapping, and the file isn't modified
-        // while we hold the mapping. The caller is responsible for not
-        // modifying the file concurrently.
-        let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_mmap_with_options(mmap, options)
+        Self::from_storage_with_options(Arc::new(FileStorage::open(path)?), options)
     }
 
     /// Open an HDF5 file from an in-memory byte slice.
@@ -171,69 +204,52 @@ impl Hdf5File {
 
     /// Open an HDF5 file from an owned byte vector with custom options.
     pub fn from_vec_with_options(data: Vec<u8>, options: OpenOptions) -> Result<Self> {
-        Self::from_file_data(FileData::Bytes(data), options)
+        Self::from_storage_with_options(Arc::new(BytesStorage::new(data)), options)
     }
 
     /// Open an HDF5 file from an existing memory map with custom options.
     ///
     /// This avoids remapping when the caller already owns a read-only mapping.
     pub fn from_mmap_with_options(mmap: Mmap, options: OpenOptions) -> Result<Self> {
-        Self::from_file_data(FileData::Mmap(mmap), options)
+        Self::from_storage_with_options(Arc::new(MmapStorage::new(mmap)), options)
+    }
+
+    /// Open an HDF5 file from a custom random-access storage backend.
+    pub fn from_storage(storage: DynStorage) -> Result<Self> {
+        Self::from_storage_with_options(storage, OpenOptions::default())
+    }
+
+    /// Open an HDF5 file from a custom random-access storage backend.
+    pub fn from_storage_with_options(storage: DynStorage, options: OpenOptions) -> Result<Self> {
+        Self::from_storage_impl(storage, options)
     }
 
     /// Get the parsed superblock.
     pub fn superblock(&self) -> &Superblock {
-        &self.superblock
+        &self.context.superblock
     }
 
     /// Look up or parse an object header at the given address.
     ///
     /// Uses the internal cache to avoid re-parsing the same header.
     pub fn get_or_parse_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
-        {
-            let cache = self.header_cache.lock();
-            if let Some(hdr) = cache.get(&addr) {
-                return Ok(Arc::clone(hdr));
-            }
-        }
-        let data = self.data.as_slice();
-        let mut hdr = ObjectHeader::parse_at(
-            data,
-            addr,
-            self.superblock.offset_size,
-            self.superblock.length_size,
-        )?;
-        hdr.resolve_shared_messages(
-            data,
-            self.superblock.offset_size,
-            self.superblock.length_size,
-        )?;
-        let arc = Arc::new(hdr);
-        let mut cache = self.header_cache.lock();
-        cache.insert(addr, Arc::clone(&arc));
-        Ok(arc)
+        self.context.get_or_parse_header(addr)
     }
 
     /// Get the root group of the file.
-    pub fn root_group(&self) -> Result<Group<'_>> {
-        let data = self.data.as_slice();
-        let addr = self.superblock.root_object_header_address()?;
+    pub fn root_group(&self) -> Result<Group> {
+        let addr = self.context.superblock.root_object_header_address()?;
 
         Ok(Group::new(
-            data,
+            self.context.clone(),
             addr,
             "/".to_string(),
-            self.superblock.offset_size,
-            self.superblock.length_size,
             addr, // root_address = self
-            self.chunk_cache.clone(),
-            self.header_cache.clone(),
-            self.filter_registry.clone(),
         ))
     }
 
     /// Convenience: get a dataset at a path like "/group1/dataset".
-    pub fn dataset(&self, path: &str) -> Result<Dataset<'_>> {
+    pub fn dataset(&self, path: &str) -> Result<Dataset> {
         let parts: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
@@ -246,19 +262,13 @@ impl Hdf5File {
         }
 
         if let Some(template) = self
+            .context
             .dataset_path_cache
             .lock()
             .get(&normalized_path)
             .cloned()
         {
-            return Ok(Dataset::from_template(
-                self.data.as_slice(),
-                self.superblock.offset_size,
-                self.superblock.length_size,
-                template,
-                self.chunk_cache.clone(),
-                self.filter_registry.clone(),
-            ));
+            return Ok(Dataset::from_template(self.context.clone(), template));
         }
 
         let mut group = self.root_group()?;
@@ -269,14 +279,15 @@ impl Hdf5File {
         let dataset = group
             .dataset(parts[parts.len() - 1])
             .map_err(|e| e.with_context(path))?;
-        self.dataset_path_cache
+        self.context
+            .dataset_path_cache
             .lock()
             .insert(normalized_path, dataset.template());
         Ok(dataset)
     }
 
     /// Convenience: get a group at a path like "/group1/subgroup".
-    pub fn group(&self, path: &str) -> Result<Group<'_>> {
+    pub fn group(&self, path: &str) -> Result<Group> {
         let parts: Vec<&str> = path
             .trim_start_matches('/')
             .split('/')
