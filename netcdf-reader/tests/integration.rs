@@ -56,9 +56,9 @@ fn test_cdf1_simple() {
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
     assert_eq!(file.format(), netcdf_reader::NcFormat::Classic);
-    assert_eq!(file.dimensions().unwrap().len(), 2);
-    assert_eq!(file.dimensions().unwrap()[0].name, "x");
-    assert_eq!(file.dimensions().unwrap()[0].size, 5);
+    assert_eq!(file.dimensions().len(), 2);
+    assert_eq!(file.dimensions()[0].name, "x");
+    assert_eq!(file.dimensions()[0].size, 5);
 
     let var = file.variable("temp").unwrap();
     assert_eq!(var.shape(), vec![5, 10]);
@@ -112,10 +112,10 @@ fn test_nc4_basic() {
         netcdf_reader::NcFormat::Nc4 | netcdf_reader::NcFormat::Nc4Classic
     ));
 
-    let dims = file.dimensions().unwrap();
+    let dims = file.dimensions();
     assert!(dims.len() >= 2);
 
-    let vars = file.variables().unwrap();
+    let vars = file.variables();
     assert!(!vars.is_empty());
 }
 

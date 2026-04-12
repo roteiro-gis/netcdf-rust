@@ -13,7 +13,7 @@
 //!
 //! let file = NcFile::open("example.nc").unwrap();
 //! println!("format: {:?}", file.format());
-//! for var in file.variables().unwrap() {
+//! for var in file.variables() {
 //!     println!("  variable: {} shape={:?}", var.name(), var.shape());
 //! }
 //! ```
@@ -191,46 +191,78 @@ impl NcFile {
     }
 
     /// Convenience: dimensions in the root group.
-    pub fn dimensions(&self) -> Result<&[NcDimension]> {
-        Ok(&self.root_group()?.dimensions)
+    pub fn dimensions(&self) -> &[NcDimension] {
+        match &self.inner {
+            NcFileInner::Classic(c) => &c.root_group().dimensions,
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.dimensions(),
+        }
     }
 
     /// Convenience: variables in the root group.
-    pub fn variables(&self) -> Result<&[NcVariable]> {
-        Ok(&self.root_group()?.variables)
+    pub fn variables(&self) -> &[NcVariable] {
+        match &self.inner {
+            NcFileInner::Classic(c) => &c.root_group().variables,
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.variables(),
+        }
     }
 
     /// Convenience: global attributes (attributes of the root group).
-    pub fn global_attributes(&self) -> Result<&[NcAttribute]> {
-        Ok(&self.root_group()?.attributes)
+    pub fn global_attributes(&self) -> &[NcAttribute] {
+        match &self.inner {
+            NcFileInner::Classic(c) => &c.root_group().attributes,
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.global_attributes(),
+        }
     }
 
     /// Find a group by path relative to the root group.
     pub fn group(&self, path: &str) -> Result<&NcGroup> {
-        self.root_group()?
-            .group(path)
-            .ok_or_else(|| Error::GroupNotFound(path.to_string()))
+        match &self.inner {
+            NcFileInner::Classic(c) => c
+                .root_group()
+                .group(path)
+                .ok_or_else(|| Error::GroupNotFound(path.to_string())),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.group(path),
+        }
     }
 
     /// Find a variable by name or path relative to the root group.
     pub fn variable(&self, name: &str) -> Result<&NcVariable> {
-        self.root_group()?
-            .variable(name)
-            .ok_or_else(|| Error::VariableNotFound(name.to_string()))
+        match &self.inner {
+            NcFileInner::Classic(c) => c
+                .root_group()
+                .variable(name)
+                .ok_or_else(|| Error::VariableNotFound(name.to_string())),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.variable(name),
+        }
     }
 
     /// Find a dimension by name or path relative to the root group.
     pub fn dimension(&self, name: &str) -> Result<&NcDimension> {
-        self.root_group()?
-            .dimension(name)
-            .ok_or_else(|| Error::DimensionNotFound(name.to_string()))
+        match &self.inner {
+            NcFileInner::Classic(c) => c
+                .root_group()
+                .dimension(name)
+                .ok_or_else(|| Error::DimensionNotFound(name.to_string())),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.dimension(name),
+        }
     }
 
     /// Find a group attribute by name or path relative to the root group.
     pub fn global_attribute(&self, name: &str) -> Result<&NcAttribute> {
-        self.root_group()?
-            .attribute(name)
-            .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
+        match &self.inner {
+            NcFileInner::Classic(c) => c
+                .root_group()
+                .attribute(name)
+                .ok_or_else(|| Error::AttributeNotFound(name.to_string())),
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => n.global_attribute(name),
+        }
     }
 
     /// Read a variable's data as a typed array.
@@ -549,7 +581,7 @@ impl NcFile {
                             filter_registry: options.filter_registry,
                         },
                     )?;
-                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, options.metadata_mode);
+                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, options.metadata_mode)?;
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
@@ -686,9 +718,9 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert!(file.dimensions().unwrap().is_empty());
-        assert!(file.variables().unwrap().is_empty());
-        assert!(file.global_attributes().unwrap().is_empty());
+        assert!(file.dimensions().is_empty());
+        assert!(file.variables().is_empty());
+        assert!(file.global_attributes().is_empty());
     }
 
     #[test]
@@ -749,21 +781,18 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert_eq!(file.dimensions().unwrap().len(), 1);
-        assert_eq!(file.dimensions().unwrap()[0].name, "x");
-        assert_eq!(file.dimensions().unwrap()[0].size, 3);
+        assert_eq!(file.dimensions().len(), 1);
+        assert_eq!(file.dimensions()[0].name, "x");
+        assert_eq!(file.dimensions()[0].size, 3);
 
-        assert_eq!(file.global_attributes().unwrap().len(), 1);
-        assert_eq!(file.global_attributes().unwrap()[0].name, "title");
+        assert_eq!(file.global_attributes().len(), 1);
+        assert_eq!(file.global_attributes()[0].name, "title");
         assert_eq!(
-            file.global_attributes().unwrap()[0]
-                .value
-                .as_string()
-                .unwrap(),
+            file.global_attributes()[0].value.as_string().unwrap(),
             "test"
         );
 
-        assert_eq!(file.variables().unwrap().len(), 1);
+        assert_eq!(file.variables().len(), 1);
         let var = file.variable("vals").unwrap();
         assert_eq!(var.dtype(), &NcType::Float);
         assert_eq!(var.shape(), vec![3]);
