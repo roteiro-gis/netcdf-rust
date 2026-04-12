@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use lru::LruCache;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
-use std::num::NonZeroUsize;
+
+use crate::error::Result;
 
 /// Key for the chunk cache: (dataset object header address, chunk offset tuple).
 ///
@@ -27,6 +30,12 @@ pub struct ChunkCache {
 struct ChunkCacheState {
     cache: LruCache<ChunkKey, Arc<Vec<u8>>>,
     current_bytes: usize,
+    in_flight: HashMap<ChunkKey, Arc<InFlightLoad>>,
+}
+
+struct InFlightLoad {
+    completed: Mutex<bool>,
+    ready: Condvar,
 }
 
 impl ChunkCache {
@@ -40,6 +49,7 @@ impl ChunkCache {
             inner: Mutex::new(ChunkCacheState {
                 cache: LruCache::new(slots),
                 current_bytes: 0,
+                in_flight: HashMap::new(),
             }),
             max_bytes,
         }
@@ -68,10 +78,54 @@ impl ChunkCache {
             }
         }
 
+        if let Some(replaced) = state.cache.peek(&key) {
+            state.current_bytes = state.current_bytes.saturating_sub(replaced.len());
+        }
         state.current_bytes += data_len;
         state.cache.put(key, arc.clone());
 
         arc
+    }
+
+    /// Return a cached chunk or compute it once across concurrent callers.
+    pub fn get_or_insert_with<F>(&self, key: ChunkKey, load: F) -> Result<Arc<Vec<u8>>>
+    where
+        F: FnOnce() -> Result<Vec<u8>>,
+    {
+        loop {
+            let in_flight = {
+                let mut state = self.inner.lock();
+                if let Some(cached) = state.cache.get(&key).cloned() {
+                    return Ok(cached);
+                }
+
+                if let Some(in_flight) = state.in_flight.get(&key) {
+                    Arc::clone(in_flight)
+                } else {
+                    let in_flight = Arc::new(InFlightLoad {
+                        completed: Mutex::new(false),
+                        ready: Condvar::new(),
+                    });
+                    state.in_flight.insert(key.clone(), Arc::clone(&in_flight));
+                    drop(state);
+
+                    let result = load().map(|data| self.insert(key.clone(), data));
+
+                    let mut state = self.inner.lock();
+                    state.in_flight.remove(&key);
+                    let mut completed = in_flight.completed.lock();
+                    *completed = true;
+                    in_flight.ready.notify_all();
+
+                    return result;
+                }
+            };
+
+            let mut completed = in_flight.completed.lock();
+            while !*completed {
+                in_flight.ready.wait(&mut completed);
+            }
+        }
     }
 }
 
@@ -160,5 +214,58 @@ mod tests {
 
         assert!(cache.get(&key_a).is_some()); // a was promoted, should survive
         assert!(cache.get(&key_b).is_none()); // b was LRU, should be evicted
+    }
+
+    #[test]
+    fn test_cache_replacement_updates_accounting() {
+        let cache = ChunkCache::new(8, 10);
+        let key = ChunkKey {
+            dataset_addr: 100,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+
+        cache.insert(key.clone(), vec![1, 2, 3, 4]);
+        cache.insert(key.clone(), vec![5, 6]);
+
+        let other = ChunkKey {
+            dataset_addr: 100,
+            chunk_offsets: SmallVec::from_vec(vec![1]),
+        };
+        cache.insert(other.clone(), vec![7, 8, 9, 10]);
+
+        assert_eq!(&**cache.get(&key).unwrap(), &[5, 6]);
+        assert!(cache.get(&other).is_some());
+    }
+
+    #[test]
+    fn test_cache_get_or_insert_with_deduplicates_concurrent_loads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = Arc::new(ChunkCache::new(1024, 10));
+        let key = ChunkKey {
+            dataset_addr: 100,
+            chunk_offsets: SmallVec::from_vec(vec![0, 0]),
+        };
+        let load_count = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let load_count = Arc::clone(&load_count);
+                scope.spawn(move || {
+                    let value = cache
+                        .get_or_insert_with(key, || {
+                            load_count.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            Ok(vec![1, 2, 3, 4])
+                        })
+                        .unwrap();
+                    assert_eq!(&*value, &[1, 2, 3, 4]);
+                });
+            }
+        });
+
+        assert_eq!(load_count.load(Ordering::SeqCst), 1);
     }
 }

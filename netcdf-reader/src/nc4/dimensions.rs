@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use hdf5_reader::group::Group;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::NcDimension;
 
 fn leaf_name(name: &str) -> &str {
@@ -31,47 +31,59 @@ fn leaf_name(name: &str) -> &str {
 /// references back to the correct dimension by address rather than by size.
 pub fn extract_dimensions(
     group: &Group<'_>,
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
-    let datasets = match group.datasets() {
-        Ok(ds) => ds,
-        Err(_) => return Ok((Vec::new(), HashMap::new())),
-    };
-    extract_dimensions_from_datasets(&datasets)
+    let datasets = group.datasets()?;
+    extract_dimensions_from_datasets(&datasets, metadata_mode)
 }
 
 pub fn extract_dimensions_from_datasets(
     datasets: &[hdf5_reader::Dataset<'_>],
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
+    let strict = metadata_mode == crate::NcMetadataMode::Strict;
 
     for ds in datasets {
         // Check for CLASS=DIMENSION_SCALE attribute
-        let is_dim_scale = ds
-            .attribute("CLASS")
-            .ok()
-            .and_then(|attr| attr.read_string().ok())
-            .map(|s| s == "DIMENSION_SCALE")
-            .unwrap_or(false);
+        let is_dim_scale = match ds.attribute("CLASS") {
+            Ok(attr) => match attr.read_string() {
+                Ok(value) => value == "DIMENSION_SCALE",
+                Err(err) if strict => {
+                    return Err(Error::InvalidData(format!(
+                        "dataset '{}' has unreadable CLASS attribute: {err}",
+                        ds.name()
+                    )))
+                }
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
 
         if !is_dim_scale {
             continue;
         }
 
         // Get dimension name from NAME attribute, falling back to dataset name
-        let name = ds
-            .attribute("NAME")
-            .ok()
-            .and_then(|attr| attr.read_string().ok())
-            .map(|s| {
-                // NetCDF-4 uses "This is a netCDF dimension but not a netCDF variable."
-                // as a sentinel for anonymous dimensions. In that case, use the dataset name.
-                if s.starts_with("This is a netCDF dimension but not a netCDF variable") {
-                    leaf_name(ds.name()).to_string()
-                } else {
-                    s
+        let name = match ds.attribute("NAME") {
+            Ok(attr) => match attr.read_string() {
+                Ok(value) => {
+                    if value.starts_with("This is a netCDF dimension but not a netCDF variable") {
+                        leaf_name(ds.name()).to_string()
+                    } else {
+                        value
+                    }
                 }
-            })
-            .unwrap_or_else(|| leaf_name(ds.name()).to_string());
+                Err(err) if strict => {
+                    return Err(Error::InvalidData(format!(
+                        "dimension scale '{}' has unreadable NAME attribute: {err}",
+                        ds.name()
+                    )))
+                }
+                Err(_) => leaf_name(ds.name()).to_string(),
+            },
+            Err(_) => leaf_name(ds.name()).to_string(),
+        };
 
         // Get current size from dataspace
         let shape = ds.shape();
@@ -83,11 +95,19 @@ pub fn extract_dimensions_from_datasets(
             .is_some_and(|md| !md.is_empty() && md[0] == u64::MAX);
 
         // Get stable ordering from _Netcdf4Dimid
-        let dimid = ds
-            .attribute("_Netcdf4Dimid")
-            .ok()
-            .and_then(|attr| attr.read_scalar::<i32>().ok())
-            .map(|id| id as i64);
+        let dimid = match ds.attribute("_Netcdf4Dimid") {
+            Ok(attr) => match attr.read_scalar::<i32>() {
+                Ok(id) => Some(id as i64),
+                Err(err) if strict => {
+                    return Err(Error::InvalidData(format!(
+                        "dimension scale '{}' has unreadable _Netcdf4Dimid attribute: {err}",
+                        ds.name()
+                    )))
+                }
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
 
         let address = ds.address();
 

@@ -17,7 +17,7 @@ use netcdf_reader::{NcFile, NcSliceInfo, NcSliceInfoElem};
 let file = NcFile::open("era5.nc")?;
 println!("format: {:?}", file.format());
 
-for var in file.variables() {
+for var in file.variables().unwrap() {
     println!("  var: {} {:?}", var.name(), var.shape());
 }
 

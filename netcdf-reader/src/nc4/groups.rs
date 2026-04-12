@@ -8,12 +8,18 @@ use std::collections::HashMap;
 
 use hdf5_reader::Hdf5File;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{NcDimension, NcGroup};
 
 use super::attributes;
 use super::dimensions;
 use super::variables;
+
+pub(crate) struct GroupContext<'f> {
+    pub(crate) group: hdf5_reader::group::Group<'f>,
+    pub(crate) visible_dimensions: Vec<NcDimension>,
+    pub(crate) visible_dim_addr_map: HashMap<u64, NcDimension>,
+}
 
 fn leaf_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
@@ -47,9 +53,100 @@ fn visible_dim_addr_map(
 }
 
 /// Build the root NcGroup from an HDF5 file.
-pub fn build_root_group(hdf5: &Hdf5File) -> Result<NcGroup> {
+pub fn build_root_group(hdf5: &Hdf5File, metadata_mode: crate::NcMetadataMode) -> Result<NcGroup> {
+    build_group_at_path(hdf5, "/", metadata_mode, true)
+}
+
+/// Build only the root group's local metadata.
+pub fn build_root_group_metadata(
+    hdf5: &Hdf5File,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<NcGroup> {
+    build_group_at_path(hdf5, "/", metadata_mode, false)
+}
+
+/// Build metadata for a group path.
+pub fn build_group_at_path(
+    hdf5: &Hdf5File,
+    path: &str,
+    metadata_mode: crate::NcMetadataMode,
+    recursive: bool,
+) -> Result<NcGroup> {
+    let normalized = normalize_group_path(path);
     let root = hdf5.root_group()?;
-    build_group_recursive(&root, "/", &[], &HashMap::new())
+    let mut group = root;
+    let mut inherited_dimensions = Vec::new();
+    let mut inherited_dim_addr_map = HashMap::new();
+
+    for component in normalized.split('/').filter(|part| !part.is_empty()) {
+        let datasets = group.datasets()?;
+        let (local_dimensions, local_dim_addr_map) =
+            dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
+        inherited_dimensions = visible_dimensions(&local_dimensions, &inherited_dimensions);
+        inherited_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, &inherited_dim_addr_map);
+        group = group
+            .group(component)
+            .map_err(|_| Error::GroupNotFound(path.to_string()))?;
+    }
+
+    let group_name = if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        leaf_name(group.name()).to_string()
+    };
+
+    if recursive {
+        build_group_recursive(
+            &group,
+            &group_name,
+            &inherited_dimensions,
+            &inherited_dim_addr_map,
+            metadata_mode,
+        )
+    } else {
+        build_group_metadata(
+            &group,
+            &group_name,
+            &inherited_dimensions,
+            &inherited_dim_addr_map,
+            metadata_mode,
+        )
+    }
+}
+
+pub(crate) fn group_context_at_path<'f>(
+    hdf5: &'f Hdf5File,
+    path: &str,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<GroupContext<'f>> {
+    let normalized = normalize_group_path(path);
+    let root = hdf5.root_group()?;
+    let mut group = root;
+    let mut inherited_dimensions = Vec::new();
+    let mut inherited_dim_addr_map = HashMap::new();
+
+    for component in normalized.split('/').filter(|part| !part.is_empty()) {
+        let datasets = group.datasets()?;
+        let (local_dimensions, local_dim_addr_map) =
+            dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
+        inherited_dimensions = visible_dimensions(&local_dimensions, &inherited_dimensions);
+        inherited_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, &inherited_dim_addr_map);
+        group = group
+            .group(component)
+            .map_err(|_| Error::GroupNotFound(path.to_string()))?;
+    }
+
+    let datasets = group.datasets()?;
+    let (local_dimensions, local_dim_addr_map) =
+        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
+    let visible_dimensions = visible_dimensions(&local_dimensions, &inherited_dimensions);
+    let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, &inherited_dim_addr_map);
+
+    Ok(GroupContext {
+        group,
+        visible_dimensions,
+        visible_dim_addr_map,
+    })
 }
 
 /// Recursively build an NcGroup from an HDF5 Group.
@@ -58,6 +155,7 @@ fn build_group_recursive(
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<NcGroup> {
     let (hdf5_children, datasets) = hdf5_group.members()?;
 
@@ -65,7 +163,7 @@ fn build_group_recursive(
     // with dimensions inherited from ancestor groups for lookups and variable
     // reconstruction.
     let (local_dimensions, local_dim_addr_map) =
-        dimensions::extract_dimensions_from_datasets(&datasets)?;
+        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
     let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
     let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
 
@@ -75,10 +173,11 @@ fn build_group_recursive(
         hdf5_group,
         &visible_dimensions,
         &visible_dim_addr_map,
+        metadata_mode,
     )?;
 
     // Extract group-level attributes, filtering internal NetCDF-4 attributes.
-    let nc_attributes = attributes::extract_group_attributes(hdf5_group)?;
+    let nc_attributes = attributes::extract_group_attributes(hdf5_group, metadata_mode)?;
 
     // Recurse into child groups.
     let mut child_groups = Vec::new();
@@ -89,6 +188,7 @@ fn build_group_recursive(
             &child_name,
             &visible_dimensions,
             &visible_dim_addr_map,
+            metadata_mode,
         )?;
         child_groups.push(nc_child);
     }
@@ -100,6 +200,40 @@ fn build_group_recursive(
         attributes: nc_attributes,
         groups: child_groups,
     })
+}
+
+fn build_group_metadata(
+    hdf5_group: &hdf5_reader::group::Group<'_>,
+    name: &str,
+    inherited_dimensions: &[NcDimension],
+    inherited_dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<NcGroup> {
+    let datasets = hdf5_group.datasets()?;
+    let (local_dimensions, local_dim_addr_map) =
+        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
+    let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
+    let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    let variables = variables::extract_variables_from_datasets(
+        &datasets,
+        hdf5_group,
+        &visible_dimensions,
+        &visible_dim_addr_map,
+        metadata_mode,
+    )?;
+    let attributes = attributes::extract_group_attributes(hdf5_group, metadata_mode)?;
+
+    Ok(NcGroup {
+        name: name.to_string(),
+        dimensions: visible_dimensions,
+        variables,
+        attributes,
+        groups: Vec::new(),
+    })
+}
+
+fn normalize_group_path(path: &str) -> &str {
+    path.trim_matches('/')
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use hdf5_reader::group::Group;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{NcDimension, NcVariable};
 
 use super::attributes;
@@ -29,12 +29,10 @@ pub fn extract_variables(
     group: &Group<'_>,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcVariable>> {
-    let datasets = match group.datasets() {
-        Ok(ds) => ds,
-        Err(_) => return Ok(Vec::new()),
-    };
-    extract_variables_from_datasets(&datasets, group, dimensions, dim_addr_map)
+    let datasets = group.datasets()?;
+    extract_variables_from_datasets(&datasets, group, dimensions, dim_addr_map, metadata_mode)
 }
 
 pub fn extract_variables_from_datasets(
@@ -42,55 +40,76 @@ pub fn extract_variables_from_datasets(
     group: &Group<'_>,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcVariable>> {
     let mut variables = Vec::new();
 
     for ds in datasets {
-        // Skip dimension scale datasets
-        let is_dim_scale = ds
-            .attribute("CLASS")
-            .ok()
-            .and_then(|attr| attr.read_string().ok())
-            .map(|s| s == "DIMENSION_SCALE")
-            .unwrap_or(false);
-
-        if is_dim_scale {
-            continue;
+        if let Some(variable) =
+            extract_variable(ds, group, dimensions, dim_addr_map, metadata_mode)?
+        {
+            variables.push(variable);
         }
-
-        // Map the HDF5 datatype to a NetCDF type
-        let nc_type = match hdf5_to_nc_type(ds.dtype()) {
-            Ok(t) => t,
-            Err(_) => continue, // Skip datasets with unsupported types
-        };
-
-        // Resolve dimensions from DIMENSION_LIST attribute, falling back to size heuristic
-        let var_dims = resolve_variable_dimensions_from_dimlist(ds, group, dim_addr_map)
-            .unwrap_or_else(|| resolve_variable_dimensions_by_size(ds, dimensions));
-
-        // Detect if this variable uses an unlimited dimension
-        let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
-
-        let shape = ds.shape();
-        let (data_size, record_size) =
-            compute_storage_sizes(shape, nc_type.size() as u64, is_unlimited)?;
-
-        // Extract variable-level attributes
-        let var_attrs = attributes::extract_variable_attributes(ds)?;
-
-        variables.push(NcVariable {
-            name: leaf_name(ds.name()).to_string(),
-            dimensions: var_dims,
-            dtype: nc_type,
-            attributes: var_attrs,
-            data_offset: ds.address(),
-            _data_size: data_size,
-            is_record_var: is_unlimited,
-            record_size,
-        });
     }
 
     Ok(variables)
+}
+
+pub fn extract_variable(
+    ds: &hdf5_reader::Dataset<'_>,
+    group: &Group<'_>,
+    dimensions: &[NcDimension],
+    dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Option<NcVariable>> {
+    let strict = metadata_mode == crate::NcMetadataMode::Strict;
+
+    let is_dim_scale = match ds.attribute("CLASS") {
+        Ok(attr) => match attr.read_string() {
+            Ok(value) => value == "DIMENSION_SCALE",
+            Err(err) if strict => {
+                return Err(Error::InvalidData(format!(
+                    "dataset '{}' has unreadable CLASS attribute: {err}",
+                    ds.name()
+                )))
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+
+    if is_dim_scale {
+        return Ok(None);
+    }
+
+    let nc_type = match hdf5_to_nc_type(ds.dtype()) {
+        Ok(t) => t,
+        Err(err) if strict => {
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' uses unsupported NetCDF-4 type: {err}",
+                ds.name()
+            )))
+        }
+        Err(_) => return Ok(None),
+    };
+
+    let var_dims = resolve_variable_dimensions(ds, group, dimensions, dim_addr_map, metadata_mode)?;
+    let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
+    let shape = ds.shape();
+    let (data_size, record_size) =
+        compute_storage_sizes(shape, nc_type.size() as u64, is_unlimited)?;
+    let var_attrs = attributes::extract_variable_attributes(ds, metadata_mode)?;
+
+    Ok(Some(NcVariable {
+        name: leaf_name(ds.name()).to_string(),
+        dimensions: var_dims,
+        dtype: nc_type,
+        attributes: var_attrs,
+        data_offset: ds.address(),
+        _data_size: data_size,
+        is_record_var: is_unlimited,
+        record_size,
+    }))
 }
 
 /// Resolve variable dimensions via the `DIMENSION_LIST` attribute.
@@ -99,42 +118,99 @@ pub fn extract_variables_from_datasets(
 /// variable-length sequence of object references pointing to dimension-scale
 /// datasets. We parse the raw attribute data to extract these references.
 ///
-/// Returns `None` if the attribute is missing or unparseable.
+fn resolve_variable_dimensions(
+    ds: &hdf5_reader::Dataset<'_>,
+    group: &Group<'_>,
+    dimensions: &[NcDimension],
+    dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Vec<NcDimension>> {
+    resolve_variable_dimensions_with_mode(ds, group, dimensions, dim_addr_map, metadata_mode)
+}
+
+fn resolve_variable_dimensions_with_mode(
+    ds: &hdf5_reader::Dataset<'_>,
+    group: &Group<'_>,
+    dimensions: &[NcDimension],
+    dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Vec<NcDimension>> {
+    match resolve_variable_dimensions_from_dimlist(ds, group, dim_addr_map) {
+        Ok(dims) => Ok(dims),
+        Err(_err) if metadata_mode == crate::NcMetadataMode::Lossy => {
+            Ok(resolve_variable_dimensions_by_size(ds, dimensions))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Resolve variable dimensions via the `DIMENSION_LIST` attribute.
 fn resolve_variable_dimensions_from_dimlist(
     ds: &hdf5_reader::Dataset<'_>,
     group: &Group<'_>,
     dim_addr_map: &HashMap<u64, NcDimension>,
-) -> Option<Vec<NcDimension>> {
-    let attr = ds.attribute("DIMENSION_LIST").ok()?;
+) -> Result<Vec<NcDimension>> {
+    let attr = ds.attribute("DIMENSION_LIST").map_err(|_| {
+        Error::InvalidData(format!(
+            "dataset '{}' is missing required DIMENSION_LIST metadata",
+            ds.name()
+        ))
+    })?;
     let raw_data = &attr.raw_data;
     let ndim = ds.ndim();
     let offset_size = group.offset_size();
     let file_data = group.file_data();
 
-    if raw_data.is_empty() || ndim == 0 {
-        return None;
+    if ndim == 0 {
+        return Ok(Vec::new());
+    }
+    if raw_data.is_empty() {
+        return Err(Error::InvalidData(format!(
+            "dataset '{}' has empty DIMENSION_LIST metadata",
+            ds.name()
+        )));
     }
 
     // Each vlen entry in the attribute data is:
     //   seq_len: u32 (number of references in this vlen)
     //   heap_addr: offset_size bytes (global heap collection address)
     //   heap_idx: u32 (object index within the global heap collection)
-    let entry_size = 4 + offset_size as usize + 4;
+    let entry_size = 4 + usize::from(offset_size) + 4;
     if raw_data.len() < ndim * entry_size {
-        return None;
+        return Err(Error::InvalidData(format!(
+            "dataset '{}' has truncated DIMENSION_LIST metadata",
+            ds.name()
+        )));
     }
 
     let mut var_dims = Vec::with_capacity(ndim);
     let mut cursor = hdf5_reader::io::Cursor::new(raw_data);
 
     for _ in 0..ndim {
-        let seq_len = cursor.read_u32_le().ok()? as usize;
-        let heap_addr = cursor.read_offset(offset_size).ok()?;
-        let heap_idx = cursor.read_u32_le().ok()? as u16;
+        let seq_len = cursor.read_u32_le().map_err(|err| {
+            Error::InvalidData(format!(
+                "dataset '{}' has invalid DIMENSION_LIST entry count: {err}",
+                ds.name()
+            ))
+        })? as usize;
+        let heap_addr = cursor.read_offset(offset_size).map_err(|err| {
+            Error::InvalidData(format!(
+                "dataset '{}' has invalid DIMENSION_LIST heap address: {err}",
+                ds.name()
+            ))
+        })?;
+        let heap_idx = cursor.read_u32_le().map_err(|err| {
+            Error::InvalidData(format!(
+                "dataset '{}' has invalid DIMENSION_LIST heap index: {err}",
+                ds.name()
+            ))
+        })? as u16;
 
         if seq_len == 0 || hdf5_reader::io::Cursor::is_undefined_offset(heap_addr, offset_size) {
-            // No reference for this dimension — can't resolve.
-            return None;
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' has an unresolved DIMENSION_LIST reference",
+                ds.name()
+            )));
         }
 
         // Parse the global heap collection at heap_addr.
@@ -145,17 +221,36 @@ fn resolve_variable_dimensions_from_dimlist(
             offset_size,
             group.length_size(),
         )
-        .ok()?;
+        .map_err(|err| {
+            Error::InvalidData(format!(
+                "dataset '{}' has unreadable DIMENSION_LIST heap object: {err}",
+                ds.name()
+            ))
+        })?;
 
-        let heap_obj = collection.get_object(heap_idx)?;
+        let heap_obj = collection.get_object(heap_idx).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "dataset '{}' references missing DIMENSION_LIST heap object {}",
+                ds.name(),
+                heap_idx
+            ))
+        })?;
 
         // The heap object data contains `seq_len` object references,
         // each `offset_size` bytes.
-        let refs =
-            hdf5_reader::reference::read_object_references(&heap_obj.data, offset_size).ok()?;
+        let refs = hdf5_reader::reference::read_object_references(&heap_obj.data, offset_size)
+            .map_err(|err| {
+                Error::InvalidData(format!(
+                    "dataset '{}' has invalid DIMENSION_LIST references: {err}",
+                    ds.name()
+                ))
+            })?;
 
         if refs.is_empty() {
-            return None;
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' has empty DIMENSION_LIST references",
+                ds.name()
+            )));
         }
 
         // Use the first reference (there's usually only one per dimension).
@@ -163,8 +258,10 @@ fn resolve_variable_dimensions_from_dimlist(
         if let Some(dim) = dim_addr_map.get(&dim_addr) {
             var_dims.push(dim.clone());
         } else {
-            // Reference points to unknown address — can't resolve.
-            return None;
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' references unknown dimension scale address {dim_addr:#x}",
+                ds.name()
+            )));
         }
     }
 
@@ -177,7 +274,7 @@ fn resolve_variable_dimensions_from_dimlist(
         }
     }
 
-    Some(var_dims)
+    Ok(var_dims)
 }
 
 fn compute_storage_sizes(shape: &[u64], elem_size: u64, is_unlimited: bool) -> Result<(u64, u64)> {
