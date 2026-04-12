@@ -13,7 +13,7 @@
 //!
 //! let file = NcFile::open("example.nc").unwrap();
 //! println!("format: {:?}", file.format());
-//! for var in file.variables() {
+//! for var in file.variables().unwrap() {
 //!     println!("  variable: {} shape={:?}", var.name(), var.shape());
 //! }
 //! ```
@@ -90,7 +90,7 @@ pub struct NcFile {
 enum NcFileInner {
     Classic(classic::ClassicFile),
     #[cfg(feature = "netcdf4")]
-    Nc4(nc4::Nc4File),
+    Nc4(Box<nc4::Nc4File>),
 }
 
 /// HDF5 magic bytes: `\x89HDF\r\n\x1a\n`
@@ -160,7 +160,7 @@ impl NcFile {
                     };
                     Ok(NcFile {
                         format: actual_format,
-                        inner: NcFileInner::Nc4(nc4),
+                        inner: NcFileInner::Nc4(Box::new(nc4)),
                     })
                 }
                 #[cfg(not(feature = "netcdf4"))]
@@ -191,27 +191,27 @@ impl NcFile {
     }
 
     /// Convenience: dimensions in the root group.
-    pub fn dimensions(&self) -> &[NcDimension] {
+    pub fn dimensions(&self) -> Result<&[NcDimension]> {
         match &self.inner {
-            NcFileInner::Classic(c) => &c.root_group().dimensions,
+            NcFileInner::Classic(c) => Ok(&c.root_group().dimensions),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.dimensions(),
         }
     }
 
     /// Convenience: variables in the root group.
-    pub fn variables(&self) -> &[NcVariable] {
+    pub fn variables(&self) -> Result<&[NcVariable]> {
         match &self.inner {
-            NcFileInner::Classic(c) => &c.root_group().variables,
+            NcFileInner::Classic(c) => Ok(&c.root_group().variables),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.variables(),
         }
     }
 
     /// Convenience: global attributes (attributes of the root group).
-    pub fn global_attributes(&self) -> &[NcAttribute] {
+    pub fn global_attributes(&self) -> Result<&[NcAttribute]> {
         match &self.inner {
-            NcFileInner::Classic(c) => &c.root_group().attributes,
+            NcFileInner::Classic(c) => Ok(&c.root_group().attributes),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.global_attributes(),
         }
@@ -589,7 +589,7 @@ impl NcFile {
                     };
                     Ok(NcFile {
                         format: actual_format,
-                        inner: NcFileInner::Nc4(nc4),
+                        inner: NcFileInner::Nc4(Box::new(nc4)),
                     })
                 }
                 #[cfg(not(feature = "netcdf4"))]
@@ -718,9 +718,9 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert!(file.dimensions().is_empty());
-        assert!(file.variables().is_empty());
-        assert!(file.global_attributes().is_empty());
+        assert!(file.dimensions().unwrap().is_empty());
+        assert!(file.variables().unwrap().is_empty());
+        assert!(file.global_attributes().unwrap().is_empty());
     }
 
     #[test]
@@ -781,18 +781,21 @@ mod tests {
 
         let file = NcFile::from_bytes(&data).unwrap();
         assert_eq!(file.format(), NcFormat::Classic);
-        assert_eq!(file.dimensions().len(), 1);
-        assert_eq!(file.dimensions()[0].name, "x");
-        assert_eq!(file.dimensions()[0].size, 3);
+        assert_eq!(file.dimensions().unwrap().len(), 1);
+        assert_eq!(file.dimensions().unwrap()[0].name, "x");
+        assert_eq!(file.dimensions().unwrap()[0].size, 3);
 
-        assert_eq!(file.global_attributes().len(), 1);
-        assert_eq!(file.global_attributes()[0].name, "title");
+        assert_eq!(file.global_attributes().unwrap().len(), 1);
+        assert_eq!(file.global_attributes().unwrap()[0].name, "title");
         assert_eq!(
-            file.global_attributes()[0].value.as_string().unwrap(),
+            file.global_attributes().unwrap()[0]
+                .value
+                .as_string()
+                .unwrap(),
             "test"
         );
 
-        assert_eq!(file.variables().len(), 1);
+        assert_eq!(file.variables().unwrap().len(), 1);
         let var = file.variable("vals").unwrap();
         assert_eq!(var.dtype(), &NcType::Float);
         assert_eq!(var.shape(), vec![3]);

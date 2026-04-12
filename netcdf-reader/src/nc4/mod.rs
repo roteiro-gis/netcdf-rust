@@ -15,7 +15,7 @@ pub mod types;
 pub mod variables;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use hdf5_reader::datatype_api::H5Type;
 use hdf5_reader::Hdf5File;
@@ -24,7 +24,7 @@ use ndarray::ArrayD;
 use rayon::ThreadPool;
 
 use crate::error::{Error, Result};
-use crate::types::{NcGroup, NcType};
+use crate::types::{NcAttribute, NcDimension, NcGroup, NcType, NcVariable};
 
 /// Dispatch on `NcType` to read data and promote to `f64`.
 ///
@@ -109,9 +109,11 @@ macro_rules! dispatch_read_as_f64 {
 pub struct Nc4File {
     hdf5: Hdf5File,
     metadata_mode: crate::NcMetadataMode,
-    root_metadata: NcGroup,
-    shallow_group_cache: MetadataArena<NcGroup>,
+    root_metadata: OnceLock<NcGroup>,
     subtree_group_cache: MetadataArena<NcGroup>,
+    variable_cache: MetadataArena<NcVariable>,
+    dimension_cache: MetadataArena<NcDimension>,
+    attribute_cache: MetadataArena<NcAttribute>,
 }
 
 struct MetadataArena<T> {
@@ -120,7 +122,7 @@ struct MetadataArena<T> {
 
 struct MetadataArenaState<T> {
     entries: Vec<Box<T>>,
-    index: std::collections::HashMap<String, *const T>,
+    index: std::collections::HashMap<String, usize>,
 }
 
 impl<T> MetadataArena<T> {
@@ -143,16 +145,19 @@ impl<T> MetadataArena<T> {
 
         let value = build()?;
         let mut state = self.state.lock().expect("metadata arena mutex poisoned");
-        if let Some(&ptr) = state.index.get(key) {
-            // SAFETY: pointers in the arena always reference boxed values stored
-            // in `entries`, which are never removed or moved after insertion.
+        if let Some(&index) = state.index.get(key) {
+            let ptr: *const T = state.entries[index].as_ref();
+            // SAFETY: `entries` stores boxed values that are never removed or
+            // moved after insertion, so references derived from their inner
+            // pointers remain valid for the lifetime of the arena.
             return Ok(unsafe { &*ptr });
         }
 
         let boxed = Box::new(value);
-        let ptr: *const T = boxed.as_ref();
         state.entries.push(boxed);
-        state.index.insert(key.to_string(), ptr);
+        let index = state.entries.len() - 1;
+        state.index.insert(key.to_string(), index);
+        let ptr: *const T = state.entries[index].as_ref();
         // SAFETY: `ptr` references the boxed value now owned by `entries`,
         // which will live for the lifetime of `self`.
         Ok(unsafe { &*ptr })
@@ -160,7 +165,8 @@ impl<T> MetadataArena<T> {
 
     fn get(&self, key: &str) -> Option<&T> {
         let state = self.state.lock().expect("metadata arena mutex poisoned");
-        let ptr = *state.index.get(key)?;
+        let index = *state.index.get(key)?;
+        let ptr: *const T = state.entries[index].as_ref();
         drop(state);
         // SAFETY: pointers in the arena always reference boxed values stored
         // in `entries`, which are never removed or moved after insertion.
@@ -170,13 +176,14 @@ impl<T> MetadataArena<T> {
 
 impl Nc4File {
     pub(crate) fn from_hdf5(hdf5: Hdf5File, metadata_mode: crate::NcMetadataMode) -> Result<Self> {
-        let root_metadata = groups::build_root_group_metadata(&hdf5, metadata_mode)?;
         Ok(Nc4File {
             hdf5,
             metadata_mode,
-            root_metadata,
-            shallow_group_cache: MetadataArena::new(),
+            root_metadata: OnceLock::new(),
             subtree_group_cache: MetadataArena::new(),
+            variable_cache: MetadataArena::new(),
+            dimension_cache: MetadataArena::new(),
+            attribute_cache: MetadataArena::new(),
         })
     }
 
@@ -235,16 +242,16 @@ impl Nc4File {
             .is_some()
     }
 
-    pub fn dimensions(&self) -> &[crate::types::NcDimension] {
-        &self.root_metadata.dimensions
+    pub fn dimensions(&self) -> Result<&[crate::types::NcDimension]> {
+        Ok(&self.root_metadata()?.dimensions)
     }
 
-    pub fn variables(&self) -> &[crate::types::NcVariable] {
-        &self.root_metadata.variables
+    pub fn variables(&self) -> Result<&[crate::types::NcVariable]> {
+        Ok(&self.root_metadata()?.variables)
     }
 
-    pub fn global_attributes(&self) -> &[crate::types::NcAttribute] {
-        &self.root_metadata.attributes
+    pub fn global_attributes(&self) -> Result<&[crate::types::NcAttribute]> {
+        Ok(&self.root_metadata()?.attributes)
     }
 
     pub fn group(&self, path: &str) -> Result<&NcGroup> {
@@ -257,43 +264,57 @@ impl Nc4File {
 
     pub fn variable(&self, path: &str) -> Result<&crate::types::NcVariable> {
         let (group_path, variable_name) = split_parent_path_required(path, "variable")?;
-        let group = self.group_metadata(group_path)?;
-        group
-            .variables
-            .iter()
-            .find(|var| var.name == variable_name)
-            .ok_or_else(|| Error::VariableNotFound(path.to_string()))
+        let normalized_group = normalize_group_path(group_path)?;
+        let normalized_dataset = normalize_dataset_path(path)?;
+        self.variable_cache
+            .get_or_try_insert_with(normalized_dataset, || {
+                let context = groups::group_context_at_path(
+                    &self.hdf5,
+                    normalized_group,
+                    self.metadata_mode,
+                )?;
+                let dataset = context
+                    .group
+                    .dataset(variable_name)
+                    .map_err(|_| Error::VariableNotFound(path.to_string()))?;
+                variables::extract_variable(
+                    &dataset,
+                    &context.group,
+                    &context.visible_dimensions,
+                    &context.visible_dim_addr_map,
+                    self.metadata_mode,
+                )?
+                .ok_or_else(|| Error::VariableNotFound(path.to_string()))
+            })
     }
 
     pub fn dimension(&self, path: &str) -> Result<&crate::types::NcDimension> {
         let (group_path, dimension_name) = split_parent_path_required(path, "dimension")?;
-        let group = self.group_metadata(group_path)?;
-        group
-            .dimensions
-            .iter()
+        let context = groups::group_context_at_path(&self.hdf5, group_path, self.metadata_mode)?;
+        let dim = context
+            .visible_dimensions
+            .into_iter()
             .find(|dim| dim.name == dimension_name)
-            .ok_or_else(|| Error::DimensionNotFound(path.to_string()))
+            .ok_or_else(|| Error::DimensionNotFound(path.to_string()))?;
+        self.dimension_cache
+            .get_or_try_insert_with(&format!("dim:{path}"), || Ok(dim))
     }
 
     pub fn global_attribute(&self, path: &str) -> Result<&crate::types::NcAttribute> {
         let (group_path, attr_name) = split_parent_path_required(path, "attribute")?;
-        let group = self.group_metadata(group_path)?;
-        group
-            .attributes
-            .iter()
-            .find(|attr| attr.name == attr_name)
-            .ok_or_else(|| Error::AttributeNotFound(path.to_string()))
-    }
-
-    fn group_metadata(&self, group_path: &str) -> Result<&NcGroup> {
-        let normalized = normalize_group_path(group_path)?;
-        if normalized.is_empty() {
-            return Ok(&self.root_metadata);
-        }
-
-        self.shallow_group_cache
-            .get_or_try_insert_with(normalized, || {
-                groups::build_group_at_path(&self.hdf5, normalized, self.metadata_mode, false)
+        self.attribute_cache
+            .get_or_try_insert_with(&format!("attr:{path}"), || {
+                let normalized = normalize_group_path(group_path)?;
+                let group = if normalized.is_empty() {
+                    self.hdf5.root_group()?
+                } else {
+                    self.hdf5.group(normalized)?
+                };
+                let attr = group
+                    .attribute(attr_name)
+                    .map_err(|_| Error::AttributeNotFound(path.to_string()))?;
+                attributes::convert_visible_attribute(&attr, self.metadata_mode)?
+                    .ok_or_else(|| Error::AttributeNotFound(path.to_string()))
             })
     }
 
@@ -353,6 +374,20 @@ impl Nc4File {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
         Ok(dataset.read_array_in_pool::<T>(pool)?)
+    }
+}
+
+impl Nc4File {
+    fn root_metadata(&self) -> Result<&NcGroup> {
+        if let Some(group) = self.root_metadata.get() {
+            return Ok(group);
+        }
+        let root_metadata = groups::build_root_group_metadata(&self.hdf5, self.metadata_mode)?;
+        let _ = self.root_metadata.set(root_metadata);
+        Ok(self
+            .root_metadata
+            .get()
+            .expect("root metadata must be initialized after successful build"))
     }
 }
 

@@ -680,7 +680,7 @@ fn walk_netcdf_rust_group(group: &NcGroup) -> usize {
 }
 
 fn metadata_netcdf_rust_file(file: &NcFile) -> usize {
-    walk_netcdf_rust_group(file.root_group())
+    walk_netcdf_rust_group(file.root_group().unwrap())
 }
 
 fn metadata_netcdf_rust(path: &Path) -> usize {

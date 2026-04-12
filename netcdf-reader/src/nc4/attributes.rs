@@ -68,6 +68,16 @@ fn collect_visible_attributes(
     Ok(nc_attrs)
 }
 
+pub fn convert_visible_attribute(
+    attr: &hdf5_reader::Attribute,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Option<NcAttribute>> {
+    if is_internal_attribute(&attr.name) {
+        return Ok(None);
+    }
+    convert_attribute(attr, metadata_mode)
+}
+
 /// Convert an HDF5 attribute to a NetCDF attribute.
 fn convert_attribute(
     attr: &hdf5_reader::Attribute,
