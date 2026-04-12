@@ -9,6 +9,7 @@
 //! - Extensible array indexing (extensible_array module)
 
 use crate::error::Result;
+use crate::storage::Storage;
 
 /// A resolved chunk location within the file.
 #[derive(Debug, Clone)]
@@ -102,6 +103,67 @@ pub fn collect_v2_chunk_entries(
             _ => {
                 // Skip non-chunk records
             }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Collect chunk entries from a B-tree v2 chunk index using random-access storage.
+pub fn collect_v2_chunk_entries_storage(
+    storage: &dyn Storage,
+    btree_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    ndim: u32,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Result<Vec<ChunkEntry>> {
+    let header = crate::btree_v2::BTreeV2Header::parse_at_storage(
+        storage,
+        btree_address,
+        offset_size,
+        length_size,
+    )?;
+    let records = crate::btree_v2::collect_btree_v2_records_storage(
+        storage,
+        &header,
+        offset_size,
+        length_size,
+        Some(ndim),
+        chunk_dims,
+        chunk_bounds,
+    )?;
+
+    let mut entries = Vec::with_capacity(records.len());
+    for record in records {
+        match record {
+            crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets } => {
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
+                    entries.push(ChunkEntry {
+                        address,
+                        size: 0,
+                        filter_mask: 0,
+                        offsets,
+                    });
+                }
+            }
+            crate::btree_v2::BTreeV2Record::ChunkedFiltered {
+                address,
+                chunk_size,
+                filter_mask,
+                offsets,
+            } => {
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
+                    entries.push(ChunkEntry {
+                        address,
+                        size: chunk_size,
+                        filter_mask,
+                        offsets,
+                    });
+                }
+            }
+            _ => {}
         }
     }
 

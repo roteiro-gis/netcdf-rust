@@ -10,6 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 
 /// Signature bytes for a Global Heap Collection: ASCII `GCOL`.
 const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
@@ -119,6 +120,36 @@ impl GlobalHeapCollection {
         }
 
         Ok(GlobalHeapCollection { objects })
+    }
+
+    /// Parse a global heap collection from random-access storage.
+    pub fn parse_at_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let header_len = 4 + 1 + 3 + usize::from(length_size);
+        let header = storage.read_range(address, header_len)?;
+        let mut cursor = Cursor::new(header.as_ref());
+        let sig = cursor.read_bytes(4)?;
+        if sig != GCOL_SIGNATURE {
+            return Err(Error::InvalidGlobalHeapSignature);
+        }
+
+        let version = cursor.read_u8()?;
+        if version != 1 {
+            return Err(Error::UnsupportedGlobalHeapVersion(version));
+        }
+
+        cursor.skip(3)?;
+        let collection_size = cursor.read_length(length_size)?;
+        let collection_len = usize::try_from(collection_size).map_err(|_| {
+            Error::InvalidData("global heap collection exceeds platform usize capacity".into())
+        })?;
+        let bytes = storage.read_range(address, collection_len)?;
+        let mut full_cursor = Cursor::new(bytes.as_ref());
+        Self::parse(&mut full_cursor, offset_size, length_size)
     }
 
     /// Look up an object by its index within this collection.

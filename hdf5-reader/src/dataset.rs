@@ -10,8 +10,8 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::attribute_api::{
-    collect_attribute_messages, decode_string, decode_varlen_byte_string, read_one_vlen_string,
-    resolve_vlen_bytes, Attribute,
+    collect_attribute_messages_storage, decode_string, decode_varlen_byte_string,
+    read_one_vlen_string_storage, resolve_vlen_bytes_storage, Attribute,
 };
 use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
@@ -416,10 +416,9 @@ impl Dataset {
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
-        let file_data = context.context.full_file_data()?;
-        let attributes = collect_attribute_messages(
+        let attributes = collect_attribute_messages_storage(
             header,
-            file_data.as_ref(),
+            context.context.storage.as_ref(),
             context.context.superblock.offset_size,
             context.context.superblock.length_size,
         )?;
@@ -526,32 +525,18 @@ impl Dataset {
 
     /// Dataset attributes.
     pub fn attributes(&self) -> Vec<Attribute> {
-        let file_data = self.context.full_file_data().ok();
         self.attributes
             .iter()
-            .map(|a| {
-                Attribute::from_message_with_context(
-                    a.clone(),
-                    file_data.as_ref().map(|data| data.as_ref()),
-                    self.offset_size(),
-                )
-            })
+            .map(|a| attribute_from_message_storage(a, self.context.as_ref()))
             .collect()
     }
 
     /// Find an attribute by name.
     pub fn attribute(&self, name: &str) -> Result<Attribute> {
-        let file_data = self.context.full_file_data().ok();
         self.attributes
             .iter()
             .find(|a| a.name == name)
-            .map(|a| {
-                Attribute::from_message_with_context(
-                    a.clone(),
-                    file_data.as_ref().map(|data| data.as_ref()),
-                    self.offset_size(),
-                )
-            })
+            .map(|a| attribute_from_message_storage(a, self.context.as_ref()))
             .ok_or_else(|| Error::AttributeNotFound(name.to_string()))
     }
 
@@ -623,14 +608,14 @@ impl Dataset {
                 }
 
                 let mut strings = Vec::with_capacity(count);
-                let file_data = self.context.full_file_data()?;
                 for i in 0..count {
                     let offset = i * ref_size;
-                    strings.push(read_one_vlen_string(
+                    strings.push(read_one_vlen_string_storage(
                         &raw,
                         offset,
-                        file_data.as_ref(),
+                        self.context.storage.as_ref(),
                         self.offset_size(),
+                        self.length_size(),
                         *padding,
                         *encoding,
                     )?);
@@ -660,13 +645,16 @@ impl Dataset {
                 }
 
                 let mut strings = Vec::with_capacity(count);
-                let file_data = self.context.full_file_data()?;
                 for i in 0..count {
                     let offset = i * ref_size;
                     let ref_bytes = &raw[offset..offset + ref_size];
-                    let value =
-                        resolve_vlen_bytes(ref_bytes, file_data.as_ref(), self.offset_size())
-                            .unwrap_or_default();
+                    let value = resolve_vlen_bytes_storage(
+                        ref_bytes,
+                        self.context.storage.as_ref(),
+                        self.offset_size(),
+                        self.length_size(),
+                    )
+                    .unwrap_or_default();
                     strings.push(decode_varlen_byte_string(&value)?);
                 }
                 Ok(strings)
@@ -1287,18 +1275,15 @@ impl Dataset {
                 *filters,
                 selection.ndim,
             )]),
-            Some(ChunkIndexing::BTreeV2) => {
-                let file_data = self.context.full_file_data()?;
-                chunk_index::collect_v2_chunk_entries(
-                    file_data.as_ref(),
-                    index_address,
-                    self.offset_size(),
-                    self.length_size(),
-                    selection.ndim as u32,
-                    chunk_dims,
-                    selection.chunk_bounds,
-                )
-            }
+            Some(ChunkIndexing::BTreeV2) => chunk_index::collect_v2_chunk_entries_storage(
+                self.context.storage.as_ref(),
+                index_address,
+                self.offset_size(),
+                self.length_size(),
+                selection.ndim as u32,
+                chunk_dims,
+                selection.chunk_bounds,
+            ),
             Some(ChunkIndexing::Implicit) => Ok(chunk_index::collect_implicit_chunk_entries(
                 index_address,
                 selection.shape,
@@ -1307,9 +1292,8 @@ impl Dataset {
                 selection.chunk_bounds,
             )),
             Some(ChunkIndexing::FixedArray { .. }) => {
-                let file_data = self.context.full_file_data()?;
-                crate::fixed_array::collect_fixed_array_chunk_entries(
-                    file_data.as_ref(),
+                crate::fixed_array::collect_fixed_array_chunk_entries_storage(
+                    self.context.storage.as_ref(),
                     index_address,
                     self.offset_size(),
                     self.length_size(),
@@ -1319,9 +1303,8 @@ impl Dataset {
                 )
             }
             Some(ChunkIndexing::ExtensibleArray { .. }) => {
-                let file_data = self.context.full_file_data()?;
-                crate::extensible_array::collect_extensible_array_chunk_entries(
-                    file_data.as_ref(),
+                crate::extensible_array::collect_extensible_array_chunk_entries_storage(
+                    self.context.storage.as_ref(),
                     index_address,
                     self.offset_size(),
                     self.length_size(),
@@ -1350,9 +1333,8 @@ impl Dataset {
         chunk_dims: &[u32],
         chunk_bounds: Option<(&[u64], &[u64])>,
     ) -> Result<Vec<chunk_index::ChunkEntry>> {
-        let file_data = self.context.full_file_data()?;
-        let leaves = crate::btree_v1::collect_btree_v1_leaves(
-            file_data.as_ref(),
+        let leaves = crate::btree_v1::collect_btree_v1_leaves_storage(
+            self.context.storage.as_ref(),
             btree_address,
             self.offset_size(),
             self.length_size(),
@@ -2133,6 +2115,35 @@ impl Dataset {
             normalized[..raw.len()].copy_from_slice(raw);
             normalized
         }
+    }
+}
+
+fn attribute_from_message_storage(message: &AttributeMessage, context: &FileContext) -> Attribute {
+    let raw_data = match &message.datatype {
+        Datatype::VarLen { base }
+            if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. })
+                && message.dataspace.num_elements() == 1 =>
+        {
+            resolve_vlen_bytes_storage(
+                &message.raw_data,
+                context.storage.as_ref(),
+                context.superblock.offset_size,
+                context.superblock.length_size,
+            )
+            .unwrap_or_else(|| message.raw_data.clone())
+        }
+        _ => message.raw_data.clone(),
+    };
+
+    Attribute {
+        name: message.name.clone(),
+        datatype: message.datatype.clone(),
+        shape: match message.dataspace.dataspace_type {
+            DataspaceType::Scalar => vec![],
+            DataspaceType::Null => vec![0],
+            DataspaceType::Simple => message.dataspace.dims.clone(),
+        },
+        raw_data,
     }
 }
 

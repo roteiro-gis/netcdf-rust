@@ -11,6 +11,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 
 /// Signature bytes for a v1 B-tree node: ASCII `TREE`.
 const BTREE_V1_SIGNATURE: [u8; 4] = *b"TREE";
@@ -192,9 +193,45 @@ pub fn collect_btree_v1_leaves(
     Ok(results)
 }
 
+/// Walk a v1 B-tree from random-access storage and collect leaf entries.
+pub fn collect_btree_v1_leaves_storage(
+    storage: &dyn Storage,
+    root_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Result<Vec<(BTreeV1Key, u64)>> {
+    let mut results = Vec::new();
+    collect_recursive_storage(
+        BTreeV1CollectContextStorage {
+            storage,
+            offset_size,
+            length_size,
+            ndims,
+            chunk_dims,
+            chunk_bounds,
+        },
+        root_address,
+        &mut results,
+    )?;
+    Ok(results)
+}
+
 #[derive(Clone, Copy)]
 struct BTreeV1CollectContext<'a> {
     data: &'a [u8],
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &'a [u32],
+    chunk_bounds: Option<(&'a [u64], &'a [u64])>,
+}
+
+#[derive(Clone, Copy)]
+struct BTreeV1CollectContextStorage<'a> {
+    storage: &'a dyn Storage,
     offset_size: u8,
     length_size: u8,
     ndims: Option<u32>,
@@ -253,6 +290,86 @@ fn collect_recursive(
         // Internal node — recurse into each child.
         for child_addr in &node.children {
             collect_recursive(context, *child_addr, results)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_recursive_storage(
+    context: BTreeV1CollectContextStorage<'_>,
+    address: u64,
+    results: &mut Vec<(BTreeV1Key, u64)>,
+) -> Result<()> {
+    if Cursor::is_undefined_offset(address, context.offset_size) {
+        return Ok(());
+    }
+
+    let header_len = 4 + 1 + 1 + 2 + 2 * usize::from(context.offset_size);
+    let header = context.storage.read_range(address, header_len)?;
+    let mut header_cursor = Cursor::new(header.as_ref());
+    let sig = header_cursor.read_bytes(4)?;
+    if sig != BTREE_V1_SIGNATURE {
+        return Err(Error::InvalidBTreeSignature);
+    }
+
+    let node_type = header_cursor.read_u8()?;
+    let _level = header_cursor.read_u8()?;
+    let entries_used = header_cursor.read_u16_le()?;
+    let key_size = match node_type {
+        0 => usize::from(context.length_size),
+        1 => {
+            let ndims = context.ndims.ok_or_else(|| {
+                Error::InvalidData("ndims required for raw data chunk B-tree keys".into())
+            })?;
+            8 + (usize::try_from(ndims).map_err(|_| {
+                Error::InvalidData("B-tree v1 ndims exceeds platform usize capacity".into())
+            })? + 1)
+                * usize::from(context.offset_size)
+        }
+        _ => {
+            return Err(Error::InvalidData(format!(
+                "unknown v1 B-tree node type: {node_type}"
+            )));
+        }
+    };
+    let node_len = header_len
+        + (usize::from(entries_used) + 1) * key_size
+        + usize::from(entries_used) * usize::from(context.offset_size);
+    let node_bytes = context.storage.read_range(address, node_len)?;
+    let mut cursor = Cursor::new(node_bytes.as_ref());
+    let node = BTreeV1Node::parse(
+        &mut cursor,
+        context.offset_size,
+        context.length_size,
+        context.ndims,
+    )?;
+
+    if node.level == 0 {
+        for (i, child_addr) in node.children.iter().enumerate() {
+            let include = match &node.keys[i] {
+                BTreeV1Key::RawData { offsets, .. } => {
+                    context.chunk_bounds.map_or(true, |(first, last)| {
+                        offsets
+                            .iter()
+                            .zip(context.chunk_dims.iter())
+                            .enumerate()
+                            .all(|(dim, (offset, chunk_dim))| {
+                                let chunk_index = *offset / u64::from(*chunk_dim);
+                                chunk_index >= first[dim] && chunk_index <= last[dim]
+                            })
+                    })
+                }
+                _ => true,
+            };
+
+            if include {
+                results.push((node.keys[i].clone(), *child_addr));
+            }
+        }
+    } else {
+        for child_addr in &node.children {
+            collect_recursive_storage(context, *child_addr, results)?;
         }
     }
 

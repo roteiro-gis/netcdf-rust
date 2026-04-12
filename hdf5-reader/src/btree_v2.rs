@@ -11,6 +11,7 @@
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 
 // ---------------------------------------------------------------------------
 // Signatures
@@ -109,6 +110,30 @@ impl BTreeV2Header {
             num_records_in_root,
             total_records,
         })
+    }
+
+    /// Parse a B-tree v2 header from random-access storage.
+    pub fn parse_at_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let header_len = 4
+            + 1
+            + 1
+            + 4
+            + 2
+            + 2
+            + 1
+            + 1
+            + usize::from(offset_size)
+            + 2
+            + usize::from(length_size)
+            + 4;
+        let bytes = storage.read_range(address, header_len)?;
+        let mut cursor = Cursor::new(bytes.as_ref());
+        Self::parse(&mut cursor, offset_size, length_size)
     }
 }
 
@@ -638,6 +663,242 @@ pub fn collect_btree_v2_records(
     }
 
     Ok(records)
+}
+
+/// Collect all records from a B-tree v2 using random-access storage.
+pub fn collect_btree_v2_records_storage(
+    storage: &dyn Storage,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Result<Vec<BTreeV2Record>> {
+    if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
+        return Ok(Vec::new());
+    }
+
+    if header.total_records == 0 || header.num_records_in_root == 0 {
+        return Ok(Vec::new());
+    }
+
+    let heap_id_len = compute_heap_id_len(header);
+    let mut records = Vec::new();
+
+    if header.depth == 0 {
+        parse_leaf_node_storage(
+            storage,
+            header.root_node_address,
+            header,
+            offset_size,
+            length_size,
+            ndims,
+            chunk_dims,
+            chunk_bounds,
+            header.num_records_in_root,
+            heap_id_len,
+            &mut records,
+        )?;
+    } else {
+        parse_internal_node_storage(
+            storage,
+            header.root_node_address,
+            header,
+            offset_size,
+            length_size,
+            ndims,
+            chunk_dims,
+            chunk_bounds,
+            header.num_records_in_root,
+            header.depth,
+            heap_id_len,
+            &mut records,
+        )?;
+    }
+
+    Ok(records)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_leaf_node_storage(
+    storage: &dyn Storage,
+    address: u64,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+    num_records: u16,
+    heap_id_len: usize,
+    records: &mut Vec<BTreeV2Record>,
+) -> Result<()> {
+    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+        Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
+    })?;
+    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
+        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
+    })?;
+    let node_bytes = storage.read_range(address, read_len)?;
+    let mut cursor = Cursor::new(node_bytes.as_ref());
+    parse_leaf_node(
+        &mut cursor,
+        header,
+        offset_size,
+        length_size,
+        ndims,
+        chunk_dims,
+        chunk_bounds,
+        num_records,
+        heap_id_len,
+        records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_internal_node_storage(
+    storage: &dyn Storage,
+    address: u64,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+    num_records: u16,
+    depth: u16,
+    heap_id_len: usize,
+    records: &mut Vec<BTreeV2Record>,
+) -> Result<()> {
+    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+        Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
+    })?;
+    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
+        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
+    })?;
+    let node_bytes = storage.read_range(address, read_len)?;
+    let mut cursor = Cursor::new(node_bytes.as_ref());
+    let start = cursor.position();
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != BTIN_SIGNATURE {
+        return Err(Error::InvalidBTreeV2Signature {
+            context: "internal node",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::UnsupportedBTreeVersion(version));
+    }
+
+    let node_type = cursor.read_u8()?;
+    if node_type != header.btree_type {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 internal node type mismatch: header says {}, node says {}",
+            header.btree_type, node_type
+        )));
+    }
+
+    let max_child_records = if depth == 1 {
+        max_leaf_records(header.node_size, header.record_size)
+    } else {
+        let leaf_max = max_leaf_records(header.node_size, header.record_size);
+        let mut prev_max = leaf_max;
+        for _ in 1..depth {
+            prev_max =
+                max_internal_records(header.node_size, header.record_size, offset_size, prev_max);
+        }
+        prev_max
+    };
+    let nrec_bytes = num_records_size(max_child_records);
+
+    let mut node_records = Vec::with_capacity(num_records as usize);
+    for _ in 0..num_records {
+        let record = parse_record(
+            &mut cursor,
+            header.btree_type,
+            header.record_size,
+            offset_size,
+            length_size,
+            ndims,
+            heap_id_len,
+        )?;
+        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
+            node_records.push(record);
+        }
+    }
+
+    let num_children = usize::from(num_records) + 1;
+    let has_total_records = depth > 1;
+    let total_nrec_bytes = if has_total_records {
+        usize::from(length_size)
+    } else {
+        0
+    };
+
+    let mut child_addresses = Vec::with_capacity(num_children);
+    let mut child_nrecords = Vec::with_capacity(num_children);
+    for _ in 0..num_children {
+        child_addresses.push(cursor.read_offset(offset_size)?);
+        child_nrecords.push(cursor.read_uvar(nrec_bytes)? as u16);
+        if has_total_records {
+            cursor.read_uvar(total_nrec_bytes)?;
+        }
+    }
+
+    let checksum_data_end = cursor.position();
+    let stored_checksum = cursor.read_u32_le()?;
+    let computed = jenkins_lookup3(&cursor.data()[start as usize..checksum_data_end as usize]);
+    if computed != stored_checksum {
+        return Err(Error::ChecksumMismatch {
+            expected: stored_checksum,
+            actual: computed,
+        });
+    }
+
+    records.extend(node_records);
+
+    let child_depth = depth - 1;
+    for (i, &child_addr) in child_addresses.iter().enumerate() {
+        if Cursor::is_undefined_offset(child_addr, offset_size) {
+            continue;
+        }
+        let child_nrec = child_nrecords[i];
+        if child_depth == 0 {
+            parse_leaf_node_storage(
+                storage,
+                child_addr,
+                header,
+                offset_size,
+                length_size,
+                ndims,
+                chunk_dims,
+                chunk_bounds,
+                child_nrec,
+                heap_id_len,
+                records,
+            )?;
+        } else {
+            parse_internal_node_storage(
+                storage,
+                child_addr,
+                header,
+                offset_size,
+                length_size,
+                ndims,
+                chunk_dims,
+                chunk_bounds,
+                child_nrec,
+                child_depth,
+                heap_id_len,
+                records,
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the heap ID length from the record size and tree type.
