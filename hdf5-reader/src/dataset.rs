@@ -2620,15 +2620,23 @@ fn slice_array<T: H5Type + Clone>(
                 // Don't add to result_shape — this dimension is collapsed
             }
             SliceInfoElem::Slice { start, end, step } => {
+                let dim_size = checked_usize(dim_size, "slice dimension size")?;
                 let actual_end = if *end == u64::MAX {
-                    dim_size as usize
+                    dim_size
                 } else {
-                    (*end as usize).min(dim_size as usize)
+                    checked_usize(*end, "slice end")?.min(dim_size)
                 };
-                let actual_start = *start as usize;
-                let actual_step = *step as usize;
+                let actual_start = checked_usize(*start, "slice start")?;
+                let actual_step = checked_usize(*step, "slice step")?;
                 if actual_step == 0 {
                     return Err(Error::InvalidData("slice step cannot be 0".into()));
+                }
+                if actual_start > dim_size {
+                    return Err(Error::SliceOutOfBounds {
+                        dim: i,
+                        index: *start,
+                        size: shape[i],
+                    });
                 }
                 let n = (actual_end - actual_start).div_ceil(actual_step);
                 result_shape.push(n);
@@ -2638,7 +2646,7 @@ fn slice_array<T: H5Type + Clone>(
 
     // Extract elements manually (ndarray's slicing API is complex with dynamic dims)
     let ndim = shape.len();
-    let total: usize = result_shape.iter().product();
+    let total = checked_product_usize(&result_shape, "slice result element count")?;
     let mut elements = Vec::with_capacity(total);
 
     // Generate all indices in the result
@@ -2651,10 +2659,14 @@ fn slice_array<T: H5Type + Clone>(
         for sel in selection.selections.iter() {
             match sel {
                 SliceInfoElem::Index(idx) => {
-                    src_idx.push(*idx as usize);
+                    src_idx.push(checked_usize(*idx, "slice source index")?);
                 }
                 SliceInfoElem::Slice { start, step, .. } => {
-                    src_idx.push(*start as usize + result_idx[ri] * *step as usize);
+                    let start = checked_usize(*start, "slice start")?;
+                    let step = checked_usize(*step, "slice step")?;
+                    let offset =
+                        checked_mul_usize(result_idx[ri], step, "slice source index offset")?;
+                    src_idx.push(checked_add_usize(start, offset, "slice source index")?);
                     ri += 1;
                 }
             }

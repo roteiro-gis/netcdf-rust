@@ -606,7 +606,8 @@ impl<'f, T: NcReadable> Iterator for NcSliceIterator<'f, T> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = (self.dim_size - self.current) as usize;
+        let remaining_u64 = self.dim_size.saturating_sub(self.current);
+        let remaining = remaining_u64.min(usize::MAX as u64) as usize;
         (remaining, Some(remaining))
     }
 }
@@ -755,7 +756,10 @@ mod tests {
         assert_eq!(file.global_attributes().unwrap().len(), 1);
         assert_eq!(file.global_attributes().unwrap()[0].name, "title");
         assert_eq!(
-            file.global_attributes().unwrap()[0].value.as_string().unwrap(),
+            file.global_attributes().unwrap()[0]
+                .value
+                .as_string()
+                .unwrap(),
             "test"
         );
 

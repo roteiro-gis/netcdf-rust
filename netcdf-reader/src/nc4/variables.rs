@@ -77,13 +77,8 @@ pub fn extract_variables_from_datasets(
             Err(_) => continue,
         };
 
-        let var_dims = resolve_variable_dimensions(
-            ds,
-            group,
-            dimensions,
-            dim_addr_map,
-            metadata_mode,
-        )?;
+        let var_dims =
+            resolve_variable_dimensions(ds, group, dimensions, dim_addr_map, metadata_mode)?;
 
         // Detect if this variable uses an unlimited dimension
         let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
@@ -123,13 +118,7 @@ fn resolve_variable_dimensions(
     dim_addr_map: &HashMap<u64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcDimension>> {
-    resolve_variable_dimensions_with_mode(
-        ds,
-        group,
-        dimensions,
-        dim_addr_map,
-        metadata_mode,
-    )
+    resolve_variable_dimensions_with_mode(ds, group, dimensions, dim_addr_map, metadata_mode)
 }
 
 fn resolve_variable_dimensions_with_mode(
@@ -242,15 +231,13 @@ fn resolve_variable_dimensions_from_dimlist(
 
         // The heap object data contains `seq_len` object references,
         // each `offset_size` bytes.
-        let refs =
-            hdf5_reader::reference::read_object_references(&heap_obj.data, offset_size).map_err(
-                |err| {
-                    Error::InvalidData(format!(
-                        "dataset '{}' has invalid DIMENSION_LIST references: {err}",
-                        ds.name()
-                    ))
-                },
-            )?;
+        let refs = hdf5_reader::reference::read_object_references(&heap_obj.data, offset_size)
+            .map_err(|err| {
+                Error::InvalidData(format!(
+                    "dataset '{}' has invalid DIMENSION_LIST references: {err}",
+                    ds.name()
+                ))
+            })?;
 
         if refs.is_empty() {
             return Err(Error::InvalidData(format!(

@@ -186,10 +186,8 @@ mod tests {
             raw_data: vec![0; 16],
         };
 
-        assert!(
-            convert_attribute_value(&attr, crate::NcMetadataMode::Lossy)
-                .unwrap()
-                .is_none()
-        );
+        assert!(convert_attribute_value(&attr, crate::NcMetadataMode::Lossy)
+            .unwrap()
+            .is_none());
     }
 }
