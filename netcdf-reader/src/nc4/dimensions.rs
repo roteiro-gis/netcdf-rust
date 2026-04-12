@@ -42,84 +42,11 @@ pub fn extract_dimensions_from_datasets(
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
-    let strict = metadata_mode == crate::NcMetadataMode::Strict;
 
     for ds in datasets {
-        // Check for CLASS=DIMENSION_SCALE attribute
-        let is_dim_scale = match ds.attribute("CLASS") {
-            Ok(attr) => match attr.read_string() {
-                Ok(value) => value == "DIMENSION_SCALE",
-                Err(err) if strict => {
-                    return Err(Error::InvalidData(format!(
-                        "dataset '{}' has unreadable CLASS attribute: {err}",
-                        ds.name()
-                    )))
-                }
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
-
-        if !is_dim_scale {
-            continue;
+        if let Some((dimid, dim, address)) = extract_dimension_entry(ds, metadata_mode)? {
+            dims.push((dimid, dim, address));
         }
-
-        // Get dimension name from NAME attribute, falling back to dataset name
-        let name = match ds.attribute("NAME") {
-            Ok(attr) => match attr.read_string() {
-                Ok(value) => {
-                    if value.starts_with("This is a netCDF dimension but not a netCDF variable") {
-                        leaf_name(ds.name()).to_string()
-                    } else {
-                        value
-                    }
-                }
-                Err(err) if strict => {
-                    return Err(Error::InvalidData(format!(
-                        "dimension scale '{}' has unreadable NAME attribute: {err}",
-                        ds.name()
-                    )))
-                }
-                Err(_) => leaf_name(ds.name()).to_string(),
-            },
-            Err(_) => leaf_name(ds.name()).to_string(),
-        };
-
-        // Get current size from dataspace
-        let shape = ds.shape();
-        let size = if shape.is_empty() { 0 } else { shape[0] };
-
-        // Check max dims for unlimited
-        let is_unlimited = ds
-            .max_dims()
-            .is_some_and(|md| !md.is_empty() && md[0] == u64::MAX);
-
-        // Get stable ordering from _Netcdf4Dimid
-        let dimid = match ds.attribute("_Netcdf4Dimid") {
-            Ok(attr) => match attr.read_scalar::<i32>() {
-                Ok(id) => Some(id as i64),
-                Err(err) if strict => {
-                    return Err(Error::InvalidData(format!(
-                        "dimension scale '{}' has unreadable _Netcdf4Dimid attribute: {err}",
-                        ds.name()
-                    )))
-                }
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
-
-        let address = ds.address();
-
-        dims.push((
-            dimid,
-            NcDimension {
-                name,
-                size,
-                is_unlimited,
-            },
-            address,
-        ));
     }
 
     // Sort by _Netcdf4Dimid if available, otherwise preserve order
@@ -131,4 +58,85 @@ pub fn extract_dimensions_from_datasets(
     let dim_list: Vec<NcDimension> = dims.into_iter().map(|(_, d, _)| d).collect();
 
     Ok((dim_list, addr_map))
+}
+
+pub(crate) fn extract_dimension(
+    ds: &hdf5_reader::Dataset,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Option<NcDimension>> {
+    Ok(extract_dimension_entry(ds, metadata_mode)?.map(|(_, dim, _)| dim))
+}
+
+fn extract_dimension_entry(
+    ds: &hdf5_reader::Dataset,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Option<(Option<i64>, NcDimension, u64)>> {
+    let strict = metadata_mode == crate::NcMetadataMode::Strict;
+
+    let is_dim_scale = match ds.attribute("CLASS") {
+        Ok(attr) => match attr.read_string() {
+            Ok(value) => value == "DIMENSION_SCALE",
+            Err(err) if strict => {
+                return Err(Error::InvalidData(format!(
+                    "dataset '{}' has unreadable CLASS attribute: {err}",
+                    ds.name()
+                )))
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+
+    if !is_dim_scale {
+        return Ok(None);
+    }
+
+    let name = match ds.attribute("NAME") {
+        Ok(attr) => match attr.read_string() {
+            Ok(value) => {
+                if value.starts_with("This is a netCDF dimension but not a netCDF variable") {
+                    leaf_name(ds.name()).to_string()
+                } else {
+                    value
+                }
+            }
+            Err(err) if strict => {
+                return Err(Error::InvalidData(format!(
+                    "dimension scale '{}' has unreadable NAME attribute: {err}",
+                    ds.name()
+                )))
+            }
+            Err(_) => leaf_name(ds.name()).to_string(),
+        },
+        Err(_) => leaf_name(ds.name()).to_string(),
+    };
+
+    let shape = ds.shape();
+    let size = if shape.is_empty() { 0 } else { shape[0] };
+    let is_unlimited = ds
+        .max_dims()
+        .is_some_and(|md| !md.is_empty() && md[0] == u64::MAX);
+    let dimid = match ds.attribute("_Netcdf4Dimid") {
+        Ok(attr) => match attr.read_scalar::<i32>() {
+            Ok(id) => Some(id as i64),
+            Err(err) if strict => {
+                return Err(Error::InvalidData(format!(
+                    "dimension scale '{}' has unreadable _Netcdf4Dimid attribute: {err}",
+                    ds.name()
+                )))
+            }
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+
+    Ok(Some((
+        dimid,
+        NcDimension {
+            name,
+            size,
+            is_unlimited,
+        },
+        ds.address(),
+    )))
 }

@@ -229,6 +229,11 @@ impl Hdf5File {
         &self.context.superblock
     }
 
+    /// Access the underlying random-access storage backend.
+    pub fn storage(&self) -> &dyn Storage {
+        self.context.storage.as_ref()
+    }
+
     /// Look up or parse an object header at the given address.
     ///
     /// Uses the internal cache to avoid re-parsing the same header.

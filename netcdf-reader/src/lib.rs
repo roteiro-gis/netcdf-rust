@@ -31,6 +31,10 @@ pub mod nc4;
 pub mod cf;
 
 pub use error::{Error, Result};
+#[cfg(feature = "netcdf4")]
+pub use hdf5_reader::storage::DynStorage;
+#[cfg(feature = "netcdf4")]
+pub use hdf5_reader::{BytesStorage, FileStorage, MmapStorage, Storage, StorageBuffer};
 pub use types::*;
 
 use std::fs::File;
@@ -134,6 +138,50 @@ impl NcFile {
     /// The format is auto-detected from the magic bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         Self::from_bytes_with_options(data, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from a custom random-access storage backend.
+    ///
+    /// NetCDF-4 files stay fully range-backed. Classic formats are read from
+    /// the provided storage into an owned buffer.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_storage(storage: DynStorage) -> Result<Self> {
+        Self::from_storage_with_options(storage, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from a custom random-access storage backend with custom options.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_storage_with_options(storage: DynStorage, options: NcOpenOptions) -> Result<Self> {
+        let magic = storage.read_range(0, 8)?;
+        let format = detect_format(magic.as_ref())?;
+
+        match format {
+            NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
+                let len = usize::try_from(storage.len()).map_err(|_| {
+                    Error::InvalidData(
+                        "classic storage length exceeds platform usize capacity".into(),
+                    )
+                })?;
+                let bytes = storage.read_range(0, len)?;
+                let classic = classic::ClassicFile::from_bytes(bytes.as_ref(), format)?;
+                Ok(NcFile {
+                    format,
+                    inner: NcFileInner::Classic(classic),
+                })
+            }
+            NcFormat::Nc4 | NcFormat::Nc4Classic => {
+                let nc4 = nc4::Nc4File::from_storage_with_options(storage, options)?;
+                let actual_format = if nc4.is_classic_model() {
+                    NcFormat::Nc4Classic
+                } else {
+                    NcFormat::Nc4
+                };
+                Ok(NcFile {
+                    format: actual_format,
+                    inner: NcFileInner::Nc4(Box::new(nc4)),
+                })
+            }
+        }
     }
 
     /// Open a NetCDF file from in-memory bytes with custom options.

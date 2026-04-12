@@ -8,6 +8,7 @@ use crate::messages::dataspace::DataspaceType;
 use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringSize};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
+use crate::storage::Storage;
 use crate::{btree_v2, messages};
 
 /// A parsed, high-level HDF5 attribute.
@@ -301,6 +302,7 @@ impl Attribute {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn collect_attribute_messages(
     header: &ObjectHeader,
     file_data: &[u8],
@@ -330,6 +332,36 @@ pub(crate) fn collect_attribute_messages(
     Ok(attributes)
 }
 
+pub(crate) fn collect_attribute_messages_storage(
+    header: &ObjectHeader,
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>> {
+    let mut attributes = Vec::new();
+    let mut attribute_info = None;
+
+    for msg in &header.messages {
+        match msg {
+            HdfMessage::Attribute(attr) => attributes.push(attr.clone()),
+            HdfMessage::AttributeInfo(info) => attribute_info = Some(info.clone()),
+            _ => {}
+        }
+    }
+
+    if let Some(info) = attribute_info {
+        attributes.extend(load_dense_attribute_messages_storage(
+            &info,
+            storage,
+            offset_size,
+            length_size,
+        )?);
+    }
+
+    Ok(attributes)
+}
+
+#[allow(dead_code)]
 fn load_dense_attribute_messages(
     info: &AttributeInfoMessage,
     file_data: &[u8],
@@ -375,6 +407,55 @@ fn load_dense_attribute_messages(
     Ok(attributes)
 }
 
+fn load_dense_attribute_messages_storage(
+    info: &AttributeInfoMessage,
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>> {
+    if Cursor::is_undefined_offset(info.fractal_heap_address, offset_size) {
+        return Ok(Vec::new());
+    }
+
+    let heap = FractalHeap::parse_at_storage(
+        storage,
+        info.fractal_heap_address,
+        offset_size,
+        length_size,
+    )?;
+
+    let records = load_dense_attribute_records_storage(info, storage, offset_size, length_size)
+        .unwrap_or_default();
+
+    let mut attributes = Vec::new();
+    for record in records {
+        let heap_id = match record {
+            btree_v2::BTreeV2Record::AttributeNameHash { heap_id, .. }
+            | btree_v2::BTreeV2Record::AttributeCreationOrder { heap_id, .. } => heap_id,
+            _ => continue,
+        };
+
+        let managed_bytes =
+            match heap.get_managed_object_storage(&heap_id, storage, offset_size, length_size) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+
+        let mut attr_cursor = Cursor::new(&managed_bytes);
+        if let Ok(attr) = messages::attribute::parse(
+            &mut attr_cursor,
+            offset_size,
+            length_size,
+            managed_bytes.len(),
+        ) {
+            attributes.push(attr);
+        }
+    }
+
+    Ok(attributes)
+}
+
+#[allow(dead_code)]
 fn load_dense_attribute_records(
     info: &AttributeInfoMessage,
     file_data: &[u8],
@@ -415,6 +496,48 @@ fn load_dense_attribute_records(
     Ok(Vec::new())
 }
 
+fn load_dense_attribute_records_storage(
+    info: &AttributeInfoMessage,
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<btree_v2::BTreeV2Record>> {
+    let mut addrs = vec![info.btree_name_index_address];
+    if let Some(creation_order_addr) = info.btree_creation_order_address {
+        addrs.push(creation_order_addr);
+    }
+
+    for addr in addrs {
+        if Cursor::is_undefined_offset(addr, offset_size) {
+            continue;
+        }
+
+        let header = match btree_v2::BTreeV2Header::parse_at_storage(
+            storage,
+            addr,
+            offset_size,
+            length_size,
+        ) {
+            Ok(header) => header,
+            Err(_) => continue,
+        };
+
+        if let Ok(records) = btree_v2::collect_btree_v2_records_storage(
+            storage,
+            &header,
+            offset_size,
+            length_size,
+            None,
+            &[],
+            None,
+        ) {
+            return Ok(records);
+        }
+    }
+
+    Ok(Vec::new())
+}
+
 /// Read one variable-length string from a vlen reference in raw_data.
 pub(crate) fn read_one_vlen_string(
     raw_data: &[u8],
@@ -437,6 +560,32 @@ pub(crate) fn read_one_vlen_string(
     heap_cursor.set_position(heap_addr);
     let collection = GlobalHeapCollection::parse(&mut heap_cursor, offset_size, offset_size)?;
 
+    match collection.get_object(obj_index as u16) {
+        Some(obj) => decode_string(&obj.data, padding, encoding),
+        None => Ok(String::new()),
+    }
+}
+
+pub(crate) fn read_one_vlen_string_storage(
+    raw_data: &[u8],
+    offset: usize,
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+    padding: StringPadding,
+    encoding: StringEncoding,
+) -> Result<String> {
+    let mut cursor = Cursor::new(&raw_data[offset..]);
+    let _seq_len = cursor.read_u32_le()?;
+    let heap_addr = cursor.read_offset(offset_size)?;
+    let obj_index = cursor.read_u32_le()?;
+
+    if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
+        return Ok(String::new());
+    }
+
+    let collection =
+        GlobalHeapCollection::parse_at_storage(storage, heap_addr, offset_size, length_size)?;
     match collection.get_object(obj_index as u16) {
         Some(obj) => decode_string(&obj.data, padding, encoding),
         None => Ok(String::new()),
@@ -503,6 +652,32 @@ pub(crate) fn resolve_vlen_bytes(
     heap_cursor.set_position(heap_addr);
     let collection =
         GlobalHeapCollection::parse(&mut heap_cursor, offset_size, offset_size).ok()?;
+    let object = collection.get_object(obj_index)?;
+    Some(object.data[..object.data.len().min(seq_len)].to_vec())
+}
+
+pub(crate) fn resolve_vlen_bytes_storage(
+    raw_data: &[u8],
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+) -> Option<Vec<u8>> {
+    if raw_data.len() < 4 + offset_size as usize + 4 {
+        return None;
+    }
+
+    let mut cursor = Cursor::new(raw_data);
+    let seq_len = cursor.read_u32_le().ok()? as usize;
+    let heap_addr = cursor.read_offset(offset_size).ok()?;
+    let obj_index = cursor.read_u32_le().ok()? as u16;
+
+    if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
+        return Some(Vec::new());
+    }
+
+    let collection =
+        GlobalHeapCollection::parse_at_storage(storage, heap_addr, offset_size, length_size)
+            .ok()?;
     let object = collection.get_object(obj_index)?;
     Some(object.data[..object.data.len().min(seq_len)].to_vec())
 }

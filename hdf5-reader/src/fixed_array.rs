@@ -12,6 +12,7 @@ use crate::checksum::jenkins_lookup3;
 use crate::chunk_index::ChunkEntry;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 
 const FAHD_SIGNATURE: [u8; 4] = *b"FAHD";
 const FADB_SIGNATURE: [u8; 4] = *b"FADB";
@@ -75,6 +76,17 @@ fn parse_header(data: &[u8], address: u64, offset_size: u8, length_size: u8) -> 
         num_entries,
         data_block_address,
     })
+}
+
+fn parse_header_storage(
+    storage: &dyn Storage,
+    address: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<FaHeader> {
+    let header_len = 4 + 1 + 1 + 1 + 1 + usize::from(length_size) + usize::from(offset_size) + 4;
+    let bytes = storage.read_range(address, header_len)?;
+    parse_header(bytes.as_ref(), 0, offset_size, length_size)
 }
 
 /// A single raw fixed-array entry (before conversion to ChunkEntry).
@@ -228,6 +240,21 @@ fn read_entry_at(
 ) -> Result<FaRawEntry> {
     let mut cursor = Cursor::new(data);
     cursor.set_position(position);
+    let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
+    entries
+        .pop()
+        .ok_or_else(|| Error::InvalidData("missing fixed array entry".into()))
+}
+
+fn read_entry_at_storage(
+    storage: &dyn Storage,
+    position: u64,
+    is_filtered: bool,
+    offset_size: u8,
+    entry_size: u8,
+) -> Result<FaRawEntry> {
+    let bytes = storage.read_range(position, usize::from(entry_size))?;
+    let mut cursor = Cursor::new(bytes.as_ref());
     let mut entries = read_entries(&mut cursor, 1, is_filtered, offset_size, entry_size)?;
     entries
         .pop()
@@ -401,6 +428,142 @@ fn collect_fixed_array_chunk_entries_bounded(
     Ok(entries)
 }
 
+fn collect_fixed_array_chunk_entries_bounded_storage(
+    storage: &dyn Storage,
+    header: &FaHeader,
+    offset_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: (&[u64], &[u64]),
+) -> Result<Vec<ChunkEntry>> {
+    let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(chunk_bounds));
+    let block_header_len = 4 + 1 + 1 + usize::from(offset_size);
+    let header_bytes = storage.read_range(header.data_block_address, block_header_len)?;
+    let mut cursor = Cursor::new(header_bytes.as_ref());
+
+    let sig = cursor.read_bytes(4)?;
+    if sig != FADB_SIGNATURE {
+        return Err(Error::InvalidFixedArraySignature {
+            context: "data block signature mismatch",
+        });
+    }
+
+    let version = cursor.read_u8()?;
+    if version != 0 {
+        return Err(Error::Other(format!(
+            "unsupported fixed array data block version {}",
+            version
+        )));
+    }
+
+    let _client_id = cursor.read_u8()?;
+    let _header_address = cursor.read_offset(offset_size)?;
+
+    let num_entries = usize::try_from(header.num_entries).map_err(|_| {
+        Error::InvalidData("fixed array entry count exceeds platform usize capacity".into())
+    })?;
+    let is_filtered = header.client_id == 1;
+    let entry_bytes = usize::from(header.entry_size);
+    let use_paging = header.page_bits > 0 && num_entries > (1usize << header.page_bits);
+    let entries_start = header.data_block_address
+        + u64::try_from(block_header_len)
+            .map_err(|_| Error::OffsetOutOfBounds(header.data_block_address))?;
+
+    if !use_paging {
+        let mut entries = Vec::new();
+        for (linear_idx, offsets) in targets {
+            let position = entries_start
+                + u64::try_from(linear_idx * entry_bytes).map_err(|_| {
+                    Error::InvalidData("fixed array entry offset exceeds u64 capacity".into())
+                })?;
+            let raw = read_entry_at_storage(
+                storage,
+                position,
+                is_filtered,
+                offset_size,
+                header.entry_size,
+            )?;
+            if Cursor::is_undefined_offset(raw.address, offset_size) {
+                continue;
+            }
+            entries.push(ChunkEntry {
+                address: raw.address,
+                size: raw.chunk_size,
+                filter_mask: raw.filter_mask,
+                offsets,
+            });
+        }
+        return Ok(entries);
+    }
+
+    let entries_per_page = 1usize << header.page_bits;
+    let num_pages = num_entries.div_ceil(entries_per_page);
+    let bitmap_bytes = num_pages.div_ceil(8);
+    let page_bitmap = storage.read_range(entries_start, bitmap_bytes)?;
+    let pages_start = entries_start
+        + u64::try_from(bitmap_bytes).map_err(|_| {
+            Error::InvalidData("fixed array bitmap size exceeds u64 capacity".into())
+        })?;
+
+    let mut page_offsets = vec![None; num_pages];
+    let mut next_page_start = pages_start;
+    for (page_idx, page_offset) in page_offsets.iter_mut().enumerate().take(num_pages) {
+        let byte_idx = page_idx / 8;
+        let bit_idx = page_idx % 8;
+        let page_initialized =
+            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+
+        let entries_in_page = if page_idx == num_pages - 1 {
+            let remainder = num_entries % entries_per_page;
+            if remainder == 0 {
+                entries_per_page
+            } else {
+                remainder
+            }
+        } else {
+            entries_per_page
+        };
+
+        if page_initialized {
+            *page_offset = Some(next_page_start);
+            next_page_start += u64::try_from(entries_in_page * entry_bytes + 4).map_err(|_| {
+                Error::InvalidData("fixed array page size exceeds u64 capacity".into())
+            })?;
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (linear_idx, offsets) in targets {
+        let page_idx = linear_idx / entries_per_page;
+        let within_page = linear_idx % entries_per_page;
+        let Some(page_start) = page_offsets[page_idx] else {
+            continue;
+        };
+        let position = page_start
+            + u64::try_from(within_page * entry_bytes).map_err(|_| {
+                Error::InvalidData("fixed array page entry offset exceeds u64 capacity".into())
+            })?;
+        let raw = read_entry_at_storage(
+            storage,
+            position,
+            is_filtered,
+            offset_size,
+            header.entry_size,
+        )?;
+        if Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+        entries.push(ChunkEntry {
+            address: raw.address,
+            size: raw.chunk_size,
+            filter_mask: raw.filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(entries)
+}
+
 /// Collect chunk entries from a Fixed Array index.
 ///
 /// Reads the FAHD header and FADB data block, then converts linear entry
@@ -466,6 +629,102 @@ pub fn collect_fixed_array_chunk_entries(
         entries.push(ChunkEntry {
             address: raw.address,
             size: raw.chunk_size,
+            filter_mask: raw.filter_mask,
+            offsets,
+        });
+    }
+
+    Ok(entries)
+}
+
+/// Collect chunk entries from a Fixed Array index using random-access storage.
+pub fn collect_fixed_array_chunk_entries_storage(
+    storage: &dyn Storage,
+    header_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    dataset_shape: &[u64],
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Result<Vec<ChunkEntry>> {
+    let header = parse_header_storage(storage, header_address, offset_size, length_size)?;
+
+    if Cursor::is_undefined_offset(header.data_block_address, offset_size) {
+        return Ok(Vec::new());
+    }
+
+    if let Some(bounds) = chunk_bounds {
+        return collect_fixed_array_chunk_entries_bounded_storage(
+            storage,
+            &header,
+            offset_size,
+            dataset_shape,
+            chunk_dims,
+            bounds,
+        );
+    }
+
+    let num_entries = usize::try_from(header.num_entries).map_err(|_| {
+        Error::InvalidData("fixed array entry count exceeds platform usize capacity".into())
+    })?;
+    let is_filtered = header.client_id == 1;
+    let header_len = 4 + 1 + 1 + usize::from(offset_size);
+    let use_paging = header.page_bits > 0 && num_entries > (1usize << header.page_bits);
+    let block_len = if !use_paging {
+        header_len + num_entries * usize::from(header.entry_size) + 4
+    } else {
+        let entries_per_page = 1usize << header.page_bits;
+        let num_pages = num_entries.div_ceil(entries_per_page);
+        let bitmap_bytes = num_pages.div_ceil(8);
+        let mut len = header_len + bitmap_bytes;
+        for page_idx in 0..num_pages {
+            let entries_in_page = if page_idx == num_pages - 1 {
+                let remainder = num_entries % entries_per_page;
+                if remainder == 0 {
+                    entries_per_page
+                } else {
+                    remainder
+                }
+            } else {
+                entries_per_page
+            };
+            len += entries_in_page * usize::from(header.entry_size) + 4;
+        }
+        len
+    };
+    let block = storage.read_range(header.data_block_address, block_len)?;
+    let raw_entries = parse_data_block(block.as_ref(), 0, &header, offset_size)?;
+
+    let ndim = dataset_shape.len();
+    let chunks_per_dim: Vec<u64> = (0..ndim)
+        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
+        .collect();
+
+    let mut entries = Vec::new();
+    for (linear_idx, raw) in raw_entries.iter().enumerate() {
+        if Cursor::is_undefined_offset(raw.address, offset_size) {
+            continue;
+        }
+        let mut remaining = linear_idx as u64;
+        let mut offsets = vec![0u64; ndim];
+        for d in (0..ndim).rev() {
+            offsets[d] = (remaining % chunks_per_dim[d]) * chunk_dims[d] as u64;
+            remaining /= chunks_per_dim[d];
+        }
+
+        if let Some((first_chunk, last_chunk)) = chunk_bounds {
+            let overlaps = offsets.iter().enumerate().all(|(dim, offset)| {
+                let chunk_index = *offset / u64::from(chunk_dims[dim]);
+                chunk_index >= first_chunk[dim] && chunk_index <= last_chunk[dim]
+            });
+            if !overlaps {
+                continue;
+            }
+        }
+
+        entries.push(ChunkEntry {
+            address: raw.address,
+            size: if is_filtered { raw.chunk_size } else { 0 },
             filter_mask: raw.filter_mask,
             offsets,
         });

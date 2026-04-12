@@ -44,11 +44,16 @@ struct ResolvedClassicSelection {
 }
 
 struct BlockReadContext<'a> {
-    dims: &'a [ResolvedClassicSelectionDim],
-    strides: &'a [u64],
     file_data: &'a [u8],
     var_name: &'a str,
     base_offset: usize,
+    plan: &'a ContiguousSelectionPlan,
+}
+
+struct ContiguousSelectionPlan {
+    dims: Vec<ResolvedClassicSelectionDim>,
+    strides: Vec<u64>,
+    tail_start: usize,
     block_elements: usize,
     block_bytes: usize,
     elem_size: u64,
@@ -59,8 +64,8 @@ struct RecordSliceContext<'a> {
     var_name: &'a str,
     base_offset: usize,
     record_stride: usize,
-    inner_shape: &'a [u64],
     inner_resolved: &'a ResolvedClassicSelection,
+    inner_plan: &'a ContiguousSelectionPlan,
 }
 
 impl ClassicFile {
@@ -453,6 +458,7 @@ fn read_record_variable_slice_direct<T: NcReadType>(
         result_elements: selection_result_elements(&inner_dims)?,
         dims: inner_dims,
     };
+    let inner_plan = build_contiguous_selection_plan::<T>(inner_shape, &inner_resolved.dims)?;
     let base_offset = checked_usize_from_u64(var.data_offset, "classic slice data offset")?;
     let record_stride = checked_usize_from_u64(record_stride, "classic record stride")?;
     let mut values = Vec::with_capacity(resolved.result_elements);
@@ -461,8 +467,8 @@ fn read_record_variable_slice_direct<T: NcReadType>(
         var_name: &var.name,
         base_offset,
         record_stride,
-        inner_shape,
         inner_resolved: &inner_resolved,
+        inner_plan: &inner_plan,
     };
 
     match &resolved.dims[0] {
@@ -526,26 +532,24 @@ fn build_array_from_contiguous_selection<T: NcReadType>(
 ) -> Result<ArrayD<T>> {
     use ndarray::IxDyn;
 
-    let values =
-        read_contiguous_selection_values::<T>(file_data, var_name, base_offset, shape, resolved)?;
+    let plan = build_contiguous_selection_plan::<T>(shape, &resolved.dims)?;
+    let values = read_contiguous_selection_values_with_plan::<T>(
+        file_data,
+        var_name,
+        base_offset,
+        &plan,
+        resolved.result_elements,
+    )?;
     ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {e}")))
 }
 
-fn read_contiguous_selection_values<T: NcReadType>(
-    file_data: &[u8],
-    var_name: &str,
-    base_offset: usize,
+fn build_contiguous_selection_plan<T: NcReadType>(
     shape: &[u64],
-    resolved: &ResolvedClassicSelection,
-) -> Result<Vec<T>> {
-    if resolved.result_elements == 0 {
-        return Ok(Vec::new());
-    }
-
+    dims: &[ResolvedClassicSelectionDim],
+) -> Result<ContiguousSelectionPlan> {
     let strides = row_major_strides(shape, "classic slice stride")?;
-    let tail_start = resolved
-        .dims
+    let tail_start = dims
         .iter()
         .rposition(|dim| !dim.is_full_unit_stride())
         .map_or(0, |idx| idx + 1);
@@ -566,18 +570,35 @@ fn read_contiguous_selection_values<T: NcReadType>(
         "classic slice contiguous block size in bytes",
     )?;
 
-    let mut values = Vec::with_capacity(resolved.result_elements);
-    let context = BlockReadContext {
-        dims: &resolved.dims,
-        strides: &strides,
-        file_data,
-        var_name,
-        base_offset,
+    Ok(ContiguousSelectionPlan {
+        dims: dims.to_vec(),
+        strides,
+        tail_start,
         block_elements,
         block_bytes,
         elem_size: T::element_size() as u64,
+    })
+}
+
+fn read_contiguous_selection_values_with_plan<T: NcReadType>(
+    file_data: &[u8],
+    var_name: &str,
+    base_offset: usize,
+    plan: &ContiguousSelectionPlan,
+    result_elements: usize,
+) -> Result<Vec<T>> {
+    if result_elements == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut values = Vec::with_capacity(result_elements);
+    let context = BlockReadContext {
+        file_data,
+        var_name,
+        base_offset,
+        plan,
     };
-    read_selected_blocks_recursive::<T>(0, tail_start, 0, &context, &mut values)?;
+    read_selected_blocks_recursive::<T>(0, 0, &context, &mut values)?;
     Ok(values)
 }
 
@@ -595,12 +616,12 @@ fn append_one_record_slice<T: NcReadType>(
         .ok_or_else(|| {
             Error::InvalidData("classic record byte offset exceeds platform usize".to_string())
         })?;
-    let mut decoded = read_contiguous_selection_values::<T>(
+    let mut decoded = read_contiguous_selection_values_with_plan::<T>(
         context.file_data,
         context.var_name,
         record_offset,
-        context.inner_shape,
-        context.inner_resolved,
+        context.inner_plan,
+        context.inner_resolved.result_elements,
     )?;
     values.append(&mut decoded);
     Ok(())
@@ -608,16 +629,15 @@ fn append_one_record_slice<T: NcReadType>(
 
 fn read_selected_blocks_recursive<T: NcReadType>(
     level: usize,
-    tail_start: usize,
     current_offset: u64,
     context: &BlockReadContext<'_>,
     values: &mut Vec<T>,
 ) -> Result<()> {
-    if level == tail_start {
+    if level == context.plan.tail_start {
         let byte_offset = checked_usize_from_u64(
             checked_mul_u64(
                 current_offset,
-                context.elem_size,
+                context.plan.elem_size,
                 "classic slice element byte offset",
             )?,
             "classic slice element byte offset",
@@ -628,7 +648,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
             .ok_or_else(|| {
                 Error::InvalidData("classic slice byte offset exceeds platform usize".to_string())
             })?;
-        let end = start.checked_add(context.block_bytes).ok_or_else(|| {
+        let end = start.checked_add(context.plan.block_bytes).ok_or_else(|| {
             Error::InvalidData("classic slice byte range exceeds platform usize".to_string())
         })?;
         if end > context.file_data.len() {
@@ -639,19 +659,18 @@ fn read_selected_blocks_recursive<T: NcReadType>(
         }
 
         let mut decoded =
-            T::decode_bulk_be(&context.file_data[start..end], context.block_elements)?;
+            T::decode_bulk_be(&context.file_data[start..end], context.plan.block_elements)?;
         values.append(&mut decoded);
         return Ok(());
     }
 
-    match &context.dims[level] {
+    match &context.plan.dims[level] {
         ResolvedClassicSelectionDim::Index(idx) => read_selected_blocks_recursive::<T>(
             level + 1,
-            tail_start,
             current_offset
                 .checked_add(checked_mul_u64(
                     *idx,
-                    context.strides[level],
+                    context.plan.strides[level],
                     "classic slice logical element offset",
                 )?)
                 .ok_or_else(|| {
@@ -680,11 +699,10 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                     })?;
                 read_selected_blocks_recursive::<T>(
                     level + 1,
-                    tail_start,
                     current_offset
                         .checked_add(checked_mul_u64(
                             coord,
-                            context.strides[level],
+                            context.plan.strides[level],
                             "classic slice logical element offset",
                         )?)
                         .ok_or_else(|| {

@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use hdf5_reader::datatype_api::H5Type;
+use hdf5_reader::storage::DynStorage;
 use hdf5_reader::Hdf5File;
 use ndarray::ArrayD;
 #[cfg(feature = "rayon")]
@@ -223,6 +224,27 @@ impl Nc4File {
         Nc4File::from_hdf5(hdf5, options.metadata_mode)
     }
 
+    /// Open a NetCDF-4 file from a custom random-access storage backend.
+    pub fn from_storage(storage: DynStorage) -> Result<Self> {
+        Self::from_storage_with_options(storage, crate::NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF-4 file from a custom random-access storage backend with custom options.
+    pub fn from_storage_with_options(
+        storage: DynStorage,
+        options: crate::NcOpenOptions,
+    ) -> Result<Self> {
+        let hdf5 = Hdf5File::from_storage_with_options(
+            storage,
+            hdf5_reader::OpenOptions {
+                chunk_cache_bytes: options.chunk_cache_bytes,
+                chunk_cache_slots: options.chunk_cache_slots,
+                filter_registry: options.filter_registry,
+            },
+        )?;
+        Nc4File::from_hdf5(hdf5, options.metadata_mode)
+    }
+
     /// The root group.
     pub fn root_group(&self) -> Result<&NcGroup> {
         self.subtree_group_cache.get_or_try_insert_with("/", || {
@@ -268,33 +290,24 @@ impl Nc4File {
         let normalized_dataset = normalize_dataset_path(path)?;
         self.variable_cache
             .get_or_try_insert_with(normalized_dataset, || {
-                let context = groups::group_context_at_path(
-                    &self.hdf5,
-                    normalized_group,
-                    self.metadata_mode,
-                )?;
-                let dataset = context
-                    .group
+                let group = groups::open_group_at_path(&self.hdf5, normalized_group)?;
+                let dataset = group
                     .dataset(variable_name)
                     .map_err(|_| Error::VariableNotFound(path.to_string()))?;
-                variables::extract_variable(
+                let var_dims = self.resolve_variable_dimensions_path_local(
+                    normalized_group,
+                    &group,
                     &dataset,
-                    &context.group,
-                    &context.visible_dimensions,
-                    &context.visible_dim_addr_map,
-                    self.metadata_mode,
-                )?
-                .ok_or_else(|| Error::VariableNotFound(path.to_string()))
+                )?;
+                variables::build_variable_with_dimensions(&dataset, var_dims, self.metadata_mode)?
+                    .ok_or_else(|| Error::VariableNotFound(path.to_string()))
             })
     }
 
     pub fn dimension(&self, path: &str) -> Result<&crate::types::NcDimension> {
         let (group_path, dimension_name) = split_parent_path_required(path, "dimension")?;
-        let context = groups::group_context_at_path(&self.hdf5, group_path, self.metadata_mode)?;
-        let dim = context
-            .visible_dimensions
-            .into_iter()
-            .find(|dim| dim.name == dimension_name)
+        let dim = self
+            .find_dimension_path_local(group_path, dimension_name)?
             .ok_or_else(|| Error::DimensionNotFound(path.to_string()))?;
         self.dimension_cache
             .get_or_try_insert_with(&format!("dim:{path}"), || Ok(dim))
@@ -388,6 +401,73 @@ impl Nc4File {
             .root_metadata
             .get()
             .expect("root metadata must be initialized after successful build"))
+    }
+
+    fn resolve_variable_dimensions_path_local(
+        &self,
+        group_path: &str,
+        group: &hdf5_reader::group::Group,
+        dataset: &hdf5_reader::Dataset,
+    ) -> Result<Vec<NcDimension>> {
+        let dim_addrs = variables::resolve_dimension_scale_addresses(dataset, group)?;
+        let ancestor_groups = groups::ancestor_groups_including(&self.hdf5, group_path)?;
+        let mut dims = Vec::with_capacity(dim_addrs.len());
+
+        for dim_addr in dim_addrs {
+            let mut resolved = None;
+            for ancestor in ancestor_groups.iter().rev() {
+                let Some(child_name) = ancestor.child_name_by_address(dim_addr)? else {
+                    continue;
+                };
+                let dim_dataset = ancestor.dataset(&child_name).map_err(|_| {
+                    Error::InvalidData(format!(
+                        "failed to open dimension scale dataset '{child_name}' for address {dim_addr:#x}"
+                    ))
+                })?;
+                if let Some(dim) = dimensions::extract_dimension(&dim_dataset, self.metadata_mode)?
+                {
+                    resolved = Some(dim);
+                    break;
+                }
+            }
+
+            let mut dim = resolved.ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "dataset '{}' references unknown dimension scale address {dim_addr:#x}",
+                    dataset.name()
+                ))
+            })?;
+
+            if let Some(max_dims) = dataset.max_dims() {
+                if let Some(index) = dims.len().checked_sub(0) {
+                    if index < max_dims.len() && max_dims[index] == u64::MAX {
+                        dim.is_unlimited = true;
+                    }
+                }
+            }
+
+            dims.push(dim);
+        }
+
+        Ok(dims)
+    }
+
+    fn find_dimension_path_local(
+        &self,
+        group_path: &str,
+        dimension_name: &str,
+    ) -> Result<Option<NcDimension>> {
+        let ancestor_groups = groups::ancestor_groups_including(&self.hdf5, group_path)?;
+        for group in ancestor_groups.into_iter().rev() {
+            let dataset = match group.dataset(dimension_name) {
+                Ok(dataset) => dataset,
+                Err(_) => continue,
+            };
+            if let Some(dim) = dimensions::extract_dimension(&dataset, self.metadata_mode)? {
+                return Ok(Some(dim));
+            }
+        }
+        Ok(None)
     }
 }
 

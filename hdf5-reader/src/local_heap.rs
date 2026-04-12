@@ -10,6 +10,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
+use crate::storage::Storage;
 
 /// Signature bytes for a Local Heap: ASCII `HEAP`.
 const HEAP_SIGNATURE: [u8; 4] = *b"HEAP";
@@ -64,6 +65,24 @@ impl LocalHeap {
         })
     }
 
+    /// Parse a local heap header from random-access storage.
+    pub fn parse_at_storage(
+        storage: &dyn Storage,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self> {
+        let header_len = 4
+            + 1
+            + 3
+            + usize::from(length_size)
+            + usize::from(length_size)
+            + usize::from(offset_size);
+        let bytes = storage.read_range(address, header_len)?;
+        let mut cursor = Cursor::new(bytes.as_ref());
+        Self::parse(&mut cursor, offset_size, length_size)
+    }
+
     /// Read a null-terminated string at the given offset within the heap's
     /// data segment.
     ///
@@ -94,6 +113,32 @@ impl LocalHeap {
         let s = std::str::from_utf8(&search_region[..null_pos])
             .map_err(|e| Error::InvalidData(format!("invalid UTF-8 in local heap string: {e}")))?;
 
+        Ok(s.to_string())
+    }
+
+    /// Read a null-terminated string from random-access storage.
+    pub fn get_string_storage(&self, offset: u64, storage: &dyn Storage) -> Result<String> {
+        if offset >= self.data_segment_size {
+            return Err(Error::OffsetOutOfBounds(offset));
+        }
+
+        let available = self
+            .data_segment_size
+            .checked_sub(offset)
+            .ok_or(Error::OffsetOutOfBounds(offset))?;
+        let len = usize::try_from(available).map_err(|_| {
+            Error::InvalidData("local heap string region exceeds platform usize capacity".into())
+        })?;
+        let abs = self
+            .data_segment_address
+            .checked_add(offset)
+            .ok_or(Error::OffsetOutOfBounds(offset))?;
+        let bytes = storage.read_range(abs, len)?;
+        let null_pos = bytes.iter().position(|&b| b == 0).ok_or_else(|| {
+            Error::InvalidData("local heap string missing null terminator".into())
+        })?;
+        let s = std::str::from_utf8(&bytes[..null_pos])
+            .map_err(|e| Error::InvalidData(format!("invalid UTF-8 in local heap string: {e}")))?;
         Ok(s.to_string())
     }
 }

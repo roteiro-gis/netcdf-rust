@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::attribute_api::{collect_attribute_messages, Attribute};
+use crate::attribute_api::{
+    collect_attribute_messages_storage, resolve_vlen_bytes_storage, Attribute,
+};
 use crate::btree_v1;
 use crate::btree_v2;
 use crate::dataset::Dataset;
@@ -12,9 +14,11 @@ use crate::messages::link::{self, LinkMessage, LinkTarget};
 use crate::messages::link_info::LinkInfoMessage;
 use crate::messages::symbol_table_msg::SymbolTableMessage;
 use crate::messages::HdfMessage;
+use crate::storage::Storage;
 use crate::FileContext;
 
 /// A group within an HDF5 file.
+#[derive(Clone)]
 pub struct Group {
     context: Arc<FileContext>,
     pub(crate) name: String,
@@ -58,6 +62,11 @@ impl Group {
     /// Materialize the full file backing this group.
     pub fn file_data(&self) -> Result<crate::storage::StorageBuffer> {
         self.context.full_file_data()
+    }
+
+    /// Access the underlying random-access storage backend.
+    pub fn storage(&self) -> &dyn Storage {
+        self.context.storage.as_ref()
     }
 
     /// Size of file offsets in bytes.
@@ -156,16 +165,41 @@ impl Group {
             self.offset_size(),
             self.length_size(),
         )?;
-        let file_data = self.context.full_file_data()?;
-        Ok(collect_attribute_messages(
+        Ok(collect_attribute_messages_storage(
             &header,
-            file_data.as_ref(),
+            self.context.storage.as_ref(),
             self.offset_size(),
             self.length_size(),
         )?
         .into_iter()
         .map(|attr| {
-            Attribute::from_message_with_context(attr, Some(file_data.as_ref()), self.offset_size())
+            let raw_data = match &attr.datatype {
+                crate::messages::datatype::Datatype::VarLen { base }
+                    if matches!(
+                        base.as_ref(),
+                        crate::messages::datatype::Datatype::FixedPoint { size: 1, .. }
+                    ) && attr.dataspace.num_elements() == 1 =>
+                {
+                    resolve_vlen_bytes_storage(
+                        &attr.raw_data,
+                        self.context.storage.as_ref(),
+                        self.offset_size(),
+                        self.length_size(),
+                    )
+                    .unwrap_or_else(|| attr.raw_data.clone())
+                }
+                _ => attr.raw_data.clone(),
+            };
+            Attribute {
+                name: attr.name,
+                datatype: attr.datatype,
+                shape: match attr.dataspace.dataspace_type {
+                    crate::messages::dataspace::DataspaceType::Scalar => vec![],
+                    crate::messages::dataspace::DataspaceType::Null => vec![0],
+                    crate::messages::dataspace::DataspaceType::Simple => attr.dataspace.dims,
+                },
+                raw_data,
+            }
         })
         .collect())
     }
@@ -188,7 +222,6 @@ impl Group {
     /// Resolve children with a soft-link depth counter to prevent cycles.
     fn resolve_children_with_link_depth(&self, link_depth: u32) -> Result<Vec<ChildEntry>> {
         let header = self.cached_header(self.address)?;
-        let file_data = self.context.full_file_data()?;
 
         let mut children = Vec::new();
 
@@ -202,7 +235,7 @@ impl Group {
             match msg {
                 HdfMessage::SymbolTable(st) => {
                     found_symbol_table = true;
-                    children = self.resolve_old_style_group(st, file_data.as_ref())?;
+                    children = self.resolve_old_style_group_storage(st)?;
                 }
                 HdfMessage::Link(link) => {
                     links.push(link.clone());
@@ -221,7 +254,7 @@ impl Group {
             // Dense-link storage can coexist with compact links, so merge both.
             if let Some(ref li) = link_info {
                 if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
-                    for child in self.resolve_dense_links(li, link_depth, file_data.as_ref())? {
+                    for child in self.resolve_dense_links_storage(li, link_depth)? {
                         let is_duplicate = children.iter().any(|existing| {
                             existing.name == child.name && existing.address == child.address
                         });
@@ -267,6 +300,7 @@ impl Group {
     }
 
     /// Resolve old-style group children via B-tree v1 + local heap.
+    #[allow(dead_code)]
     fn resolve_old_style_group(
         &self,
         st: &SymbolTableMessage,
@@ -308,7 +342,70 @@ impl Group {
         Ok(children)
     }
 
+    fn resolve_old_style_group_storage(&self, st: &SymbolTableMessage) -> Result<Vec<ChildEntry>> {
+        let heap = LocalHeap::parse_at_storage(
+            self.context.storage.as_ref(),
+            st.heap_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let leaves = btree_v1::collect_btree_v1_leaves_storage(
+            self.context.storage.as_ref(),
+            st.btree_address,
+            self.offset_size(),
+            self.length_size(),
+            None,
+            &[],
+            None,
+        )?;
+
+        let mut children = Vec::new();
+        for (_key, snod_address) in &leaves {
+            let header_len = 8 + 2 * usize::from(self.offset_size());
+            let prefix = self.context.read_range(*snod_address, header_len)?;
+            let mut prefix_cursor = Cursor::new(prefix.as_ref());
+            let sig = prefix_cursor.read_bytes(4)?;
+            if sig != *b"SNOD" {
+                return Err(Error::InvalidData(format!(
+                    "expected SNOD signature at offset {:#x}",
+                    snod_address
+                )));
+            }
+            let version = prefix_cursor.read_u8()?;
+            if version != 1 {
+                return Err(Error::InvalidData(format!(
+                    "unsupported symbol table node version {}",
+                    version
+                )));
+            }
+            prefix_cursor.skip(1)?;
+            let num_symbols = prefix_cursor.read_u16_le()?;
+            let node_len =
+                8 + usize::from(num_symbols) * (2 * usize::from(self.offset_size()) + 4 + 4 + 16);
+            let bytes = self.context.read_range(*snod_address, node_len)?;
+            let mut cursor = Cursor::new(bytes.as_ref());
+            let snod = crate::symbol_table::SymbolTableNode::parse(
+                &mut cursor,
+                self.offset_size(),
+                self.length_size(),
+            )?;
+
+            for entry in &snod.entries {
+                let name =
+                    heap.get_string_storage(entry.link_name_offset, self.context.storage.as_ref())?;
+                children.push(ChildEntry {
+                    name,
+                    address: entry.object_header_address,
+                });
+            }
+        }
+
+        Ok(children)
+    }
+
     /// Resolve dense links from a fractal heap + B-tree v2.
+    #[allow(dead_code)]
     fn resolve_dense_links(
         &self,
         link_info: &LinkInfoMessage,
@@ -380,6 +477,88 @@ impl Group {
         }
 
         Ok(children)
+    }
+
+    fn resolve_dense_links_storage(
+        &self,
+        link_info: &LinkInfoMessage,
+        link_depth: u32,
+    ) -> Result<Vec<ChildEntry>> {
+        let heap = FractalHeap::parse_at_storage(
+            self.context.storage.as_ref(),
+            link_info.fractal_heap_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let btree_header = btree_v2::BTreeV2Header::parse_at_storage(
+            self.context.storage.as_ref(),
+            link_info.btree_name_index_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let records = btree_v2::collect_btree_v2_records_storage(
+            self.context.storage.as_ref(),
+            &btree_header,
+            self.offset_size(),
+            self.length_size(),
+            None,
+            &[],
+            None,
+        )?;
+
+        let mut children = Vec::new();
+        for record in &records {
+            let heap_id = match record {
+                btree_v2::BTreeV2Record::LinkNameHash { heap_id, .. }
+                | btree_v2::BTreeV2Record::CreationOrder { heap_id, .. } => heap_id,
+                _ => continue,
+            };
+
+            let managed_bytes = heap.get_managed_object_storage(
+                heap_id,
+                self.context.storage.as_ref(),
+                self.offset_size(),
+                self.length_size(),
+            )?;
+
+            let mut link_cursor = Cursor::new(&managed_bytes);
+            let link_msg = link::parse(
+                &mut link_cursor,
+                self.offset_size(),
+                self.length_size(),
+                managed_bytes.len(),
+            )?;
+
+            match &link_msg.target {
+                LinkTarget::Hard { address } => {
+                    children.push(ChildEntry {
+                        name: link_msg.name.clone(),
+                        address: *address,
+                    });
+                }
+                LinkTarget::Soft { path } => {
+                    if let Ok(address) = self.resolve_soft_link_depth(path, link_depth) {
+                        children.push(ChildEntry {
+                            name: link_msg.name.clone(),
+                            address,
+                        });
+                    }
+                }
+                LinkTarget::External { .. } => {}
+            }
+        }
+
+        Ok(children)
+    }
+
+    pub fn child_name_by_address(&self, address: u64) -> Result<Option<String>> {
+        Ok(self
+            .resolve_children()?
+            .into_iter()
+            .find(|child| child.address == address)
+            .map(|child| child.name))
     }
 
     /// Check if the object at the given address is a group (vs a dataset).
