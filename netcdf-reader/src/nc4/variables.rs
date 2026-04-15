@@ -112,60 +112,6 @@ pub fn extract_variable(
     }))
 }
 
-pub(crate) fn build_variable_with_dimensions(
-    ds: &hdf5_reader::Dataset,
-    var_dims: Vec<NcDimension>,
-    metadata_mode: crate::NcMetadataMode,
-) -> Result<Option<NcVariable>> {
-    let strict = metadata_mode == crate::NcMetadataMode::Strict;
-
-    let is_dim_scale = match ds.attribute("CLASS") {
-        Ok(attr) => match attr.read_string() {
-            Ok(value) => value == "DIMENSION_SCALE",
-            Err(err) if strict => {
-                return Err(Error::InvalidData(format!(
-                    "dataset '{}' has unreadable CLASS attribute: {err}",
-                    ds.name()
-                )))
-            }
-            Err(_) => false,
-        },
-        Err(_) => false,
-    };
-
-    if is_dim_scale {
-        return Ok(None);
-    }
-
-    let nc_type = match hdf5_to_nc_type(ds.dtype()) {
-        Ok(t) => t,
-        Err(err) if strict => {
-            return Err(Error::InvalidData(format!(
-                "dataset '{}' uses unsupported NetCDF-4 type: {err}",
-                ds.name()
-            )))
-        }
-        Err(_) => return Ok(None),
-    };
-
-    let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
-    let shape = ds.shape();
-    let (data_size, record_size) =
-        compute_storage_sizes(shape, nc_type.size() as u64, is_unlimited)?;
-    let var_attrs = attributes::extract_variable_attributes(ds, metadata_mode)?;
-
-    Ok(Some(NcVariable {
-        name: leaf_name(ds.name()).to_string(),
-        dimensions: var_dims,
-        dtype: nc_type,
-        attributes: var_attrs,
-        data_offset: ds.address(),
-        _data_size: data_size,
-        is_record_var: is_unlimited,
-        record_size,
-    }))
-}
-
 /// Resolve variable dimensions via the `DIMENSION_LIST` attribute.
 ///
 /// `DIMENSION_LIST` is a VLen-of-object-reference attribute. Each entry is a

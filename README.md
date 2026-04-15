@@ -1,6 +1,6 @@
 # netcdf-rust
 
-Pure-Rust, read-only decoders for HDF5 and NetCDF. No C libraries, no build scripts, and no unsafe beyond `memmap2`.
+Pure-Rust, read-only decoders for HDF5 and NetCDF. No C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
 
 ## Crates
 

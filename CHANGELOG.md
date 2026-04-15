@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Changed NetCDF-4 metadata path lookups to reuse an immutable cached metadata tree, removing the pointer-based metadata arena from `netcdf-reader`.
+- Clarified the top-level safety wording in `README.md` so release docs no longer imply that all internal `unsafe` is limited to `memmap2`.
+- Expanded `RELEASING.md` with explicit version-bump steps and an offline packaging check before the online publish validation.
+
 ## 0.2.0 - 2026-04-01
 
 - Added built-in HDF5 `N-Bit` and `ScaleOffset` decoding in `hdf5-reader`, closing a zero-config compatibility gap for NetCDF-4 and direct HDF5 reads. `SZIP` remains opt-in via `FilterRegistry`, and ScaleOffset floating-point E-scale remains unsupported.
