@@ -60,13 +60,6 @@ pub fn extract_dimensions_from_datasets(
     Ok((dim_list, addr_map))
 }
 
-pub(crate) fn extract_dimension(
-    ds: &hdf5_reader::Dataset,
-    metadata_mode: crate::NcMetadataMode,
-) -> Result<Option<NcDimension>> {
-    Ok(extract_dimension_entry(ds, metadata_mode)?.map(|(_, dim, _)| dim))
-}
-
 fn extract_dimension_entry(
     ds: &hdf5_reader::Dataset,
     metadata_mode: crate::NcMetadataMode,

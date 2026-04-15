@@ -151,40 +151,6 @@ pub(crate) fn group_context_at_path(
     })
 }
 
-pub(crate) fn open_group_at_path(hdf5: &Hdf5File, path: &str) -> Result<hdf5_reader::group::Group> {
-    let normalized = normalize_group_path(path);
-    if normalized.is_empty() {
-        return Ok(hdf5.root_group()?);
-    }
-
-    let mut group = hdf5.root_group()?;
-    for component in normalized.split('/').filter(|part| !part.is_empty()) {
-        group = group
-            .group(component)
-            .map_err(|_| Error::GroupNotFound(path.to_string()))?;
-    }
-    Ok(group)
-}
-
-pub(crate) fn ancestor_groups_including(
-    hdf5: &Hdf5File,
-    path: &str,
-) -> Result<Vec<hdf5_reader::group::Group>> {
-    let normalized = normalize_group_path(path);
-    let mut groups = Vec::new();
-    let mut group = hdf5.root_group()?;
-    groups.push(group.clone());
-
-    for component in normalized.split('/').filter(|part| !part.is_empty()) {
-        group = group
-            .group(component)
-            .map_err(|_| Error::GroupNotFound(path.to_string()))?;
-        groups.push(group.clone());
-    }
-
-    Ok(groups)
-}
-
 /// Recursively build an NcGroup from an HDF5 Group.
 fn build_group_recursive(
     hdf5_group: &hdf5_reader::group::Group,

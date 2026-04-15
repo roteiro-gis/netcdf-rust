@@ -9,6 +9,15 @@ This repository publishes two crates that must be released in order:
 publish verification for `netcdf-reader` will fail until `hdf5-reader` has been
 published and the crates.io index has updated.
 
+## Version prep
+
+Before running the release checks:
+
+1. Update `[workspace.package].version` in `Cargo.toml`
+2. Update the `hdf5-reader` dependency version in `netcdf-reader/Cargo.toml`
+3. Move release notes from `CHANGELOG.md` `Unreleased` into the new version heading
+4. Commit those versioning changes before packaging or publishing
+
 ## Pre-release checks
 
 ```sh
@@ -17,6 +26,7 @@ cargo clippy --all -- -D warnings
 cargo test --workspace
 cargo test -p hdf5-reader --no-default-features
 cargo test -p netcdf-reader --no-default-features
+cargo package -p hdf5-reader --offline
 cargo package -p hdf5-reader
 ```
 
