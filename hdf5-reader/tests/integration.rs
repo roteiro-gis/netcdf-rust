@@ -275,6 +275,19 @@ fn test_from_bytes_with_options() {
 }
 
 #[test]
+fn test_from_storage() {
+    let path = skip_if_missing!("scalar_dataset.h5");
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_reader::Hdf5File::from_storage(std::sync::Arc::new(
+        hdf5_reader::BytesStorage::new(bytes),
+    ))
+    .unwrap();
+    let ds = file.dataset("/value").unwrap();
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    assert!((data[[]] - 42.0).abs() < 1e-10);
+}
+
+#[test]
 fn test_header_cache_reuse() {
     let path = skip_if_missing!("nested_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-04-16
 
-- Changed NetCDF-4 metadata path lookups to reuse an immutable cached metadata tree, removing the pointer-based metadata arena from `netcdf-reader`.
+- Added range-backed open APIs in `hdf5-reader` and `netcdf-reader`, including `from_storage`/`from_storage_with_options`, plus public `Storage`/`DynStorage` reexports for custom backends.
+- Added `NcMetadataMode` and `NcOpenOptions::metadata_mode` so NetCDF-4 callers can choose strict metadata reconstruction or lossy fallback heuristics for malformed files.
+- Changed NetCDF-4 metadata handling to stay lazy and path-local, reusing immutable cached metadata trees instead of the old pointer-based metadata arena.
+- Changed `NcFile::{root_group, dimensions, variables, global_attributes}` to return `Result<_>` so NetCDF-4 metadata errors can surface at access time instead of forcing eager reconstruction during open.
+- Improved NetCDF classic contiguous slice reuse and NetCDF-4 metadata lookup locality to cut repeated setup work and unnecessary full-file metadata fallbacks.
+- Fixed storage-backed format detection to handle short backing stores consistently with the byte-slice and file-based open paths.
 - Clarified the top-level safety wording in `README.md` so release docs no longer imply that all internal `unsafe` is limited to `memmap2`.
-- Expanded `RELEASING.md` with explicit version-bump steps and an offline packaging check before the online publish validation.
+- Expanded `RELEASING.md` with explicit version-bump steps and the staged `hdf5-reader`/`netcdf-reader` packaging flow required by the publish order.
 
 ## 0.2.0 - 2026-04-01
 

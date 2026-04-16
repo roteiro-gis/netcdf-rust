@@ -145,6 +145,30 @@ fn test_nc4_from_bytes_with_options() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn test_nc4_from_storage_with_options() {
+    let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
+    let bytes = std::fs::read(&path).unwrap();
+    let file = netcdf_reader::NcFile::from_storage_with_options(
+        std::sync::Arc::new(netcdf_reader::BytesStorage::new(bytes)),
+        netcdf_reader::NcOpenOptions {
+            chunk_cache_bytes: 1024,
+            chunk_cache_slots: 17,
+            metadata_mode: netcdf_reader::NcMetadataMode::Strict,
+            filter_registry: None,
+        },
+    )
+    .unwrap();
+
+    assert!(matches!(
+        file.format(),
+        netcdf_reader::NcFormat::Nc4 | netcdf_reader::NcFormat::Nc4Classic
+    ));
+    let data: ndarray::ArrayD<f64> = file.read_variable("data").unwrap();
+    assert_eq!(data.shape(), &[5, 10]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn test_nc4_compressed() {
     let path = skip_if_missing!("netcdf4", "nc4_compressed.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
