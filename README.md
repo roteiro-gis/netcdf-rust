@@ -17,7 +17,7 @@ use netcdf_reader::{NcFile, NcSliceInfo, NcSliceInfoElem};
 let file = NcFile::open("era5.nc")?;
 println!("format: {:?}", file.format());
 
-for var in file.variables().unwrap() {
+for var in file.variables()? {
     println!("  var: {} {:?}", var.name(), var.shape());
 }
 
@@ -58,6 +58,7 @@ let bytes = std::fs::read("era5.nc")?;
 let file = NcFile::from_bytes_with_options(&bytes, netcdf_reader::NcOpenOptions {
     chunk_cache_bytes: 8 * 1024 * 1024,
     chunk_cache_slots: 257,
+    metadata_mode: netcdf_reader::NcMetadataMode::Strict,
     #[cfg(feature = "netcdf4")]
     filter_registry: None,
 })?;
@@ -97,6 +98,7 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Fixed-length strings, HDF5 variable-length strings, and byte-vlen string datasets
 - Dense-link resolution, soft-link resolution, committed datatypes, global heap strings, and object references
 - Parallel chunk decoding, chunk caching, and object-header caching
+- Range-backed opens via `Storage` backends (`BytesStorage`, `FileStorage`, `MmapStorage`)
 
 **NetCDF**
 - CDF-1, CDF-2, CDF-5, and NetCDF-4
@@ -105,14 +107,14 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Unified string reads for classic char arrays and NetCDF-4 string variables
 - Type promotion to `f64`, unpacking, masking, and combined CF helpers
 - Slice reads, lazy slice iteration, and parallel NC4 slice reads
-- Cache and filter configuration through `NcOpenOptions`, including in-memory opens
+- Cache and filter configuration through `NcOpenOptions`, including in-memory and storage-backed opens
 
 ## Feature flags
 
 ```toml
 [dependencies]
-netcdf-reader = "0.2"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.2", default-features = false }  # CDF-1/2/5 only
+netcdf-reader = "0.3"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.3", default-features = false }  # CDF-1/2/5 only
 ```
 
 | Flag | Default | Description |

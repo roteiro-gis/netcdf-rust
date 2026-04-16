@@ -125,6 +125,19 @@ fn detect_format(data: &[u8]) -> Result<NcFormat> {
     Err(Error::InvalidMagic)
 }
 
+fn read_magic_prefix(reader: &mut impl Read) -> std::io::Result<([u8; 8], usize)> {
+    let mut magic = [0u8; 8];
+    let mut read_len = 0;
+    while read_len < magic.len() {
+        let n = reader.read(&mut magic[read_len..])?;
+        if n == 0 {
+            break;
+        }
+        read_len += n;
+    }
+    Ok((magic, read_len))
+}
+
 impl NcFile {
     /// Open a NetCDF file from a path.
     ///
@@ -152,7 +165,8 @@ impl NcFile {
     /// Open a NetCDF file from a custom random-access storage backend with custom options.
     #[cfg(feature = "netcdf4")]
     pub fn from_storage_with_options(storage: DynStorage, options: NcOpenOptions) -> Result<Self> {
-        let magic = storage.read_range(0, 8)?;
+        let magic_len = storage.len().min(HDF5_MAGIC.len() as u64) as usize;
+        let magic = storage.read_range(0, magic_len)?;
         let format = detect_format(magic.as_ref())?;
 
         match format {
@@ -607,8 +621,7 @@ impl NcFile {
     pub fn open_with_options(path: impl AsRef<Path>, options: NcOpenOptions) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::open(path)?;
-        let mut magic = [0u8; 8];
-        let n = file.read(&mut magic)?;
+        let (magic, n) = read_magic_prefix(&mut file)?;
         let format = detect_format(&magic[..n])?;
 
         match format {
@@ -699,6 +712,8 @@ impl<'f, T: NcReadable> Iterator for NcSliceIterator<'f, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "netcdf4")]
+    use std::sync::Arc;
 
     #[test]
     fn test_detect_cdf1() {
@@ -773,6 +788,39 @@ mod tests {
         assert!(file.dimensions().unwrap().is_empty());
         assert!(file.variables().unwrap().is_empty());
         assert!(file.global_attributes().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn test_from_storage_minimal_cdf1() {
+        // Minimal valid CDF-1 file: magic + numrecs + absent dim/att/var lists.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"CDF\x01");
+        data.extend_from_slice(&0u32.to_be_bytes()); // numrecs = 0
+                                                     // dim_list: ABSENT
+        data.extend_from_slice(&0u32.to_be_bytes()); // tag = 0
+        data.extend_from_slice(&0u32.to_be_bytes()); // count = 0
+                                                     // att_list: ABSENT
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        // var_list: ABSENT
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+
+        let file = NcFile::from_storage(Arc::new(BytesStorage::new(data))).unwrap();
+        assert_eq!(file.format(), NcFormat::Classic);
+        assert!(file.dimensions().unwrap().is_empty());
+        assert!(file.variables().unwrap().is_empty());
+        assert!(file.global_attributes().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn test_from_storage_short_input_reports_invalid_magic() {
+        let err = NcFile::from_storage(Arc::new(BytesStorage::new(vec![b'C', b'D'])))
+            .err()
+            .expect("short storage should not parse as NetCDF");
+        assert!(matches!(err, Error::InvalidMagic));
     }
 
     #[test]

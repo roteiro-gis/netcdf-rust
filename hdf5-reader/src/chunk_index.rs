@@ -75,30 +75,28 @@ pub fn collect_v2_chunk_entries(
     let mut entries = Vec::with_capacity(records.len());
     for record in records {
         match record {
-            crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets } => {
-                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
-                    entries.push(ChunkEntry {
-                        address,
-                        size: 0, // caller must compute from chunk dims * elem_size
-                        filter_mask: 0,
-                        offsets,
-                    });
-                }
+            crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets }
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) =>
+            {
+                entries.push(ChunkEntry {
+                    address,
+                    size: 0, // caller must compute from chunk dims * elem_size
+                    filter_mask: 0,
+                    offsets,
+                });
             }
             crate::btree_v2::BTreeV2Record::ChunkedFiltered {
                 address,
                 chunk_size,
                 filter_mask,
                 offsets,
-            } => {
-                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
-                    entries.push(ChunkEntry {
-                        address,
-                        size: chunk_size,
-                        filter_mask,
-                        offsets,
-                    });
-                }
+            } if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) => {
+                entries.push(ChunkEntry {
+                    address,
+                    size: chunk_size,
+                    filter_mask,
+                    offsets,
+                });
             }
             _ => {
                 // Skip non-chunk records
@@ -138,30 +136,28 @@ pub fn collect_v2_chunk_entries_storage(
     let mut entries = Vec::with_capacity(records.len());
     for record in records {
         match record {
-            crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets } => {
-                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
-                    entries.push(ChunkEntry {
-                        address,
-                        size: 0,
-                        filter_mask: 0,
-                        offsets,
-                    });
-                }
+            crate::btree_v2::BTreeV2Record::ChunkedNonFiltered { address, offsets }
+                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) =>
+            {
+                entries.push(ChunkEntry {
+                    address,
+                    size: 0,
+                    filter_mask: 0,
+                    offsets,
+                });
             }
             crate::btree_v2::BTreeV2Record::ChunkedFiltered {
                 address,
                 chunk_size,
                 filter_mask,
                 offsets,
-            } => {
-                if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) {
-                    entries.push(ChunkEntry {
-                        address,
-                        size: chunk_size,
-                        filter_mask,
-                        offsets,
-                    });
-                }
+            } if chunk_overlaps_bounds(&offsets, chunk_dims, chunk_bounds) => {
+                entries.push(ChunkEntry {
+                    address,
+                    size: chunk_size,
+                    filter_mask,
+                    offsets,
+                });
             }
             _ => {}
         }

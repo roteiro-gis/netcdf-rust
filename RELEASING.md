@@ -15,8 +15,9 @@ Before running the release checks:
 
 1. Update `[workspace.package].version` in `Cargo.toml`
 2. Update the `hdf5-reader` dependency version in `netcdf-reader/Cargo.toml`
-3. Move release notes from `CHANGELOG.md` `Unreleased` into the new version heading
-4. Commit those versioning changes before packaging or publishing
+3. Update versioned dependency snippets in `README.md`
+4. Move release notes from `CHANGELOG.md` `Unreleased` into the new version heading
+5. Commit those versioning changes before packaging or publishing
 
 ## Pre-release checks
 
@@ -35,7 +36,7 @@ visible in the crates.io index, so run its packaging check only after
 `hdf5-reader` has been published and the index has updated:
 
 ```sh
-cargo package -p netcdf-reader --no-verify
+cargo package -p netcdf-reader
 ```
 
 Optional but recommended:
@@ -61,6 +62,7 @@ python3 scripts/criterion_summary.py --speedup \
 ```sh
 cargo publish -p hdf5-reader
 # wait for crates.io index to update
+cargo package -p netcdf-reader
 cargo publish -p netcdf-reader
 ```
 
