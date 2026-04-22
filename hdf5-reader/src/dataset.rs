@@ -1102,14 +1102,19 @@ impl Dataset {
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
+        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
+
+        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if let Some(cached_bytes) = self.full_dataset_bytes.get() {
+                return self.decode_raw_data::<T>(cached_bytes);
+            }
+        }
+
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
         let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
-
-        // Allocate output initialized from the dataset's fill value.
-        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
-        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
         let mut entries = self.collect_chunk_entries(
             index_address,
@@ -1139,14 +1144,6 @@ impl Dataset {
             }
         };
         if full_chunk_coverage {
-            let hot_full_dataset_bytes = if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-                self.full_dataset_bytes.get().cloned()
-            } else {
-                None
-            };
-            if let Some(cached_bytes) = hot_full_dataset_bytes {
-                return self.decode_raw_data::<T>(&cached_bytes);
-            }
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
                     std::iter::repeat_with(MaybeUninit::<T>::uninit)
@@ -1270,6 +1267,13 @@ impl Dataset {
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
+
+        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if let Some(cached_bytes) = self.full_dataset_bytes.get() {
+                return Ok(cached_bytes.as_ref().clone());
+            }
+        }
+
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
@@ -1302,11 +1306,6 @@ impl Dataset {
                 ))
             }
         };
-        if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-            if let Some(cached_bytes) = self.full_dataset_bytes.get() {
-                return Ok(cached_bytes.as_ref().clone());
-            }
-        }
 
         let mut flat_data = self.make_output_buffer(total_bytes);
         for entry in &entries {
@@ -1348,12 +1347,19 @@ impl Dataset {
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
+        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
+
+        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            if let Some(cached_bytes) = self.full_dataset_bytes.get() {
+                return self.decode_raw_data::<T>(cached_bytes);
+            }
+        }
+
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
         let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
-        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
-        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
         let mut entries = self.collect_chunk_entries(
             index_address,
@@ -1383,11 +1389,6 @@ impl Dataset {
             }
         };
         if full_chunk_coverage {
-            if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-                if let Some(cached_bytes) = self.full_dataset_bytes.get() {
-                    return self.decode_raw_data::<T>(cached_bytes);
-                }
-            }
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let mut result_values: Vec<MaybeUninit<T>> =
                     std::iter::repeat_with(MaybeUninit::<T>::uninit)
