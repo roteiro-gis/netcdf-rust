@@ -76,6 +76,11 @@ jobs:
       - name: Package hdf5-reader offline
         run: cargo package -p hdf5-reader --offline
 
+      - name: Fetch published hdf5-reader for netcdf-reader verification
+        run: |
+          version="$(cargo pkgid -p hdf5-reader | sed 's/.*#//')"
+          cargo info "hdf5-reader@${version}" --registry crates-io
+
       - name: Package netcdf-reader offline
         run: cargo package -p netcdf-reader --offline
 
