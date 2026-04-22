@@ -48,6 +48,35 @@ fn create_sparse_huge_nc4_fixture(path: &Path) {
     file.enddef().unwrap();
 }
 
+#[cfg(feature = "netcdf4")]
+fn create_nc4_coordinate_variable_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("lat", 3).unwrap();
+    file.add_variable::<f64>("lat", &["lat"]).unwrap();
+    file.add_variable::<f32>("temp", &["lat"]).unwrap();
+    file.enddef().unwrap();
+
+    {
+        let mut lat = file.variable_mut("lat").unwrap();
+        lat.put_values(&[-90.0_f64, 0.0, 90.0], (..,)).unwrap();
+    }
+    {
+        let mut temp = file.variable_mut("temp").unwrap();
+        temp.put_values(&[271.0_f32, 272.0, 273.0], (..,)).unwrap();
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn create_nc4_dimension_only_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("x", 3).unwrap();
+    file.add_variable::<f32>("temp", &["x"]).unwrap();
+    file.enddef().unwrap();
+
+    let mut temp = file.variable_mut("temp").unwrap();
+    temp.put_values(&[1.0_f32, 2.0, 3.0], (..,)).unwrap();
+}
+
 // ---- NetCDF-3 tests ----
 
 #[test]
@@ -226,6 +255,45 @@ fn test_nc4_same_size_dims() {
     // (not both matched to the first size-10 dim)
     let dim_names: Vec<&str> = var.dimensions().iter().map(|d| d.name.as_str()).collect();
     assert_eq!(dim_names, vec!["lat", "lon"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_coordinate_dimension_scale_is_variable_metadata() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("coordinate_variable.nc");
+    create_nc4_coordinate_variable_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let lat = file.variable("lat").unwrap();
+    assert_eq!(lat.shape(), vec![3]);
+    assert!(matches!(lat.dtype(), netcdf_reader::NcType::Double));
+
+    let dim_names: Vec<&str> = lat.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(dim_names, vec!["lat"]);
+
+    let values: ndarray::ArrayD<f64> = file.read_variable("lat").unwrap();
+    assert_eq!(values.as_slice().unwrap(), &[-90.0, 0.0, 90.0]);
+
+    let names: Vec<&str> = file.variables().unwrap().iter().map(|v| v.name()).collect();
+    assert!(names.contains(&"lat"));
+    assert!(names.contains(&"temp"));
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_dimension_only_scale_is_not_variable_metadata() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("dimension_only.nc");
+    create_nc4_dimension_only_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    assert_eq!(file.dimension("x").unwrap().size, 3);
+    assert!(file.variable("x").is_err());
+
+    let temp = file.variable("temp").unwrap();
+    let dim_names: Vec<&str> = temp.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(dim_names, vec!["x"]);
 }
 
 #[cfg(feature = "netcdf4")]

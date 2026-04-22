@@ -21,6 +21,10 @@ fn leaf_name(name: &str) -> &str {
     name.rsplit('/').next().unwrap_or(name)
 }
 
+pub(crate) fn is_dimension_without_variable_name(name: &str) -> bool {
+    name.starts_with("This is a netCDF dimension but not a netCDF variable")
+}
+
 /// Extract dimensions from an HDF5 group.
 ///
 /// Returns a tuple of:
@@ -87,7 +91,7 @@ fn extract_dimension_entry(
     let name = match ds.attribute("NAME") {
         Ok(attr) => match attr.read_string() {
             Ok(value) => {
-                if value.starts_with("This is a netCDF dimension but not a netCDF variable") {
+                if is_dimension_without_variable_name(&value) {
                     leaf_name(ds.name()).to_string()
                 } else {
                     value
