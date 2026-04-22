@@ -6,6 +6,7 @@
 //! Tests are skipped at runtime if fixture files are missing.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 fn fixture_path(name: &str) -> Option<std::path::PathBuf> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -30,6 +31,58 @@ macro_rules! skip_if_missing {
             }
         }
     };
+}
+
+struct CountingStorage {
+    data: Vec<u8>,
+    ranges: Mutex<Vec<(u64, usize)>>,
+}
+
+impl CountingStorage {
+    fn new(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            ranges: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn clear_ranges(&self) {
+        self.ranges.lock().unwrap().clear();
+    }
+
+    fn ranges(&self) -> Vec<(u64, usize)> {
+        self.ranges.lock().unwrap().clone()
+    }
+}
+
+impl hdf5_reader::Storage for CountingStorage {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+
+    fn read_range(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> hdf5_reader::error::Result<hdf5_reader::StorageBuffer> {
+        let start = usize::try_from(offset)
+            .map_err(|_| hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+        if end > self.data.len() {
+            return Err(hdf5_reader::error::Error::UnexpectedEof {
+                offset,
+                needed: len as u64,
+                available: self.len().saturating_sub(offset),
+            });
+        }
+
+        self.ranges.lock().unwrap().push((offset, len));
+        Ok(hdf5_reader::StorageBuffer::from_vec(
+            self.data[start..end].to_vec(),
+        ))
+    }
 }
 
 #[test]
@@ -74,6 +127,36 @@ fn test_simple_contiguous_inner_window_slice() {
     assert_eq!(sliced[[0, 0]], 6.0);
     assert_eq!(sliced[[0, 2]], 8.0);
     assert_eq!(sliced[[2, 2]], 18.0);
+}
+
+#[test]
+fn test_contiguous_slice_reads_selected_ranges_directly() {
+    let path = skip_if_missing!("simple_contiguous.h5");
+    let storage = Arc::new(CountingStorage::new(std::fs::read(path).unwrap()));
+    let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
+    let ds = file.dataset("/data").unwrap();
+    storage.clear_ranges();
+
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 4,
+                step: 1,
+            },
+            hdf5_reader::SliceInfoElem::Slice {
+                start: 1,
+                end: 4,
+                step: 1,
+            },
+        ],
+    };
+
+    let sliced: ndarray::ArrayD<f64> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.shape(), &[3, 3]);
+    assert_eq!(sliced[[0, 0]], 6.0);
+    assert_eq!(sliced[[2, 2]], 18.0);
+    assert_eq!(storage.ranges(), vec![(2096, 24), (2136, 24), (2176, 24)]);
 }
 
 #[test]

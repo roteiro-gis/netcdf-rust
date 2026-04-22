@@ -58,6 +58,14 @@ struct UnitStrideCopyLayout<'a> {
     elem_size: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ContiguousSliceDirectLayout<'a> {
+    dataset_strides: &'a [usize],
+    result_strides: &'a [usize],
+    elem_size: usize,
+    result_total_bytes: usize,
+}
+
 pub(crate) struct DatasetParseContext {
     pub(crate) context: Arc<FileContext>,
 }
@@ -204,6 +212,16 @@ fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
 fn checked_add_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_add(rhs)
         .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
+fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds u64 capacity")))
+}
+
+fn checked_add_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds u64 capacity")))
 }
 
 fn checked_shape_elements_usize(shape: &[u64], context: &str) -> Result<usize> {
@@ -502,6 +520,69 @@ fn normalize_selection(selection: &SliceInfo, shape: &[u64]) -> Result<ResolvedS
         result_shape,
         result_elements,
     })
+}
+
+fn selection_dim_is_full_unit(dim: &ResolvedSelectionDim, dim_size: u64) -> bool {
+    dim.step == 1
+        && dim.start == 0
+        && dim.end == dim_size
+        && u64::try_from(dim.count).ok() == Some(dim_size)
+}
+
+fn selection_covers_full_dataset(resolved: &ResolvedSelection, shape: &[u64]) -> bool {
+    resolved.result_shape.len() == shape.len()
+        && resolved
+            .dims
+            .iter()
+            .zip(shape.iter())
+            .all(|(dim, &dim_size)| selection_dim_is_full_unit(dim, dim_size))
+}
+
+fn contiguous_slice_tail_start(shape: &[u64], resolved: &ResolvedSelection) -> usize {
+    let ndim = shape.len();
+    if ndim == 0 {
+        return 0;
+    }
+
+    let mut tail_start = if resolved.dims[ndim - 1].step == 1 {
+        ndim - 1
+    } else {
+        ndim
+    };
+
+    while tail_start > 0 {
+        let prev = tail_start - 1;
+        let later_dims_are_full =
+            (tail_start..ndim).all(|d| selection_dim_is_full_unit(&resolved.dims[d], shape[d]));
+        if resolved.dims[prev].step == 1 && later_dims_are_full {
+            tail_start = prev;
+        } else {
+            break;
+        }
+    }
+
+    tail_start
+}
+
+fn contiguous_slice_block_elements(
+    resolved: &ResolvedSelection,
+    tail_start: usize,
+) -> Result<usize> {
+    let mut elements = 1usize;
+    for dim in &resolved.dims[tail_start..] {
+        elements = checked_mul_usize(elements, dim.count, "contiguous slice block elements")?;
+    }
+    Ok(elements)
+}
+
+fn result_strides_for_dims(result_dims: &[usize]) -> Result<Vec<usize>> {
+    let ndim = result_dims.len();
+    let mut result_strides = vec![1usize; ndim];
+    for d in (0..ndim.saturating_sub(1)).rev() {
+        result_strides[d] =
+            checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
+    }
+    Ok(result_strides)
 }
 
 /// A dataset within an HDF5 file.
@@ -937,7 +1018,7 @@ impl Dataset {
 
         match &self.layout {
             DataLayout::Contiguous { address, size } => {
-                self.read_contiguous_slice::<T>(*address, *size, selection, &resolved)
+                self.read_contiguous_slice::<T>(*address, *size, &resolved)
             }
             DataLayout::Compact { data } => self.read_compact_slice::<T>(data, selection),
             DataLayout::Chunked {
@@ -2112,7 +2193,6 @@ impl Dataset {
         &self,
         address: u64,
         size: u64,
-        _selection: &SliceInfo,
         resolved: &ResolvedSelection,
     ) -> Result<ArrayD<T>> {
         if resolved.result_elements == 0 {
@@ -2125,113 +2205,29 @@ impl Dataset {
         }
 
         let shape = &self.dataspace.dims;
-        let ndim = shape.len();
+        if selection_covers_full_dataset(resolved, shape) {
+            return self.read_contiguous::<T>(address, size);
+        }
+
         let elem_size = dtype_element_size(&self.datatype);
         let result_total_bytes = checked_mul_usize(
             resolved.result_elements,
             elem_size,
             "contiguous slice result size in bytes",
         )?;
-        let storage_len = checked_usize(size, "contiguous dataset size")?;
-        let raw = self.context.read_range(address, storage_len)?;
         let dataset_strides = row_major_strides(shape, "contiguous dataset stride")?;
         let result_dims = resolved.result_dims_with_collapsed();
-        let zero_offsets = vec![0u64; ndim];
-        let mut result_strides = vec![1usize; ndim];
-        for d in (0..ndim.saturating_sub(1)).rev() {
-            result_strides[d] =
-                checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
-        }
-
-        if resolved.is_unit_stride() {
-            if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
-                let mut result_values: Vec<MaybeUninit<T>> =
-                    std::iter::repeat_with(MaybeUninit::<T>::uninit)
-                        .take(resolved.result_elements)
-                        .collect();
-                let flat = FlatBufferPtr {
-                    ptr: result_values.as_mut_ptr() as *mut u8,
-                    len: checked_mul_usize(
-                        result_values.len(),
-                        std::mem::size_of::<T>(),
-                        "typed contiguous slice size in bytes",
-                    )?,
-                };
-
-                unsafe {
-                    copy_unit_stride_chunk_overlap_ptr(
-                        raw.as_ref(),
-                        flat,
-                        UnitStrideCopyLayout {
-                            chunk_offsets: &zero_offsets,
-                            chunk_shape: shape,
-                            dataset_shape: shape,
-                            resolved,
-                            chunk_strides: &dataset_strides,
-                            result_strides: &result_strides,
-                            elem_size,
-                        },
-                    )?;
-                }
-
-                let result_values = assume_init_vec(result_values);
-                return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
-                    .map_err(|e| Error::InvalidData(format!("contiguous slice shape error: {e}")));
-            }
-
-            let mut result_buf = vec![MaybeUninit::<u8>::uninit(); result_total_bytes];
-            unsafe {
-                copy_unit_stride_chunk_overlap_ptr(
-                    raw.as_ref(),
-                    FlatBufferPtr {
-                        ptr: result_buf.as_mut_ptr() as *mut u8,
-                        len: result_buf.len(),
-                    },
-                    UnitStrideCopyLayout {
-                        chunk_offsets: &zero_offsets,
-                        chunk_shape: shape,
-                        dataset_shape: shape,
-                        resolved,
-                        chunk_strides: &dataset_strides,
-                        result_strides: &result_strides,
-                        elem_size,
-                    },
-                )?;
-            }
-
-            let result_buf = assume_init_u8_vec(result_buf);
-            return self.decode_buffer_with_shape::<T>(
-                &result_buf,
-                resolved.result_elements,
-                &resolved.result_shape,
-            );
-        }
-
-        let mut result_buf = self.make_output_buffer(result_total_bytes);
-        let mut dim_indices: Vec<Vec<(usize, usize)>> = Vec::with_capacity(ndim);
-        for dim in &resolved.dims {
-            let mut indices = Vec::with_capacity(dim.count);
-            let mut sel_idx = dim.start;
-            while sel_idx < dim.end {
-                let src_idx = checked_usize(sel_idx, "contiguous selection source index")?;
-                let result_idx = checked_usize(
-                    (sel_idx - dim.start) / dim.step,
-                    "contiguous selection result index",
-                )?;
-                indices.push((src_idx, result_idx));
-                sel_idx = sel_idx.saturating_add(dim.step);
-            }
-            dim_indices.push(indices);
-        }
-
-        copy_selected_elements(
-            raw.as_ref(),
-            &mut result_buf,
-            &dim_indices,
-            &dataset_strides,
-            &result_strides,
-            elem_size,
-            ndim,
+        let result_strides = result_strides_for_dims(&result_dims)?;
+        let result_buf = self.read_contiguous_slice_bytes_direct(
+            address,
+            size,
+            resolved,
+            ContiguousSliceDirectLayout {
+                dataset_strides: &dataset_strides,
+                result_strides: &result_strides,
+                elem_size,
+                result_total_bytes,
+            },
         )?;
 
         self.decode_buffer_with_shape::<T>(
@@ -2239,6 +2235,158 @@ impl Dataset {
             resolved.result_elements,
             &resolved.result_shape,
         )
+    }
+
+    fn read_contiguous_slice_bytes_direct(
+        &self,
+        address: u64,
+        size: u64,
+        resolved: &ResolvedSelection,
+        layout: ContiguousSliceDirectLayout<'_>,
+    ) -> Result<Vec<u8>> {
+        let shape = &self.dataspace.dims;
+        let ndim = shape.len();
+        if resolved.dims.len() != ndim
+            || layout.dataset_strides.len() != ndim
+            || layout.result_strides.len() != ndim
+        {
+            return Err(Error::InvalidData(format!(
+                "contiguous slice layout rank does not match dataset rank {ndim}"
+            )));
+        }
+
+        let storage_len = checked_usize(size, "contiguous dataset size")?;
+        let tail_start = contiguous_slice_tail_start(shape, resolved);
+        let block_elements = contiguous_slice_block_elements(resolved, tail_start)?;
+        let block_bytes = checked_mul_usize(
+            block_elements,
+            layout.elem_size,
+            "contiguous slice block size in bytes",
+        )?;
+        let mut result_buf = self.make_output_buffer(layout.result_total_bytes);
+
+        let prefix_blocks =
+            resolved.dims[..tail_start]
+                .iter()
+                .try_fold(1usize, |acc, dim| -> Result<usize> {
+                    checked_mul_usize(acc, dim.count, "contiguous slice block count")
+                })?;
+        let mut counters = vec![0usize; tail_start];
+
+        for _ in 0..prefix_blocks {
+            let mut source_elem = 0usize;
+            let mut result_elem = 0usize;
+
+            for (d, &counter) in counters.iter().enumerate().take(tail_start) {
+                let ordinal = u64::try_from(counter).map_err(|_| {
+                    Error::InvalidData("contiguous slice ordinal exceeds u64".to_string())
+                })?;
+                let coord = checked_add_u64(
+                    resolved.dims[d].start,
+                    checked_mul_u64(
+                        ordinal,
+                        resolved.dims[d].step,
+                        "contiguous slice coordinate",
+                    )?,
+                    "contiguous slice coordinate",
+                )?;
+                let coord = checked_usize(coord, "contiguous slice source index")?;
+                let source_term =
+                    checked_mul_usize(coord, layout.dataset_strides[d], "contiguous slice source")?;
+                let result_term = checked_mul_usize(
+                    counter,
+                    layout.result_strides[d],
+                    "contiguous slice result",
+                )?;
+                source_elem =
+                    checked_add_usize(source_elem, source_term, "contiguous slice source")?;
+                result_elem =
+                    checked_add_usize(result_elem, result_term, "contiguous slice result")?;
+            }
+
+            for (d, &dataset_stride) in layout
+                .dataset_strides
+                .iter()
+                .enumerate()
+                .take(ndim)
+                .skip(tail_start)
+            {
+                let coord = checked_usize(resolved.dims[d].start, "contiguous slice source index")?;
+                let source_term =
+                    checked_mul_usize(coord, dataset_stride, "contiguous slice source")?;
+                source_elem =
+                    checked_add_usize(source_elem, source_term, "contiguous slice source")?;
+            }
+
+            let source_start = checked_mul_usize(
+                source_elem,
+                layout.elem_size,
+                "contiguous slice source byte offset",
+            )?;
+            let source_end = checked_add_usize(
+                source_start,
+                block_bytes,
+                "contiguous slice source byte end",
+            )?;
+            if source_end > storage_len {
+                return Err(Error::InvalidData(format!(
+                    "contiguous slice range {}..{} exceeds dataset storage size {}",
+                    source_start, source_end, storage_len
+                )));
+            }
+
+            let dst_start = checked_mul_usize(
+                result_elem,
+                layout.elem_size,
+                "contiguous slice destination byte offset",
+            )?;
+            let dst_end = checked_add_usize(
+                dst_start,
+                block_bytes,
+                "contiguous slice destination byte end",
+            )?;
+            if dst_end > result_buf.len() {
+                return Err(Error::InvalidData(format!(
+                    "contiguous slice destination range {}..{} exceeds result size {}",
+                    dst_start,
+                    dst_end,
+                    result_buf.len()
+                )));
+            }
+
+            let file_offset = checked_add_u64(
+                address,
+                u64::try_from(source_start).map_err(|_| {
+                    Error::InvalidData(
+                        "contiguous slice source offset exceeds u64 capacity".to_string(),
+                    )
+                })?,
+                "contiguous slice file offset",
+            )?;
+            let block = self.context.read_range(file_offset, block_bytes)?;
+            if block.len() != block_bytes {
+                return Err(Error::InvalidData(format!(
+                    "contiguous slice read returned {} bytes, expected {}",
+                    block.len(),
+                    block_bytes
+                )));
+            }
+            result_buf[dst_start..dst_end].copy_from_slice(block.as_ref());
+
+            let mut carry = true;
+            for d in (0..tail_start).rev() {
+                if carry {
+                    counters[d] += 1;
+                    if counters[d] < resolved.dims[d].count {
+                        carry = false;
+                    } else {
+                        counters[d] = 0;
+                    }
+                }
+            }
+        }
+
+        Ok(result_buf)
     }
 
     fn read_compact_slice<T: H5Type>(
