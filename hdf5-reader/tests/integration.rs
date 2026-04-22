@@ -188,6 +188,27 @@ fn test_simple_contiguous_strided_slice() {
 }
 
 #[test]
+fn test_big_endian_numeric_datasets() {
+    let path = skip_if_missing!("big_endian.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let f32_data: ndarray::ArrayD<f32> = file.dataset("/float32_be").unwrap().read_array().unwrap();
+    assert_eq!(f32_data.shape(), &[4, 5]);
+    assert!((f32_data[[0, 0]] - 0.0).abs() < 1e-6);
+    assert!((f32_data[[3, 4]] - 19.0).abs() < 1e-6);
+
+    let f64_data: ndarray::ArrayD<f64> = file.dataset("/float64_be").unwrap().read_array().unwrap();
+    assert_eq!(f64_data.shape(), &[3, 4]);
+    assert!((f64_data[[0, 0]] - 0.0).abs() < 1e-12);
+    assert!((f64_data[[2, 3]] - 11.0).abs() < 1e-12);
+
+    let i32_data: ndarray::ArrayD<i32> = file.dataset("/int32_be").unwrap().read_array().unwrap();
+    assert_eq!(i32_data.shape(), &[3, 5]);
+    assert_eq!(i32_data[[0, 0]], 0);
+    assert_eq!(i32_data[[2, 4]], 14);
+}
+
+#[test]
 fn test_simple_chunked_deflate() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

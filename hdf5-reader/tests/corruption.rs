@@ -28,6 +28,36 @@ fn error_chain_contains_unsupported_datatype(err: &Error, class: u8) -> bool {
     }
 }
 
+fn error_chain_contains_invalid_btree_signature(err: &Error) -> bool {
+    match err {
+        Error::InvalidBTreeSignature => true,
+        Error::Context { source, .. } => error_chain_contains_invalid_btree_signature(source),
+        _ => false,
+    }
+}
+
+fn error_chain_contains_invalid_data(err: &Error, needle: &str) -> bool {
+    match err {
+        Error::InvalidData(message) => message.contains(needle),
+        Error::Context { source, .. } => error_chain_contains_invalid_data(source, needle),
+        _ => false,
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn find_raw_chunk_btree(bytes: &[u8], entries_used: u16) -> Option<usize> {
+    let mut needle = Vec::from(&b"TREE"[..]);
+    needle.push(1); // raw data chunk index
+    needle.push(0); // leaf node
+    needle.extend_from_slice(&entries_used.to_le_bytes());
+    find_bytes(bytes, &needle)
+}
+
 /// Build a minimal valid v2 superblock (48 bytes) with correct checksum.
 ///
 /// Layout (offset_size = 8):
@@ -551,6 +581,83 @@ fn corrupted_child_dataset_parse_error_surfaces_in_lookup_and_members() {
     assert!(
         error_chain_contains_unsupported_datatype(&members_err, 15),
         "members() should surface unsupported datatype, got: {members_err}"
+    );
+}
+
+#[test]
+fn duplicate_chunk_offsets_error_in_full_chunk_fast_path() {
+    let mut bytes = match fixture_bytes("simple_chunked_deflate.h5") {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: fixture simple_chunked_deflate.h5 not found");
+            return;
+        }
+    };
+
+    let btree =
+        find_raw_chunk_btree(&bytes, 4).expect("fixture should contain a 4-entry chunk B-tree");
+    let key0_offsets = btree + 24 + 8;
+    let key1_offsets = btree + 24 + 32 + 8 + 8;
+    let duplicate_offsets = bytes[key0_offsets..key0_offsets + 16].to_vec();
+    bytes[key1_offsets..key1_offsets + 16].copy_from_slice(&duplicate_offsets);
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("/temperature").unwrap();
+    let err = expect_err(dataset.read_array::<f32>());
+    assert!(
+        error_chain_contains_invalid_data(&err, "duplicate chunk output offsets"),
+        "expected duplicate chunk offset error, got: {err}"
+    );
+}
+
+#[test]
+fn short_unfiltered_chunk_errors_before_copying_to_output() {
+    let mut bytes = match fixture_bytes("single_chunk.h5") {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: fixture single_chunk.h5 not found");
+            return;
+        }
+    };
+
+    let btree =
+        find_raw_chunk_btree(&bytes, 1).expect("fixture should contain a 1-entry chunk B-tree");
+    let chunk_size = btree + 24;
+    assert_eq!(
+        u32::from_le_bytes(bytes[chunk_size..chunk_size + 4].try_into().unwrap()),
+        160
+    );
+    bytes[chunk_size..chunk_size + 4].copy_from_slice(&159u32.to_le_bytes());
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("/data").unwrap();
+    let err = expect_err(dataset.read_array::<f64>());
+    assert!(
+        error_chain_contains_invalid_data(&err, "decoded to 159 bytes, expected 160 bytes"),
+        "expected exact decoded chunk length error, got: {err}"
+    );
+}
+
+#[test]
+fn corrupted_chunk_index_signature_errors_on_read() {
+    let mut bytes = match fixture_bytes("simple_chunked_deflate.h5") {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: fixture simple_chunked_deflate.h5 not found");
+            return;
+        }
+    };
+
+    let btree =
+        find_raw_chunk_btree(&bytes, 4).expect("fixture should contain a 4-entry chunk B-tree");
+    bytes[btree..btree + 4].copy_from_slice(b"BROK");
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("/temperature").unwrap();
+    let err = expect_err(dataset.read_array::<f32>());
+    assert!(
+        error_chain_contains_invalid_btree_signature(&err),
+        "expected invalid B-tree signature error, got: {err}"
     );
 }
 

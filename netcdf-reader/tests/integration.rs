@@ -34,6 +34,14 @@ macro_rules! skip_if_missing {
 }
 
 #[cfg(feature = "netcdf4")]
+fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "got {actual}, expected {expected}"
+    );
+}
+
+#[cfg(feature = "netcdf4")]
 fn create_sparse_huge_nc4_fixture(path: &Path) {
     const DIM: usize = 1 << 20;
 
@@ -278,6 +286,184 @@ fn test_nc4_coordinate_dimension_scale_is_variable_metadata() {
     let names: Vec<&str> = file.variables().unwrap().iter().map(|v| v.name()).collect();
     assert!(names.contains(&"lat"));
     assert!(names.contains(&"temp"));
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_climate_4d_coordinate_variables_and_slice() {
+    let path = skip_if_missing!("netcdf4", "nc4_climate_4d.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    assert_eq!(
+        file.global_attribute("Conventions")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "CF-1.8"
+    );
+    assert_eq!(file.dimension("time").unwrap().size, 4);
+    assert_eq!(file.dimension("level").unwrap().size, 3);
+    assert_eq!(file.dimension("lat").unwrap().size, 6);
+    assert_eq!(file.dimension("lon").unwrap().size, 12);
+
+    for name in ["time", "level", "lat", "lon"] {
+        let variable = file.variable(name).unwrap();
+        assert_eq!(variable.ndim(), 1, "{name} should be a coordinate variable");
+        assert_eq!(variable.dimensions()[0].name, name);
+    }
+
+    let lat: ndarray::ArrayD<f64> = file.read_variable("lat").unwrap();
+    let lon: ndarray::ArrayD<f64> = file.read_variable("lon").unwrap();
+    assert_close(lat[[0]], -75.0, 1e-12);
+    assert_close(lat[[5]], 75.0, 1e-12);
+    assert_close(lon[[0]], 0.0, 1e-12);
+    assert_close(lon[[11]], 330.0, 1e-12);
+
+    let temp = file.variable("temperature").unwrap();
+    let dim_names: Vec<&str> = temp.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(dim_names, vec!["time", "level", "lat", "lon"]);
+
+    let selection = netcdf_reader::NcSliceInfo {
+        selections: vec![
+            netcdf_reader::NcSliceInfoElem::Index(1),
+            netcdf_reader::NcSliceInfoElem::Index(2),
+            netcdf_reader::NcSliceInfoElem::Slice {
+                start: 2,
+                end: 5,
+                step: 1,
+            },
+            netcdf_reader::NcSliceInfoElem::Slice {
+                start: 3,
+                end: 8,
+                step: 1,
+            },
+        ],
+    };
+    let sliced: ndarray::ArrayD<f32> = file.read_variable_slice("temperature", &selection).unwrap();
+    assert_eq!(sliced.shape(), &[3, 5]);
+    assert!(sliced
+        .iter()
+        .all(|value| value.is_finite() && *value > 270.0 && *value < 310.0));
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_packed_cf_unpacks_and_masks_fill_values() {
+    let path = skip_if_missing!("netcdf4", "nc4_packed_cf.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let temp = file.variable("temperature").unwrap();
+    assert_eq!(temp.shape(), vec![10, 10]);
+    assert!(matches!(temp.dtype(), netcdf_reader::NcType::Short));
+    assert_close(
+        temp.attribute("scale_factor")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap(),
+        0.01,
+        1e-12,
+    );
+    assert_close(
+        temp.attribute("add_offset")
+            .unwrap()
+            .value
+            .as_f64()
+            .unwrap(),
+        273.15,
+        1e-12,
+    );
+
+    let raw: ndarray::ArrayD<i16> = file.read_variable("temperature").unwrap();
+    assert_eq!(raw[[0, 1]], 1);
+    assert_eq!(raw[[5, 5]], -9999);
+
+    let unpacked_masked = file.read_variable_unpacked_masked("temperature").unwrap();
+    assert_eq!(unpacked_masked.shape(), &[10, 10]);
+    assert!(unpacked_masked[[0, 0]].is_nan());
+    assert!(unpacked_masked[[5, 5]].is_nan());
+    assert!(unpacked_masked[[9, 9]].is_nan());
+    assert_close(unpacked_masked[[0, 1]], 273.16, 1e-10);
+    assert_close(unpacked_masked[[9, 8]], 274.13, 1e-10);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_shared_dims_coordinate_variables_and_shared_shapes() {
+    let path = skip_if_missing!("netcdf4", "nc4_shared_dims.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let lat: ndarray::ArrayD<f64> = file.read_variable("lat").unwrap();
+    let lon: ndarray::ArrayD<f64> = file.read_variable("lon").unwrap();
+    assert_eq!(lat.shape(), &[8]);
+    assert_eq!(lon.shape(), &[16]);
+    assert_close(lat[[0]], -87.5, 1e-12);
+    assert_close(lat[[7]], 87.5, 1e-12);
+    assert_close(lon[[15]], 337.5, 1e-12);
+
+    for name in ["temperature", "humidity", "pressure"] {
+        let variable = file.variable(name).unwrap();
+        let dim_names: Vec<&str> = variable
+            .dimensions()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(dim_names, vec!["lat", "lon"]);
+
+        let selection = netcdf_reader::NcSliceInfo {
+            selections: vec![
+                netcdf_reader::NcSliceInfoElem::Slice {
+                    start: 1,
+                    end: 5,
+                    step: 2,
+                },
+                netcdf_reader::NcSliceInfoElem::Slice {
+                    start: 2,
+                    end: 10,
+                    step: 3,
+                },
+            ],
+        };
+        let data: ndarray::ArrayD<f32> = file.read_variable_slice(name, &selection).unwrap();
+        assert_eq!(data.shape(), &[2, 3]);
+        assert!(data.iter().all(|value| value.is_finite()));
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_zero_record_unlimited_dimension_reads_empty_array() {
+    let path = skip_if_missing!("netcdf4", "nc4_zero_record.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let time = file.dimension("time").unwrap();
+    assert!(time.is_unlimited);
+    assert_eq!(time.size, 0);
+
+    let series = file.variable("series").unwrap();
+    assert_eq!(series.shape(), vec![0, 5]);
+    let values: ndarray::ArrayD<f32> = file.read_variable("series").unwrap();
+    assert_eq!(values.shape(), &[0, 5]);
+    assert_eq!(values.len(), 0);
+
+    let selection = netcdf_reader::NcSliceInfo {
+        selections: vec![
+            netcdf_reader::NcSliceInfoElem::Slice {
+                start: 0,
+                end: 0,
+                step: 1,
+            },
+            netcdf_reader::NcSliceInfoElem::Slice {
+                start: 0,
+                end: 5,
+                step: 1,
+            },
+        ],
+    };
+    let sliced: ndarray::ArrayD<f32> = file.read_variable_slice("series", &selection).unwrap();
+    assert_eq!(sliced.shape(), &[0, 5]);
+    assert_eq!(sliced.len(), 0);
 }
 
 #[cfg(feature = "netcdf4")]
