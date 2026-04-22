@@ -62,6 +62,48 @@ jobs:
       - name: Test netcdf-reader with cf
         run: cargo test -p netcdf-reader --features cf
 
+  release-checks:
+    name: Release checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch package dependencies
+        run: cargo fetch --locked
+
+      - name: Package hdf5-reader offline
+        run: cargo package -p hdf5-reader --offline
+
+      - name: Package netcdf-reader offline
+        run: cargo package -p netcdf-reader --offline
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      # cargo-audit currently reports a dev-only rand 0.9.2 warning through
+      # proptest; keep it visible here until proptest/rand ships the fix.
+      - name: Audit dependencies
+        run: cargo audit
+
+  asan-fuzz-smoke:
+    name: ASan fuzz smoke
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: Run chunked read fuzz smoke under ASan
+        working-directory: hdf5-reader
+        run: cargo +nightly fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
+
   fixtures:
     name: Integration tests with fixtures
     runs-on: ubuntu-latest
