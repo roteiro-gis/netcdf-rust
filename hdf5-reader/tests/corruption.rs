@@ -9,13 +9,22 @@ use hdf5_reader::superblock::HDF5_MAGIC;
 use hdf5_reader::Hdf5File;
 use std::path::Path;
 
-/// Extract the `Err` from a `Result<Hdf5File, Error>`, panicking if `Ok`.
+/// Extract the `Err` from a result, panicking if `Ok`.
 ///
-/// We cannot use `.unwrap_err()` because `Hdf5File` does not implement `Debug`.
-fn expect_err(result: Result<Hdf5File, Error>) -> Error {
+/// We cannot use `.unwrap_err()` for some public types that do not implement
+/// `Debug`.
+fn expect_err<T>(result: Result<T, Error>) -> Error {
     match result {
         Err(e) => e,
         Ok(_) => panic!("expected error, got Ok"),
+    }
+}
+
+fn error_chain_contains_unsupported_datatype(err: &Error, class: u8) -> bool {
+    match err {
+        Error::UnsupportedDatatypeClass(actual) => *actual == class,
+        Error::Context { source, .. } => error_chain_contains_unsupported_datatype(source, class),
+        _ => false,
     }
 }
 
@@ -507,6 +516,42 @@ fn valid_parse_then_corrupted_dataset_read() {
             // An error is also acceptable -- the corruption may have hit metadata.
         }
     }
+}
+
+#[test]
+fn corrupted_child_dataset_parse_error_surfaces_in_lookup_and_members() {
+    let mut bytes = match fixture_bytes("simple_contiguous.h5") {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: fixture simple_contiguous.h5 not found");
+            return;
+        }
+    };
+
+    let dataset_address = Hdf5File::from_vec(bytes.clone())
+        .unwrap()
+        .dataset("/data")
+        .unwrap()
+        .address();
+    let datatype_class_offset = usize::try_from(dataset_address + 72).unwrap();
+    assert_eq!(bytes[datatype_class_offset] & 0x0f, 1);
+    bytes[datatype_class_offset] = (bytes[datatype_class_offset] & 0xf0) | 0x0f;
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let root = file.root_group().unwrap();
+
+    let dataset_err = expect_err(root.dataset("data"));
+    assert!(
+        error_chain_contains_unsupported_datatype(&dataset_err, 15),
+        "dataset lookup should surface unsupported datatype, got: {dataset_err}"
+    );
+    assert!(!matches!(dataset_err, Error::DatasetNotFound(_)));
+
+    let members_err = expect_err(root.members());
+    assert!(
+        error_chain_contains_unsupported_datatype(&members_err, 15),
+        "members() should surface unsupported datatype, got: {members_err}"
+    );
 }
 
 #[test]

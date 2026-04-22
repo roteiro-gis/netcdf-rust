@@ -33,6 +33,13 @@ struct ChildEntry {
     address: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildObjectKind {
+    Group,
+    Dataset,
+    Other,
+}
+
 impl Group {
     /// Create a group from a known object header address.
     pub(crate) fn new(
@@ -100,15 +107,20 @@ impl Group {
         let mut groups = Vec::new();
         let mut datasets = Vec::new();
         for child in &children {
-            if self.child_is_group(child)? {
-                groups.push(Group::new(
-                    self.context.clone(),
-                    child.address,
-                    child.name.clone(),
-                    self.root_address,
-                ));
-            } else if let Some(dataset) = self.try_open_child_dataset(child) {
-                datasets.push(dataset);
+            match self.child_object_kind(child)? {
+                ChildObjectKind::Group | ChildObjectKind::Other => {
+                    groups.push(Group::new(
+                        self.context.clone(),
+                        child.address,
+                        child.name.clone(),
+                        self.root_address,
+                    ));
+                }
+                ChildObjectKind::Dataset => {
+                    if let Some(dataset) = self.try_open_child_dataset(child)? {
+                        datasets.push(dataset);
+                    }
+                }
             }
         }
         Ok((groups, datasets))
@@ -119,19 +131,24 @@ impl Group {
         let children = self.resolve_children()?;
         for child in &children {
             if child.name == name {
-                if self.is_group_at(child.address)? {
-                    return Ok(Group::new(
+                return match self.child_object_kind(child)? {
+                    ChildObjectKind::Group => Ok(Group::new(
                         self.context.clone(),
                         child.address,
                         child.name.clone(),
                         self.root_address,
-                    ));
-                } else {
-                    return Err(Error::GroupNotFound(format!(
+                    )),
+                    ChildObjectKind::Dataset => Err(Error::GroupNotFound(format!(
                         "'{}' is a dataset, not a group",
                         name
-                    )));
-                }
+                    ))),
+                    ChildObjectKind::Other => Ok(Group::new(
+                        self.context.clone(),
+                        child.address,
+                        child.name.clone(),
+                        self.root_address,
+                    )),
+                };
             }
         }
         Err(Error::GroupNotFound(name.to_string()))
@@ -148,7 +165,7 @@ impl Group {
         let children = self.resolve_children()?;
         for child in &children {
             if child.name == name {
-                if let Some(dataset) = self.try_open_child_dataset(child) {
+                if let Some(dataset) = self.try_open_child_dataset(child)? {
                     return Ok(dataset);
                 }
                 return Err(Error::DatasetNotFound(name.to_string()));
@@ -561,29 +578,27 @@ impl Group {
             .map(|child| child.name))
     }
 
-    /// Check if the object at the given address is a group (vs a dataset).
-    fn is_group_at(&self, address: u64) -> Result<bool> {
-        let mut header = (*self.cached_header(address)?).clone();
-        header.resolve_shared_messages_storage(
-            self.context.storage.as_ref(),
-            self.offset_size(),
-            self.length_size(),
-        )?;
-        for msg in &header.messages {
-            match msg {
-                HdfMessage::SymbolTable(_)
-                | HdfMessage::Link(_)
-                | HdfMessage::LinkInfo(_)
-                | HdfMessage::GroupInfo(_) => return Ok(true),
-                HdfMessage::DataLayout(_) => return Ok(false),
-                _ => {}
-            }
-        }
-        Ok(true)
+    fn child_context(&self, child: &ChildEntry) -> String {
+        format!("child '{}' at {:#x}", child.name, child.address)
     }
 
-    fn try_open_child_dataset(&self, child: &ChildEntry) -> Option<Dataset> {
-        let header = self.cached_header(child.address).ok()?;
+    fn child_object_kind(&self, child: &ChildEntry) -> Result<ChildObjectKind> {
+        let header = self
+            .cached_header(child.address)
+            .map_err(|err| err.with_context(self.child_context(child)))?;
+
+        Ok(classify_child_header(header.as_ref()))
+    }
+
+    fn try_open_child_dataset(&self, child: &ChildEntry) -> Result<Option<Dataset>> {
+        let header = self
+            .cached_header(child.address)
+            .map_err(|err| err.with_context(self.child_context(child)))?;
+
+        if classify_child_header(header.as_ref()) != ChildObjectKind::Dataset {
+            return Ok(None);
+        }
+
         Dataset::from_parsed_header(
             crate::dataset::DatasetParseContext {
                 context: self.context.clone(),
@@ -592,14 +607,8 @@ impl Group {
             child.name.clone(),
             header.as_ref(),
         )
-        .ok()
-    }
-
-    fn child_is_group(&self, child: &ChildEntry) -> Result<bool> {
-        match self.is_group_at(child.address) {
-            Ok(is_group) => Ok(is_group),
-            Err(_) => Ok(self.try_open_child_dataset(child).is_none()),
-        }
+        .map(Some)
+        .map_err(|err| err.with_context(self.child_context(child)))
     }
 
     /// Maximum nesting depth for soft link resolution.
@@ -653,5 +662,29 @@ impl Group {
             "soft link target '{}' not found",
             path
         )))
+    }
+}
+
+fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildObjectKind {
+    let mut has_dataset_message = false;
+
+    for msg in &header.messages {
+        match msg {
+            HdfMessage::SymbolTable(_)
+            | HdfMessage::Link(_)
+            | HdfMessage::LinkInfo(_)
+            | HdfMessage::GroupInfo(_) => return ChildObjectKind::Group,
+            HdfMessage::Dataspace(_)
+            | HdfMessage::DataLayout(_)
+            | HdfMessage::FillValue(_)
+            | HdfMessage::FilterPipeline(_) => has_dataset_message = true,
+            _ => {}
+        }
+    }
+
+    if has_dataset_message {
+        ChildObjectKind::Dataset
+    } else {
+        ChildObjectKind::Other
     }
 }
