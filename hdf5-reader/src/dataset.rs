@@ -77,8 +77,8 @@ unsafe impl Sync for FlatBufferPtr {}
 impl FlatBufferPtr {
     #[cfg(feature = "rayon")]
     #[inline(always)]
-    unsafe fn copy_chunk(self, chunk_data: &[u8], layout: ChunkCopyLayout<'_>) {
-        copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout);
+    unsafe fn copy_chunk(self, chunk_data: &[u8], layout: ChunkCopyLayout<'_>) -> Result<()> {
+        copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout)
     }
 
     #[cfg(feature = "rayon")]
@@ -91,7 +91,7 @@ impl FlatBufferPtr {
         result_strides: &[usize],
         elem_size: usize,
         ndim: usize,
-    ) {
+    ) -> Result<()> {
         copy_selected_elements_ptr(
             chunk_data,
             self.ptr,
@@ -101,7 +101,7 @@ impl FlatBufferPtr {
             result_strides,
             elem_size,
             ndim,
-        );
+        )
     }
 
     #[cfg(feature = "rayon")]
@@ -214,22 +214,189 @@ fn checked_shape_elements_usize(shape: &[u64], context: &str) -> Result<usize> {
     Ok(total)
 }
 
-fn expected_chunk_count(first_chunk: &[u64], last_chunk: &[u64]) -> Result<usize> {
-    let mut total = 1usize;
-    for (&first, &last) in first_chunk.iter().zip(last_chunk.iter()) {
-        let dim_count = checked_usize(last - first + 1, "selected chunk count")?;
-        total = checked_mul_usize(total, dim_count, "selected chunk count")?;
+fn full_dataset_chunk_bounds(
+    shape: &[u64],
+    chunk_shape: &[u64],
+) -> Result<Option<(Vec<u64>, Vec<u64>)>> {
+    validate_chunk_shape(shape, chunk_shape)?;
+    if shape.contains(&0) {
+        return Ok(None);
     }
-    Ok(total)
+
+    let first_chunk = vec![0u64; shape.len()];
+    let last_chunk = shape
+        .iter()
+        .zip(chunk_shape.iter())
+        .map(|(&dim, &chunk)| dim.div_ceil(chunk) - 1)
+        .collect();
+    Ok(Some((first_chunk, last_chunk)))
 }
 
-fn full_dataset_chunk_count(shape: &[u64], chunk_shape: &[u64]) -> Result<usize> {
-    let mut total = 1usize;
-    for (&dim, &chunk) in shape.iter().zip(chunk_shape.iter()) {
-        let chunk_count = checked_usize(dim.div_ceil(chunk), "full dataset chunk count")?;
-        total = checked_mul_usize(total, chunk_count, "full dataset chunk count")?;
+fn validate_chunk_shape(shape: &[u64], chunk_shape: &[u64]) -> Result<()> {
+    if chunk_shape.len() != shape.len() {
+        return Err(Error::InvalidData(format!(
+            "chunk rank {} does not match dataset rank {}",
+            chunk_shape.len(),
+            shape.len()
+        )));
     }
-    Ok(total)
+    if let Some((dim, _)) = chunk_shape
+        .iter()
+        .enumerate()
+        .find(|(_, chunk)| **chunk == 0)
+    {
+        return Err(Error::InvalidData(format!(
+            "chunk dimension {dim} has zero extent"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_decoded_chunk_len(
+    entry: &chunk_index::ChunkEntry,
+    chunk_shape: &[u64],
+    elem_size: usize,
+    actual_len: usize,
+) -> Result<()> {
+    let chunk_elements = checked_shape_elements_usize(chunk_shape, "decoded chunk element count")?;
+    let expected_len = checked_mul_usize(chunk_elements, elem_size, "decoded chunk byte length")?;
+    if actual_len != expected_len {
+        return Err(Error::InvalidData(format!(
+            "chunk at offsets {:?} decoded to {} bytes, expected {} bytes",
+            entry.offsets, actual_len, expected_len
+        )));
+    }
+    Ok(())
+}
+
+fn validate_chunk_grid_coverage(
+    entries: &mut [chunk_index::ChunkEntry],
+    shape: &[u64],
+    chunk_shape: &[u64],
+    first_chunk: &[u64],
+    last_chunk: &[u64],
+) -> Result<bool> {
+    validate_chunk_shape(shape, chunk_shape)?;
+    if first_chunk.len() != shape.len() || last_chunk.len() != shape.len() {
+        return Err(Error::InvalidData(format!(
+            "chunk grid bounds rank does not match dataset rank {}",
+            shape.len()
+        )));
+    }
+
+    if shape.contains(&0) {
+        if entries.is_empty() {
+            return Ok(true);
+        }
+        return Err(Error::InvalidData(
+            "chunk index contains entries for an empty dataset".into(),
+        ));
+    }
+
+    for dim in 0..shape.len() {
+        if first_chunk[dim] > last_chunk[dim] {
+            return Err(Error::InvalidData(format!(
+                "invalid chunk grid bounds for dimension {dim}: {} > {}",
+                first_chunk[dim], last_chunk[dim]
+            )));
+        }
+    }
+
+    entries.sort_by(|a, b| a.offsets.cmp(&b.offsets));
+
+    for i in 0..entries.len() {
+        validate_chunk_entry_offsets(&entries[i], shape, chunk_shape, first_chunk, last_chunk)?;
+        if i > 0 && entries[i].offsets == entries[i - 1].offsets {
+            return Err(Error::InvalidData(format!(
+                "duplicate chunk output offsets {:?} (addresses {:#x} and {:#x})",
+                entries[i].offsets,
+                entries[i - 1].address,
+                entries[i].address
+            )));
+        }
+    }
+
+    let mut entry_idx = 0usize;
+    let mut expected = first_chunk.to_vec();
+    loop {
+        let expected_offsets: Vec<u64> = expected
+            .iter()
+            .enumerate()
+            .map(|(dim, chunk_index)| chunk_index * chunk_shape[dim])
+            .collect();
+
+        if entry_idx >= entries.len() || entries[entry_idx].offsets != expected_offsets {
+            return Ok(false);
+        }
+        entry_idx += 1;
+
+        if !advance_chunk_index(&mut expected, first_chunk, last_chunk) {
+            break;
+        }
+    }
+
+    Ok(entry_idx == entries.len())
+}
+
+fn validate_chunk_entry_offsets(
+    entry: &chunk_index::ChunkEntry,
+    shape: &[u64],
+    chunk_shape: &[u64],
+    first_chunk: &[u64],
+    last_chunk: &[u64],
+) -> Result<()> {
+    if entry.offsets.len() != shape.len() {
+        return Err(Error::InvalidData(format!(
+            "chunk at address {:#x} has rank {}, expected {}",
+            entry.address,
+            entry.offsets.len(),
+            shape.len()
+        )));
+    }
+
+    for dim in 0..shape.len() {
+        let offset = entry.offsets[dim];
+        if offset >= shape[dim] {
+            return Err(Error::InvalidData(format!(
+                "chunk at address {:#x} has out-of-bounds offset {} for dimension {} of size {}",
+                entry.address, offset, dim, shape[dim]
+            )));
+        }
+        if offset % chunk_shape[dim] != 0 {
+            return Err(Error::InvalidData(format!(
+                "chunk at address {:#x} has non-grid offset {} for dimension {} with chunk extent {}",
+                entry.address, offset, dim, chunk_shape[dim]
+            )));
+        }
+
+        let chunk_index = offset / chunk_shape[dim];
+        if chunk_index < first_chunk[dim] || chunk_index > last_chunk[dim] {
+            return Err(Error::InvalidData(format!(
+                "chunk at address {:#x} has offset {:?} outside requested chunk grid",
+                entry.address, entry.offsets
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn advance_chunk_index(index: &mut [u64], first_chunk: &[u64], last_chunk: &[u64]) -> bool {
+    if index.is_empty() {
+        return false;
+    }
+
+    for dim in (0..index.len()).rev() {
+        if index[dim] < last_chunk[dim] {
+            index[dim] += 1;
+            if dim + 1 < index.len() {
+                index[(dim + 1)..].copy_from_slice(&first_chunk[(dim + 1)..]);
+            }
+            return true;
+        }
+    }
+
+    false
 }
 
 fn row_major_strides(shape: &[u64], context: &str) -> Result<Vec<usize>> {
@@ -855,6 +1022,7 @@ impl Dataset {
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
         let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
 
@@ -862,7 +1030,7 @@ impl Dataset {
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
-        let entries = self.collect_chunk_entries(
+        let mut entries = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
@@ -874,7 +1042,21 @@ impl Dataset {
             },
         )?;
 
-        let full_chunk_coverage = entries.len() == full_dataset_chunk_count(shape, &chunk_shape)?;
+        let full_chunk_coverage = match full_dataset_chunk_bounds(shape, &chunk_shape)? {
+            Some((first_chunk, last_chunk)) => validate_chunk_grid_coverage(
+                &mut entries,
+                shape,
+                &chunk_shape,
+                &first_chunk,
+                &last_chunk,
+            )?,
+            None if entries.is_empty() => true,
+            None => {
+                return Err(Error::InvalidData(
+                    "chunk index contains entries for an empty dataset".into(),
+                ))
+            }
+        };
         if full_chunk_coverage {
             let hot_full_dataset_bytes = if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                 self.full_dataset_bytes.get().cloned()
@@ -898,7 +1080,7 @@ impl Dataset {
 
                 for entry in &entries {
                     let chunk_data =
-                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                        self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
                     unsafe {
                         copy_chunk_to_flat_with_strides_ptr(
                             &chunk_data,
@@ -914,7 +1096,7 @@ impl Dataset {
                                 chunk_strides: &chunk_strides,
                                 elem_size,
                             },
-                        );
+                        )?;
                     }
                 }
 
@@ -945,7 +1127,7 @@ impl Dataset {
 
             for entry in &entries {
                 let chunk_data =
-                    self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                    self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
                 unsafe {
                     copy_chunk_to_flat_with_strides_ptr(
                         &chunk_data,
@@ -961,7 +1143,7 @@ impl Dataset {
                             chunk_strides: &chunk_strides,
                             elem_size,
                         },
-                    );
+                    )?;
                 }
             }
 
@@ -974,7 +1156,8 @@ impl Dataset {
 
         let mut flat_data = self.make_output_buffer(total_bytes);
         for entry in &entries {
-            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+            let chunk_data =
+                self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
             copy_chunk_to_flat_with_strides(
                 &chunk_data,
                 &mut flat_data,
@@ -986,7 +1169,7 @@ impl Dataset {
                     chunk_strides: &chunk_strides,
                     elem_size,
                 },
-            );
+            )?;
         }
 
         self.decode_raw_data::<T>(&flat_data)
@@ -1007,10 +1190,11 @@ impl Dataset {
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
         let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
 
-        let entries = self.collect_chunk_entries(
+        let mut entries = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
@@ -1022,7 +1206,21 @@ impl Dataset {
             },
         )?;
 
-        let full_chunk_coverage = entries.len() == full_dataset_chunk_count(shape, &chunk_shape)?;
+        let full_chunk_coverage = match full_dataset_chunk_bounds(shape, &chunk_shape)? {
+            Some((first_chunk, last_chunk)) => validate_chunk_grid_coverage(
+                &mut entries,
+                shape,
+                &chunk_shape,
+                &first_chunk,
+                &last_chunk,
+            )?,
+            None if entries.is_empty() => true,
+            None => {
+                return Err(Error::InvalidData(
+                    "chunk index contains entries for an empty dataset".into(),
+                ))
+            }
+        };
         if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
                 return Ok(cached_bytes.as_ref().clone());
@@ -1031,7 +1229,8 @@ impl Dataset {
 
         let mut flat_data = self.make_output_buffer(total_bytes);
         for entry in &entries {
-            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+            let chunk_data =
+                self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
             copy_chunk_to_flat_with_strides(
                 &chunk_data,
                 &mut flat_data,
@@ -1043,7 +1242,7 @@ impl Dataset {
                     chunk_strides: &chunk_strides,
                     elem_size,
                 },
-            );
+            )?;
         }
 
         if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
@@ -1069,6 +1268,7 @@ impl Dataset {
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
         let dataset_strides = row_major_strides(shape, "dataset stride")?;
         let chunk_strides = row_major_strides(&chunk_shape, "chunk stride")?;
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
@@ -1086,22 +1286,21 @@ impl Dataset {
             },
         )?;
 
-        // Dedup check: sort by output offsets and reject duplicates.
-        // Two chunks claiming the same output offsets would cause data races
-        // when writing into the flat buffer in parallel.
-        entries.sort_by(|a, b| a.offsets.cmp(&b.offsets));
-        for i in 1..entries.len() {
-            if entries[i].offsets == entries[i - 1].offsets {
-                return Err(Error::InvalidData(format!(
-                    "duplicate chunk output offsets {:?} (addresses {:#x} and {:#x})",
-                    entries[i].offsets,
-                    entries[i - 1].address,
-                    entries[i].address
-                )));
+        let full_chunk_coverage = match full_dataset_chunk_bounds(shape, &chunk_shape)? {
+            Some((first_chunk, last_chunk)) => validate_chunk_grid_coverage(
+                &mut entries,
+                shape,
+                &chunk_shape,
+                &first_chunk,
+                &last_chunk,
+            )?,
+            None if entries.is_empty() => true,
+            None => {
+                return Err(Error::InvalidData(
+                    "chunk index contains entries for an empty dataset".into(),
+                ))
             }
-        }
-
-        let full_chunk_coverage = entries.len() == full_dataset_chunk_count(shape, &chunk_shape)?;
+        };
         if full_chunk_coverage {
             if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                 if let Some(cached_bytes) = self.full_dataset_bytes.get() {
@@ -1125,8 +1324,8 @@ impl Dataset {
                 entries
                     .par_iter()
                     .map(|entry| {
-                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                            .map(|data| unsafe {
+                        self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
+                            .and_then(|data| unsafe {
                                 flat.copy_chunk(
                                     &data,
                                     ChunkCopyLayout {
@@ -1137,7 +1336,7 @@ impl Dataset {
                                         chunk_strides: &chunk_strides,
                                         elem_size,
                                     },
-                                );
+                                )
                             })
                     })
                     .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -1171,8 +1370,8 @@ impl Dataset {
             entries
                 .par_iter()
                 .map(|entry| {
-                    self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                        .map(|data| unsafe {
+                    self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
+                        .and_then(|data| unsafe {
                             flat.copy_chunk(
                                 &data,
                                 ChunkCopyLayout {
@@ -1183,7 +1382,7 @@ impl Dataset {
                                     chunk_strides: &chunk_strides,
                                     elem_size,
                                 },
-                            );
+                            )
                         })
                 })
                 .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -1204,8 +1403,8 @@ impl Dataset {
         entries
             .par_iter()
             .map(|entry| {
-                self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                    .map(|data| unsafe {
+                self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
+                    .and_then(|data| unsafe {
                         flat.copy_chunk(
                             &data,
                             ChunkCopyLayout {
@@ -1216,7 +1415,7 @@ impl Dataset {
                                 chunk_strides: &chunk_strides,
                                 elem_size,
                             },
-                        );
+                        )
                     })
             })
             .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -1404,6 +1603,18 @@ impl Dataset {
         })
     }
 
+    fn load_exact_chunk_data(
+        &self,
+        entry: &chunk_index::ChunkEntry,
+        dataset_addr: u64,
+        chunk_shape: &[u64],
+        elem_size: usize,
+    ) -> Result<Arc<Vec<u8>>> {
+        let data = self.load_chunk_data(entry, dataset_addr, chunk_shape, elem_size)?;
+        validate_decoded_chunk_len(entry, chunk_shape, elem_size, data.len())?;
+        Ok(data)
+    }
+
     /// Chunked slice: only read chunks that overlap the selection.
     ///
     /// Resolves each `SliceInfoElem` to concrete ranges, computes the chunk
@@ -1430,6 +1641,7 @@ impl Dataset {
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
         let mut last_chunk = vec![0u64; ndim];
         for d in 0..ndim {
@@ -1441,7 +1653,7 @@ impl Dataset {
         }
 
         // Collect all chunk entries.
-        let overlapping = self.collect_chunk_entries(
+        let mut overlapping = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
@@ -1452,6 +1664,13 @@ impl Dataset {
                 chunk_bounds: Some((&first_chunk, &last_chunk)),
             },
         )?;
+        let fully_covered_grid = validate_chunk_grid_coverage(
+            &mut overlapping,
+            shape,
+            &chunk_shape,
+            &first_chunk,
+            &last_chunk,
+        )?;
 
         let result_total_bytes = checked_mul_usize(
             resolved.result_elements,
@@ -1461,12 +1680,12 @@ impl Dataset {
         // Compute result strides (including collapsed dims — they have count=1).
         let result_dims = resolved.result_dims_with_collapsed();
         let mut result_strides = vec![1usize; ndim];
-        for d in (0..ndim - 1).rev() {
+        for d in (0..ndim.saturating_sub(1)).rev() {
             result_strides[d] =
                 checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
         }
         let mut chunk_strides = vec![1usize; ndim];
-        for d in (0..ndim - 1).rev() {
+        for d in (0..ndim.saturating_sub(1)).rev() {
             chunk_strides[d] = checked_mul_usize(
                 chunk_strides[d + 1],
                 chunk_shape[d + 1] as usize,
@@ -1474,8 +1693,7 @@ impl Dataset {
             )?;
         }
         let use_unit_stride_fast_path = resolved.is_unit_stride();
-        let fully_covered_unit_stride = use_unit_stride_fast_path
-            && overlapping.len() == expected_chunk_count(&first_chunk, &last_chunk)?;
+        let fully_covered_unit_stride = use_unit_stride_fast_path && fully_covered_grid;
 
         if fully_covered_unit_stride {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
@@ -1492,7 +1710,7 @@ impl Dataset {
 
                 for entry in &overlapping {
                     let chunk_data =
-                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                        self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
                     unsafe {
                         copy_unit_stride_chunk_overlap_ptr(
@@ -1525,7 +1743,7 @@ impl Dataset {
 
             for entry in &overlapping {
                 let chunk_data =
-                    self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                    self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
                 unsafe {
                     copy_unit_stride_chunk_overlap_ptr(
@@ -1559,7 +1777,8 @@ impl Dataset {
 
         // For each overlapping chunk: decompress and copy matching elements.
         for entry in &overlapping {
-            let chunk_data = self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+            let chunk_data =
+                self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
             if use_unit_stride_fast_path {
                 copy_unit_stride_chunk_overlap(
@@ -1620,7 +1839,7 @@ impl Dataset {
                 &result_strides,
                 elem_size,
                 ndim,
-            );
+            )?;
         }
 
         self.decode_buffer_with_shape::<T>(
@@ -1658,6 +1877,7 @@ impl Dataset {
         let shape = &self.dataspace.dims;
         let elem_size = dtype_element_size(&self.datatype);
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
         let mut last_chunk = vec![0u64; ndim];
         for d in 0..ndim {
@@ -1669,7 +1889,7 @@ impl Dataset {
         }
 
         // Collect all chunk entries.
-        let overlapping = self.collect_chunk_entries(
+        let mut overlapping = self.collect_chunk_entries(
             index_address,
             chunk_dims,
             chunk_indexing,
@@ -1679,6 +1899,13 @@ impl Dataset {
                 elem_size,
                 chunk_bounds: Some((&first_chunk, &last_chunk)),
             },
+        )?;
+        let fully_covered_grid = validate_chunk_grid_coverage(
+            &mut overlapping,
+            shape,
+            &chunk_shape,
+            &first_chunk,
+            &last_chunk,
         )?;
 
         // Allocate result buffer (raw bytes) initialized from fill value.
@@ -1690,12 +1917,12 @@ impl Dataset {
         // Compute result strides (including collapsed dims — they have count=1).
         let result_dims = resolved.result_dims_with_collapsed();
         let mut result_strides = vec![1usize; ndim];
-        for d in (0..ndim - 1).rev() {
+        for d in (0..ndim.saturating_sub(1)).rev() {
             result_strides[d] =
                 checked_mul_usize(result_strides[d + 1], result_dims[d + 1], "result stride")?;
         }
         let mut chunk_strides = vec![1usize; ndim];
-        for d in (0..ndim - 1).rev() {
+        for d in (0..ndim.saturating_sub(1)).rev() {
             chunk_strides[d] = checked_mul_usize(
                 chunk_strides[d + 1],
                 chunk_shape[d + 1] as usize,
@@ -1703,8 +1930,7 @@ impl Dataset {
             )?;
         }
         let use_unit_stride_fast_path = resolved.is_unit_stride();
-        let fully_covered_unit_stride = use_unit_stride_fast_path
-            && overlapping.len() == expected_chunk_count(&first_chunk, &last_chunk)?;
+        let fully_covered_unit_stride = use_unit_stride_fast_path && fully_covered_grid;
 
         if fully_covered_unit_stride {
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
@@ -1724,8 +1950,12 @@ impl Dataset {
                 overlapping
                     .par_iter()
                     .map(|entry| {
-                        let chunk_data =
-                            self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                        let chunk_data = self.load_exact_chunk_data(
+                            entry,
+                            index_address,
+                            &chunk_shape,
+                            elem_size,
+                        )?;
 
                         unsafe {
                             flat.copy_unit_stride_chunk_overlap(
@@ -1761,7 +1991,7 @@ impl Dataset {
                 .par_iter()
                 .map(|entry| {
                     let chunk_data =
-                        self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                        self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
                     unsafe {
                         flat.copy_unit_stride_chunk_overlap(
@@ -1801,7 +2031,7 @@ impl Dataset {
             .par_iter()
             .map(|entry| {
                 let chunk_data =
-                    self.load_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                    self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
                 if use_unit_stride_fast_path {
                     unsafe {
@@ -1864,7 +2094,7 @@ impl Dataset {
                         &result_strides,
                         elem_size,
                         ndim,
-                    );
+                    )?;
                 }
 
                 Ok(())
@@ -2002,7 +2232,7 @@ impl Dataset {
             &result_strides,
             elem_size,
             ndim,
-        );
+        )?;
 
         self.decode_buffer_with_shape::<T>(
             &result_buf,
@@ -2180,7 +2410,7 @@ fn copy_chunk_to_flat(
     chunk_shape: &[u64],
     dataset_shape: &[u64],
     elem_size: usize,
-) {
+) -> Result<()> {
     let dataset_strides = row_major_strides(dataset_shape, "dataset stride")
         .expect("dataset strides should fit in usize");
     let chunk_strides =
@@ -2196,14 +2426,14 @@ fn copy_chunk_to_flat(
             chunk_strides: &chunk_strides,
             elem_size,
         },
-    );
+    )
 }
 
 fn copy_chunk_to_flat_with_strides(
     chunk_data: &[u8],
     flat: &mut [u8],
     layout: ChunkCopyLayout<'_>,
-) {
+) -> Result<()> {
     unsafe {
         copy_chunk_to_flat_with_strides_ptr(
             chunk_data,
@@ -2212,7 +2442,7 @@ fn copy_chunk_to_flat_with_strides(
                 len: flat.len(),
             },
             layout,
-        );
+        )
     }
 }
 
@@ -2221,64 +2451,107 @@ unsafe fn copy_chunk_to_flat_with_strides_ptr(
     chunk_data: &[u8],
     flat: FlatBufferPtr,
     layout: ChunkCopyLayout<'_>,
-) {
+) -> Result<()> {
     let ndim = layout.dataset_shape.len();
+    if layout.chunk_offsets.len() != ndim
+        || layout.chunk_shape.len() != ndim
+        || layout.dataset_strides.len() != ndim
+        || layout.chunk_strides.len() != ndim
+    {
+        return Err(Error::InvalidData(format!(
+            "chunk copy layout rank does not match dataset rank {ndim}"
+        )));
+    }
 
     if ndim == 0 {
-        let bytes = layout.elem_size.min(chunk_data.len()).min(flat.len);
-        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr, bytes);
-        return;
+        if chunk_data.len() < layout.elem_size || flat.len < layout.elem_size {
+            return Err(Error::InvalidData(format!(
+                "scalar chunk copy requires {} bytes, got source {} and destination {}",
+                layout.elem_size,
+                chunk_data.len(),
+                flat.len
+            )));
+        }
+        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr, layout.elem_size);
+        return Ok(());
     }
 
     // Total elements in this chunk (clamped to dataset boundaries)
     let mut actual_chunk_shape = Vec::with_capacity(ndim);
     for i in 0..ndim {
+        if layout.chunk_offsets[i] >= layout.dataset_shape[i] {
+            return Err(Error::InvalidData(format!(
+                "chunk offset {} is outside dimension {} of size {}",
+                layout.chunk_offsets[i], i, layout.dataset_shape[i]
+            )));
+        }
         let remaining = layout.dataset_shape[i] - layout.chunk_offsets[i];
-        actual_chunk_shape.push(remaining.min(layout.chunk_shape[i]) as usize);
+        actual_chunk_shape.push(checked_usize(
+            remaining.min(layout.chunk_shape[i]),
+            "actual chunk extent",
+        )?);
     }
 
     let row_elems = *actual_chunk_shape.last().unwrap_or(&1);
-    let row_bytes = row_elems * layout.elem_size;
-    let dataset_origin: usize = layout
-        .chunk_offsets
-        .iter()
-        .enumerate()
-        .map(|(d, offset)| *offset as usize * layout.dataset_strides[d])
-        .sum();
+    let row_bytes = checked_mul_usize(row_elems, layout.elem_size, "chunk row bytes")?;
+    let mut dataset_origin = 0usize;
+    for (d, offset) in layout.chunk_offsets.iter().enumerate() {
+        let offset = checked_usize(*offset, "chunk offset")?;
+        let term = checked_mul_usize(offset, layout.dataset_strides[d], "chunk origin")?;
+        dataset_origin = checked_add_usize(dataset_origin, term, "chunk origin")?;
+    }
 
     if ndim == 1 {
-        let bytes = row_bytes.min(chunk_data.len());
-        let dst_start = dataset_origin * layout.elem_size;
-        let dst_end = dst_start + bytes;
-        if dst_end <= flat.len {
-            std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr.add(dst_start), bytes);
+        let dst_start = checked_mul_usize(dataset_origin, layout.elem_size, "chunk dst offset")?;
+        let dst_end = checked_add_usize(dst_start, row_bytes, "chunk dst end")?;
+        if row_bytes > chunk_data.len() || dst_end > flat.len {
+            return Err(Error::InvalidData(format!(
+                "chunk copy out of bounds: source row needs {} bytes from {} bytes, destination range {}..{} exceeds {} bytes",
+                row_bytes,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                flat.len
+            )));
         }
-        return;
+        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr.add(dst_start), row_bytes);
+        return Ok(());
     }
 
     let outer_dims = &actual_chunk_shape[..ndim - 1];
-    let total_rows: usize = outer_dims.iter().product();
+    let total_rows = checked_product_usize(outer_dims, "chunk row count")?;
     let mut outer_idx = vec![0usize; ndim - 1];
 
     for _ in 0..total_rows {
         let mut chunk_row = 0usize;
         let mut dataset_row = dataset_origin;
         for (d, outer) in outer_idx.iter().copied().enumerate() {
-            chunk_row += outer * layout.chunk_strides[d];
-            dataset_row += outer * layout.dataset_strides[d];
+            let chunk_term = checked_mul_usize(outer, layout.chunk_strides[d], "chunk row")?;
+            let dataset_term = checked_mul_usize(outer, layout.dataset_strides[d], "dataset row")?;
+            chunk_row = checked_add_usize(chunk_row, chunk_term, "chunk row")?;
+            dataset_row = checked_add_usize(dataset_row, dataset_term, "dataset row")?;
         }
 
-        let src_start = chunk_row * layout.elem_size;
-        let dst_start = dataset_row * layout.elem_size;
-        let src_end = src_start + row_bytes;
-        let dst_end = dst_start + row_bytes;
-        if src_end <= chunk_data.len() && dst_end <= flat.len {
-            std::ptr::copy_nonoverlapping(
-                chunk_data.as_ptr().add(src_start),
-                flat.ptr.add(dst_start),
-                row_bytes,
-            );
+        let src_start = checked_mul_usize(chunk_row, layout.elem_size, "chunk src offset")?;
+        let dst_start = checked_mul_usize(dataset_row, layout.elem_size, "chunk dst offset")?;
+        let src_end = checked_add_usize(src_start, row_bytes, "chunk src end")?;
+        let dst_end = checked_add_usize(dst_start, row_bytes, "chunk dst end")?;
+        if src_end > chunk_data.len() || dst_end > flat.len {
+            return Err(Error::InvalidData(format!(
+                "chunk copy out of bounds: source range {}..{} of {} bytes, destination range {}..{} of {} bytes",
+                src_start,
+                src_end,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                flat.len
+            )));
         }
+        std::ptr::copy_nonoverlapping(
+            chunk_data.as_ptr().add(src_start),
+            flat.ptr.add(dst_start),
+            row_bytes,
+        );
 
         let mut carry = true;
         for d in (0..outer_idx.len()).rev() {
@@ -2292,6 +2565,8 @@ unsafe fn copy_chunk_to_flat_with_strides_ptr(
             }
         }
     }
+
+    Ok(())
 }
 
 fn checked_product_usize(values: &[usize], context: &str) -> Result<usize> {
@@ -2375,10 +2650,27 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
     layout: UnitStrideCopyLayout<'_>,
 ) -> Result<()> {
     let ndim = layout.dataset_shape.len();
+    if layout.chunk_offsets.len() != ndim
+        || layout.chunk_shape.len() != ndim
+        || layout.resolved.dims.len() != ndim
+        || layout.chunk_strides.len() != ndim
+        || layout.result_strides.len() != ndim
+    {
+        return Err(Error::InvalidData(format!(
+            "unit-stride copy layout rank does not match dataset rank {ndim}"
+        )));
+    }
 
     if ndim == 0 {
-        let bytes = layout.elem_size.min(chunk_data.len()).min(result.len);
-        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), result.ptr, bytes);
+        if chunk_data.len() < layout.elem_size || result.len < layout.elem_size {
+            return Err(Error::InvalidData(format!(
+                "scalar slice copy requires {} bytes, got source {} and destination {}",
+                layout.elem_size,
+                chunk_data.len(),
+                result.len
+            )));
+        }
+        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), result.ptr, layout.elem_size);
         return Ok(());
     }
 
@@ -2413,17 +2705,26 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
     }
 
     if ndim == 1 {
-        let src_start = chunk_origin * layout.elem_size;
-        let dst_start = result_origin * layout.elem_size;
-        let src_end = src_start + row_bytes;
-        let dst_end = dst_start + row_bytes;
-        if src_end <= chunk_data.len() && dst_end <= result.len {
-            std::ptr::copy_nonoverlapping(
-                chunk_data.as_ptr().add(src_start),
-                result.ptr.add(dst_start),
-                row_bytes,
-            );
+        let src_start = checked_mul_usize(chunk_origin, layout.elem_size, "slice src offset")?;
+        let dst_start = checked_mul_usize(result_origin, layout.elem_size, "slice dst offset")?;
+        let src_end = checked_add_usize(src_start, row_bytes, "slice src end")?;
+        let dst_end = checked_add_usize(dst_start, row_bytes, "slice dst end")?;
+        if src_end > chunk_data.len() || dst_end > result.len {
+            return Err(Error::InvalidData(format!(
+                "unit-stride slice copy out of bounds: source range {}..{} of {} bytes, destination range {}..{} of {} bytes",
+                src_start,
+                src_end,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                result.len
+            )));
         }
+        std::ptr::copy_nonoverlapping(
+            chunk_data.as_ptr().add(src_start),
+            result.ptr.add(dst_start),
+            row_bytes,
+        );
         return Ok(());
     }
 
@@ -2435,21 +2736,33 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
         let mut chunk_row = chunk_origin;
         let mut result_row = result_origin;
         for (d, outer) in outer_idx.iter().copied().enumerate() {
-            chunk_row += outer * layout.chunk_strides[d];
-            result_row += outer * layout.result_strides[d];
+            let chunk_term = checked_mul_usize(outer, layout.chunk_strides[d], "slice chunk row")?;
+            let result_term =
+                checked_mul_usize(outer, layout.result_strides[d], "slice result row")?;
+            chunk_row = checked_add_usize(chunk_row, chunk_term, "slice chunk row")?;
+            result_row = checked_add_usize(result_row, result_term, "slice result row")?;
         }
 
-        let src_start = chunk_row * layout.elem_size;
-        let dst_start = result_row * layout.elem_size;
-        let src_end = src_start + row_bytes;
-        let dst_end = dst_start + row_bytes;
-        if src_end <= chunk_data.len() && dst_end <= result.len {
-            std::ptr::copy_nonoverlapping(
-                chunk_data.as_ptr().add(src_start),
-                result.ptr.add(dst_start),
-                row_bytes,
-            );
+        let src_start = checked_mul_usize(chunk_row, layout.elem_size, "slice src offset")?;
+        let dst_start = checked_mul_usize(result_row, layout.elem_size, "slice dst offset")?;
+        let src_end = checked_add_usize(src_start, row_bytes, "slice src end")?;
+        let dst_end = checked_add_usize(dst_start, row_bytes, "slice dst end")?;
+        if src_end > chunk_data.len() || dst_end > result.len {
+            return Err(Error::InvalidData(format!(
+                "unit-stride slice copy out of bounds: source range {}..{} of {} bytes, destination range {}..{} of {} bytes",
+                src_start,
+                src_end,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                result.len
+            )));
         }
+        std::ptr::copy_nonoverlapping(
+            chunk_data.as_ptr().add(src_start),
+            result.ptr.add(dst_start),
+            row_bytes,
+        );
 
         let mut carry = true;
         for d in (0..outer_idx.len()).rev() {
@@ -2480,14 +2793,21 @@ fn copy_selected_elements(
     result_strides: &[usize],
     elem_size: usize,
     ndim: usize,
-) {
+) -> Result<()> {
+    if dim_indices.len() != ndim || chunk_strides.len() != ndim || result_strides.len() != ndim {
+        return Err(Error::InvalidData(format!(
+            "selected-element copy layout rank does not match rank {ndim}"
+        )));
+    }
+
     // Check for empty selection
     if dim_indices.iter().any(|v| v.is_empty()) {
-        return;
+        return Ok(());
     }
 
     // Recursive cartesian-product iteration, but unrolled iteratively.
-    let total: usize = dim_indices.iter().map(|v| v.len()).product();
+    let counts: Vec<usize> = dim_indices.iter().map(|v| v.len()).collect();
+    let total = checked_product_usize(&counts, "selected-element copy count")?;
     let mut counters = vec![0usize; ndim];
 
     for _ in 0..total {
@@ -2495,18 +2815,30 @@ fn copy_selected_elements(
         let mut result_flat = 0;
         for d in 0..ndim {
             let (cl, ri) = dim_indices[d][counters[d]];
-            chunk_flat += cl * chunk_strides[d];
-            result_flat += ri * result_strides[d];
+            let chunk_term = checked_mul_usize(cl, chunk_strides[d], "selected chunk offset")?;
+            let result_term = checked_mul_usize(ri, result_strides[d], "selected result offset")?;
+            chunk_flat = checked_add_usize(chunk_flat, chunk_term, "selected chunk offset")?;
+            result_flat = checked_add_usize(result_flat, result_term, "selected result offset")?;
         }
 
-        let src_start = chunk_flat * elem_size;
-        let dst_start = result_flat * elem_size;
-        let src_end = src_start + elem_size;
-        let dst_end = dst_start + elem_size;
+        let src_start = checked_mul_usize(chunk_flat, elem_size, "selected source byte offset")?;
+        let dst_start =
+            checked_mul_usize(result_flat, elem_size, "selected destination byte offset")?;
+        let src_end = checked_add_usize(src_start, elem_size, "selected source byte end")?;
+        let dst_end = checked_add_usize(dst_start, elem_size, "selected destination byte end")?;
 
-        if src_end <= chunk_data.len() && dst_end <= result_buf.len() {
-            result_buf[dst_start..dst_end].copy_from_slice(&chunk_data[src_start..src_end]);
+        if src_end > chunk_data.len() || dst_end > result_buf.len() {
+            return Err(Error::InvalidData(format!(
+                "selected-element copy out of bounds: source range {}..{} of {} bytes, destination range {}..{} of {} bytes",
+                src_start,
+                src_end,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                result_buf.len()
+            )));
         }
+        result_buf[dst_start..dst_end].copy_from_slice(&chunk_data[src_start..src_end]);
 
         // Increment counters (row-major)
         let mut carry = true;
@@ -2521,6 +2853,8 @@ fn copy_selected_elements(
             }
         }
     }
+
+    Ok(())
 }
 
 /// Copy selected elements from a chunk into a raw output pointer.
@@ -2544,12 +2878,19 @@ unsafe fn copy_selected_elements_ptr(
     result_strides: &[usize],
     elem_size: usize,
     ndim: usize,
-) {
-    if dim_indices.iter().any(|v| v.is_empty()) {
-        return;
+) -> Result<()> {
+    if dim_indices.len() != ndim || chunk_strides.len() != ndim || result_strides.len() != ndim {
+        return Err(Error::InvalidData(format!(
+            "selected-element copy layout rank does not match rank {ndim}"
+        )));
     }
 
-    let total: usize = dim_indices.iter().map(|v| v.len()).product();
+    if dim_indices.iter().any(|v| v.is_empty()) {
+        return Ok(());
+    }
+
+    let counts: Vec<usize> = dim_indices.iter().map(|v| v.len()).collect();
+    let total = checked_product_usize(&counts, "selected-element copy count")?;
     let mut counters = vec![0usize; ndim];
 
     for _ in 0..total {
@@ -2557,22 +2898,34 @@ unsafe fn copy_selected_elements_ptr(
         let mut result_flat = 0;
         for d in 0..ndim {
             let (cl, ri) = dim_indices[d][counters[d]];
-            chunk_flat += cl * chunk_strides[d];
-            result_flat += ri * result_strides[d];
+            let chunk_term = checked_mul_usize(cl, chunk_strides[d], "selected chunk offset")?;
+            let result_term = checked_mul_usize(ri, result_strides[d], "selected result offset")?;
+            chunk_flat = checked_add_usize(chunk_flat, chunk_term, "selected chunk offset")?;
+            result_flat = checked_add_usize(result_flat, result_term, "selected result offset")?;
         }
 
-        let src_start = chunk_flat * elem_size;
-        let dst_start = result_flat * elem_size;
-        let src_end = src_start + elem_size;
-        let dst_end = dst_start + elem_size;
+        let src_start = checked_mul_usize(chunk_flat, elem_size, "selected source byte offset")?;
+        let dst_start =
+            checked_mul_usize(result_flat, elem_size, "selected destination byte offset")?;
+        let src_end = checked_add_usize(src_start, elem_size, "selected source byte end")?;
+        let dst_end = checked_add_usize(dst_start, elem_size, "selected destination byte end")?;
 
-        if src_end <= chunk_data.len() && dst_end <= result_len {
-            std::ptr::copy_nonoverlapping(
-                chunk_data.as_ptr().add(src_start),
-                result_ptr.add(dst_start),
-                elem_size,
-            );
+        if src_end > chunk_data.len() || dst_end > result_len {
+            return Err(Error::InvalidData(format!(
+                "selected-element copy out of bounds: source range {}..{} of {} bytes, destination range {}..{} of {} bytes",
+                src_start,
+                src_end,
+                chunk_data.len(),
+                dst_start,
+                dst_end,
+                result_len
+            )));
         }
+        std::ptr::copy_nonoverlapping(
+            chunk_data.as_ptr().add(src_start),
+            result_ptr.add(dst_start),
+            elem_size,
+        );
 
         let mut carry = true;
         for d in (0..ndim).rev() {
@@ -2586,6 +2939,8 @@ unsafe fn copy_selected_elements_ptr(
             }
         }
     }
+
+    Ok(())
 }
 
 /// Slice an ndarray according to a SliceInfo selection.
@@ -2710,7 +3065,8 @@ mod tests {
             &chunk_shape,
             &dataset_shape,
             1,
-        );
+        )
+        .unwrap();
         assert_eq!(flat, vec![0, 0, 1, 2, 3, 4, 0, 0]);
     }
 
@@ -2729,7 +3085,8 @@ mod tests {
             &chunk_shape,
             &dataset_shape,
             1,
-        );
+        )
+        .unwrap();
 
         assert_eq!(flat, vec![0, 0, 0, 0, 0, 1, 2, 3, 0, 4, 5, 6, 0, 0, 0, 0,]);
     }
@@ -2778,5 +3135,120 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, vec![6, 7, 8, 10, 11, 12]);
+    }
+
+    fn chunk_entry(offsets: &[u64], address: u64) -> chunk_index::ChunkEntry {
+        chunk_index::ChunkEntry {
+            address,
+            size: 0,
+            filter_mask: 0,
+            offsets: offsets.to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_chunk_grid_coverage_detects_missing_chunk() {
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x1000),
+            chunk_entry(&[0, 2], 0x2000),
+            chunk_entry(&[2, 0], 0x3000),
+        ];
+
+        let complete =
+            validate_chunk_grid_coverage(&mut entries, &[4, 4], &[2, 2], &[0, 0], &[1, 1]).unwrap();
+
+        assert!(!complete);
+    }
+
+    #[test]
+    fn test_chunk_grid_coverage_rejects_duplicate_offsets() {
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x1000),
+            chunk_entry(&[0, 0], 0x2000),
+            chunk_entry(&[0, 2], 0x3000),
+            chunk_entry(&[2, 0], 0x4000),
+        ];
+
+        let err = validate_chunk_grid_coverage(&mut entries, &[4, 4], &[2, 2], &[0, 0], &[1, 1])
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_decoded_chunk_len_requires_exact_size() {
+        let entry = chunk_entry(&[0, 0], 0x1000);
+
+        validate_decoded_chunk_len(&entry, &[2, 3], 4, 24).unwrap();
+        let err = validate_decoded_chunk_len(&entry, &[2, 3], 4, 23).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_copy_chunk_errors_on_short_row() {
+        let chunk_data = vec![1u8, 2, 3, 4, 5];
+        let mut flat = vec![0u8; 16];
+        let chunk_offsets = vec![1u64, 1u64];
+        let chunk_shape = vec![2u64, 3u64];
+        let dataset_shape = vec![4u64, 4u64];
+
+        let err = copy_chunk_to_flat(
+            &chunk_data,
+            &mut flat,
+            &chunk_offsets,
+            &chunk_shape,
+            &dataset_shape,
+            1,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_copy_unit_stride_chunk_overlap_errors_on_short_row() {
+        let chunk_data: Vec<u8> = (1..=7).collect();
+        let mut result = vec![0u8; 6];
+        let chunk_offsets = vec![0u64, 0u64];
+        let chunk_shape = vec![4u64, 4u64];
+        let dataset_shape = vec![4u64, 4u64];
+        let resolved = ResolvedSelection {
+            dims: vec![
+                ResolvedSelectionDim {
+                    start: 1,
+                    end: 3,
+                    step: 1,
+                    count: 2,
+                },
+                ResolvedSelectionDim {
+                    start: 1,
+                    end: 4,
+                    step: 1,
+                    count: 3,
+                },
+            ],
+            result_shape: vec![2, 3],
+            result_elements: 6,
+        };
+        let chunk_strides = vec![4usize, 1usize];
+        let result_strides = vec![3usize, 1usize];
+
+        let err = copy_unit_stride_chunk_overlap(
+            &chunk_data,
+            &mut result,
+            UnitStrideCopyLayout {
+                chunk_offsets: &chunk_offsets,
+                chunk_shape: &chunk_shape,
+                dataset_shape: &dataset_shape,
+                resolved: &resolved,
+                chunk_strides: &chunk_strides,
+                result_strides: &result_strides,
+                elem_size: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 }
