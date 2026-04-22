@@ -1,8 +1,10 @@
 //! Map HDF5 datasets to NetCDF-4 variables.
 //!
-//! Each HDF5 dataset that is NOT a dimension scale becomes an NcVariable.
-//! The variable's dimensions are determined from the `DIMENSION_LIST` attribute,
-//! which contains object references to the corresponding dimension-scale datasets.
+//! Each user-visible HDF5 dataset becomes an NcVariable. Dimension-only scale
+//! datasets are internal metadata, but coordinate variables are also dimension
+//! scales and must remain visible. Non-scale variable dimensions are determined
+//! from the `DIMENSION_LIST` attribute, which contains object references to the
+//! corresponding dimension-scale datasets.
 
 use std::collections::HashMap;
 
@@ -20,8 +22,8 @@ fn leaf_name(name: &str) -> &str {
 
 /// Extract variables from an HDF5 group.
 ///
-/// Datasets with `CLASS=DIMENSION_SCALE` are dimensions, not variables.
-/// All other datasets become NcVariables.
+/// Dimension-only scale datasets are internal metadata. Coordinate variables are
+/// also dimension scales, so they are preserved as NcVariables.
 ///
 /// `dim_addr_map` maps dimension-scale dataset addresses to their `NcDimension`,
 /// used to resolve `DIMENSION_LIST` object references.
@@ -78,7 +80,7 @@ pub fn extract_variable(
         Err(_) => false,
     };
 
-    if is_dim_scale {
+    if is_dim_scale && is_dimension_only_scale(ds, strict)? {
         return Ok(None);
     }
 
@@ -93,7 +95,11 @@ pub fn extract_variable(
         Err(_) => return Ok(None),
     };
 
-    let var_dims = resolve_variable_dimensions(ds, group, dimensions, dim_addr_map, metadata_mode)?;
+    let var_dims = if is_dim_scale {
+        resolve_coordinate_variable_dimensions(ds, dim_addr_map, metadata_mode)?
+    } else {
+        resolve_variable_dimensions(ds, group, dimensions, dim_addr_map, metadata_mode)?
+    };
     let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
     let shape = ds.shape();
     let (data_size, record_size) =
@@ -110,6 +116,45 @@ pub fn extract_variable(
         is_record_var: is_unlimited,
         record_size,
     }))
+}
+
+fn is_dimension_only_scale(ds: &hdf5_reader::Dataset, strict: bool) -> Result<bool> {
+    match ds.attribute("NAME") {
+        Ok(attr) => match attr.read_string() {
+            Ok(value) => Ok(super::dimensions::is_dimension_without_variable_name(
+                &value,
+            )),
+            Err(err) if strict => Err(Error::InvalidData(format!(
+                "dimension scale '{}' has unreadable NAME attribute: {err}",
+                ds.name()
+            ))),
+            Err(_) => Ok(false),
+        },
+        Err(_) => Ok(false),
+    }
+}
+
+fn resolve_coordinate_variable_dimensions(
+    ds: &hdf5_reader::Dataset,
+    dim_addr_map: &HashMap<u64, NcDimension>,
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<Vec<NcDimension>> {
+    if let Some(dim) = dim_addr_map.get(&ds.address()) {
+        Ok(vec![dim.clone()])
+    } else if metadata_mode == crate::NcMetadataMode::Lossy {
+        Ok(vec![NcDimension {
+            name: leaf_name(ds.name()).to_string(),
+            size: ds.shape().first().copied().unwrap_or(0),
+            is_unlimited: ds
+                .max_dims()
+                .is_some_and(|md| !md.is_empty() && md[0] == u64::MAX),
+        }])
+    } else {
+        Err(Error::InvalidData(format!(
+            "coordinate variable '{}' is not registered as a dimension scale",
+            ds.name()
+        )))
+    }
 }
 
 /// Resolve variable dimensions via the `DIMENSION_LIST` attribute.
