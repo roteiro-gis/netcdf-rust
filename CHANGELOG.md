@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Added coordinate-variable metadata helpers and CF discovery APIs for coordinate axes and time coordinates, including NetCDF-4 dimension-scale coordinate variables.
+- Added exact CF calendar decoding via `CfDateTime`, including noleap, all_leap, 360_day, Julian, and standard Gregorian reform calendar arithmetic.
 
 ## 0.3.0 - 2026-04-16
 
