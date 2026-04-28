@@ -146,6 +146,29 @@ impl BTreeV2Header {
 /// The record format depends on the B-tree type field in the header.
 #[derive(Debug, Clone)]
 pub enum BTreeV2Record {
+    /// Type 1: indirectly accessed, non-filtered huge fractal heap object.
+    HugeIndirectNonFiltered {
+        address: u64,
+        length: u64,
+        object_id: u64,
+    },
+    /// Type 2: indirectly accessed, filtered huge fractal heap object.
+    HugeIndirectFiltered {
+        address: u64,
+        filtered_length: u64,
+        filter_mask: u32,
+        memory_length: u64,
+        object_id: u64,
+    },
+    /// Type 3: directly accessed, non-filtered huge fractal heap object.
+    HugeDirectNonFiltered { address: u64, length: u64 },
+    /// Type 4: directly accessed, filtered huge fractal heap object.
+    HugeDirectFiltered {
+        address: u64,
+        filtered_length: u64,
+        filter_mask: u32,
+        memory_length: u64,
+    },
     /// Type 5: Link name for indexed group (hashed).
     LinkNameHash { hash: u32, heap_id: Vec<u8> },
     /// Type 6: Creation order for indexed group.
@@ -168,6 +191,19 @@ pub enum BTreeV2Record {
         filter_mask: u32,
         offsets: Vec<u64>,
     },
+    /// Type 7: shared object-header message stored in the SOHM heap.
+    SharedMessageHeap {
+        hash: u32,
+        reference_count: u32,
+        heap_id: Vec<u8>,
+    },
+    /// Type 7: shared object-header message stored in an object header.
+    SharedMessageObjectHeader {
+        hash: u32,
+        message_type: u16,
+        object_header_index: u16,
+        object_header_address: u64,
+    },
     /// Unknown/unsupported record type — raw bytes preserved.
     Unknown { record_type: u8, data: Vec<u8> },
 }
@@ -189,6 +225,36 @@ fn parse_record(
     let record_start = cursor.position();
 
     let record = match btree_type {
+        // Type 1: indirectly accessed, non-filtered huge fractal heap object.
+        1 => BTreeV2Record::HugeIndirectNonFiltered {
+            address: cursor.read_offset(offset_size)?,
+            length: cursor.read_length(length_size)?,
+            object_id: cursor.read_length(length_size)?,
+        },
+
+        // Type 2: indirectly accessed, filtered huge fractal heap object.
+        2 => BTreeV2Record::HugeIndirectFiltered {
+            address: cursor.read_offset(offset_size)?,
+            filtered_length: cursor.read_length(length_size)?,
+            filter_mask: cursor.read_u32_le()?,
+            memory_length: cursor.read_length(length_size)?,
+            object_id: cursor.read_length(length_size)?,
+        },
+
+        // Type 3: directly accessed, non-filtered huge fractal heap object.
+        3 => BTreeV2Record::HugeDirectNonFiltered {
+            address: cursor.read_offset(offset_size)?,
+            length: cursor.read_length(length_size)?,
+        },
+
+        // Type 4: directly accessed, filtered huge fractal heap object.
+        4 => BTreeV2Record::HugeDirectFiltered {
+            address: cursor.read_offset(offset_size)?,
+            filtered_length: cursor.read_length(length_size)?,
+            filter_mask: cursor.read_u32_le()?,
+            memory_length: cursor.read_length(length_size)?,
+        },
+
         // Type 5: link name hash
         5 => {
             let hash = cursor.read_u32_le()?;
@@ -201,6 +267,41 @@ fn parse_record(
             let order = cursor.read_u64_le()?;
             let heap_id = cursor.read_bytes(heap_id_len)?.to_vec();
             BTreeV2Record::CreationOrder { order, heap_id }
+        }
+
+        // Type 7: shared object-header messages.
+        7 => {
+            let location = cursor.read_u8()?;
+            cursor.skip(3)?;
+            let hash = cursor.read_u32_le()?;
+            match location {
+                0 => {
+                    let reference_count = cursor.read_u32_le()?;
+                    let heap_id = cursor.read_bytes(8)?.to_vec();
+                    BTreeV2Record::SharedMessageHeap {
+                        hash,
+                        reference_count,
+                        heap_id,
+                    }
+                }
+                1 => {
+                    let _reserved = cursor.read_u8()?;
+                    let message_type = u16::from(cursor.read_u8()?);
+                    let object_header_index = cursor.read_u16_le()?;
+                    let object_header_address = cursor.read_offset(offset_size)?;
+                    BTreeV2Record::SharedMessageObjectHeader {
+                        hash,
+                        message_type,
+                        object_header_index,
+                        object_header_address,
+                    }
+                }
+                other => {
+                    return Err(Error::InvalidData(format!(
+                        "unknown SOHM B-tree record location: {other}"
+                    )));
+                }
+            }
         }
 
         // Type 8: attribute name hash
@@ -1057,6 +1158,54 @@ mod tests {
         assert_eq!(num_records_size(256), 2);
         assert_eq!(num_records_size(65535), 2);
         assert_eq!(num_records_size(65536), 4);
+    }
+
+    #[test]
+    fn test_parse_huge_indirect_record() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        data.extend_from_slice(&99u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(&mut cursor, 1, data.len() as u16, 8, 8, None, 0).unwrap();
+        match record {
+            BTreeV2Record::HugeIndirectNonFiltered {
+                address,
+                length,
+                object_id,
+            } => {
+                assert_eq!(address, 0x1234);
+                assert_eq!(length, 99);
+                assert_eq!(object_id, 7);
+            }
+            other => panic!("expected huge record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_shared_heap_record() {
+        let mut data = Vec::new();
+        data.push(0);
+        data.extend_from_slice(&[0, 0, 0]);
+        data.extend_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(&mut cursor, 7, data.len() as u16, 8, 8, None, 0).unwrap();
+        match record {
+            BTreeV2Record::SharedMessageHeap {
+                hash,
+                reference_count,
+                heap_id,
+            } => {
+                assert_eq!(hash, 0xAABB_CCDD);
+                assert_eq!(reference_count, 3);
+                assert_eq!(heap_id, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+            }
+            other => panic!("expected shared heap record, got {:?}", other),
+        }
     }
 
     #[test]

@@ -19,14 +19,17 @@ use crate::datatype_api::{dtype_element_size, H5Type};
 use crate::error::{Error, Result};
 use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
+use crate::local_heap::LocalHeap;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
 use crate::messages::datatype::{Datatype, StringSize};
+use crate::messages::external_files::ExternalFilesMessage;
 use crate::messages::fill_value::{FillTime, FillValueMessage};
 use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::messages::layout::{ChunkIndexing, DataLayout};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
+use crate::storage::DynStorage;
 use crate::FileContext;
 
 const HOT_FULL_DATASET_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -64,6 +67,14 @@ struct ContiguousSliceDirectLayout<'a> {
     result_strides: &'a [usize],
     elem_size: usize,
     result_total_bytes: usize,
+}
+
+#[derive(Clone)]
+struct ResolvedExternalRawSlot {
+    logical_offset: u64,
+    storage: DynStorage,
+    file_offset: u64,
+    size: u64,
 }
 
 pub(crate) struct DatasetParseContext {
@@ -587,7 +598,7 @@ fn result_strides_for_dims(result_dims: &[usize]) -> Result<Vec<usize>> {
 
 /// A dataset within an HDF5 file.
 pub struct Dataset {
-    context: Arc<FileContext>,
+    pub(crate) context: Arc<FileContext>,
     pub(crate) name: String,
     pub(crate) data_address: u64,
     pub(crate) dataspace: DataspaceMessage,
@@ -595,11 +606,13 @@ pub struct Dataset {
     pub(crate) layout: DataLayout,
     pub(crate) fill_value: Option<FillValueMessage>,
     pub(crate) filters: Option<FilterPipelineMessage>,
+    pub(crate) external_files: Option<ExternalFilesMessage>,
     pub(crate) attributes: Vec<AttributeMessage>,
     pub(crate) chunk_cache: Arc<ChunkCache>,
     chunk_entry_cache: Arc<Mutex<LruCache<ChunkEntryCacheKey, Arc<Vec<chunk_index::ChunkEntry>>>>>,
     full_chunk_entries: Arc<OnceLock<Arc<Vec<chunk_index::ChunkEntry>>>>,
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
+    external_slots: Arc<OnceLock<Arc<Vec<ResolvedExternalRawSlot>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
 }
 
@@ -611,10 +624,12 @@ pub(crate) struct DatasetTemplate {
     layout: DataLayout,
     fill_value: Option<FillValueMessage>,
     filters: Option<FilterPipelineMessage>,
+    external_files: Option<ExternalFilesMessage>,
     attributes: Vec<AttributeMessage>,
     chunk_entry_cache: Arc<Mutex<LruCache<ChunkEntryCacheKey, Arc<Vec<chunk_index::ChunkEntry>>>>>,
     full_chunk_entries: Arc<OnceLock<Arc<Vec<chunk_index::ChunkEntry>>>>,
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
+    external_slots: Arc<OnceLock<Arc<Vec<ResolvedExternalRawSlot>>>>,
 }
 
 impl Dataset {
@@ -630,10 +645,12 @@ impl Dataset {
             layout: template.layout.clone(),
             fill_value: template.fill_value.clone(),
             filters: template.filters.clone(),
+            external_files: template.external_files.clone(),
             attributes: template.attributes.clone(),
             chunk_entry_cache: template.chunk_entry_cache.clone(),
             full_chunk_entries: template.full_chunk_entries.clone(),
             full_dataset_bytes: template.full_dataset_bytes.clone(),
+            external_slots: template.external_slots.clone(),
         }
     }
 
@@ -646,10 +663,12 @@ impl Dataset {
             layout: self.layout.clone(),
             fill_value: self.fill_value.clone(),
             filters: self.filters.clone(),
+            external_files: self.external_files.clone(),
             attributes: self.attributes.clone(),
             chunk_entry_cache: self.chunk_entry_cache.clone(),
             full_chunk_entries: self.full_chunk_entries.clone(),
             full_dataset_bytes: self.full_dataset_bytes.clone(),
+            external_slots: self.external_slots.clone(),
         })
     }
 
@@ -664,6 +683,7 @@ impl Dataset {
         let mut layout: Option<DataLayout> = None;
         let mut fill_value: Option<FillValueMessage> = None;
         let mut filter_pipeline: Option<FilterPipelineMessage> = None;
+        let mut external_files: Option<ExternalFilesMessage> = None;
         let attributes = collect_attribute_messages_storage(
             header,
             context.context.storage.as_ref(),
@@ -678,6 +698,7 @@ impl Dataset {
                 HdfMessage::DataLayout(dl) => layout = Some(dl.layout.clone()),
                 HdfMessage::FillValue(fv) => fill_value = Some(fv.clone()),
                 HdfMessage::FilterPipeline(fp) => filter_pipeline = Some(fp.clone()),
+                HdfMessage::ExternalFiles(ef) => external_files = Some(ef.clone()),
                 _ => {}
             }
         }
@@ -710,11 +731,13 @@ impl Dataset {
             layout,
             fill_value,
             filters: filter_pipeline,
+            external_files,
             attributes,
             chunk_cache: context.context.chunk_cache.clone(),
             chunk_entry_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap()))),
             full_chunk_entries: Arc::new(OnceLock::new()),
             full_dataset_bytes: Arc::new(OnceLock::new()),
+            external_slots: Arc::new(OnceLock::new()),
             filter_registry: context.context.filter_registry.clone(),
         })
     }
@@ -1063,6 +1086,15 @@ impl Dataset {
     }
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
+        if self.external_files.is_some() {
+            let elem_size = dtype_element_size(&self.datatype);
+            let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+            let total_bytes =
+                checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
+            let raw = self.read_external_range(0, total_bytes)?;
+            return self.decode_raw_data::<T>(&raw);
+        }
+
         if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
             // Dataset with no data written — return fill values
             return self.make_fill_array::<T>();
@@ -1079,6 +1111,10 @@ impl Dataset {
         size: u64,
         total_bytes: usize,
     ) -> Result<Vec<u8>> {
+        if self.external_files.is_some() {
+            return self.read_external_range(0, total_bytes);
+        }
+
         if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
             return Ok(self.make_output_buffer(total_bytes));
         }
@@ -1086,6 +1122,127 @@ impl Dataset {
         let sz = checked_usize(size, "contiguous dataset size")?;
         let raw = self.context.read_range(address, sz)?;
         Ok(self.normalize_raw_bytes(raw.as_ref(), total_bytes))
+    }
+
+    fn read_contiguous_logical_range(
+        &self,
+        address: u64,
+        logical_offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>> {
+        if self.external_files.is_some() {
+            return self.read_external_range(logical_offset, len);
+        }
+
+        let file_offset = checked_add_u64(
+            address,
+            u64::try_from(logical_offset).map_err(|_| {
+                Error::InvalidData("contiguous logical offset exceeds u64 capacity".to_string())
+            })?,
+            "contiguous read file offset",
+        )?;
+        Ok(self.context.read_range(file_offset, len)?.to_vec())
+    }
+
+    fn read_external_range(&self, logical_offset: usize, len: usize) -> Result<Vec<u8>> {
+        let mut output = self.make_output_buffer(len);
+        if len == 0 {
+            return Ok(output);
+        }
+
+        let request_start = u64::try_from(logical_offset).map_err(|_| {
+            Error::InvalidData("external dataset offset exceeds u64 capacity".to_string())
+        })?;
+        let request_len = u64::try_from(len).map_err(|_| {
+            Error::InvalidData("external dataset length exceeds u64 capacity".to_string())
+        })?;
+        let request_end = request_start
+            .checked_add(request_len)
+            .ok_or_else(|| Error::InvalidData("external dataset range overflows".into()))?;
+
+        for slot in self.external_raw_slots()?.iter() {
+            let slot_end = slot.logical_offset.saturating_add(slot.size);
+            let overlap_start = request_start.max(slot.logical_offset);
+            let overlap_end = request_end.min(slot_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let read_offset = slot
+                .file_offset
+                .checked_add(overlap_start - slot.logical_offset)
+                .ok_or_else(|| Error::InvalidData("external file read offset overflows".into()))?;
+            let read_len = checked_usize(overlap_end - overlap_start, "external read length")?;
+            let dst_start = checked_usize(overlap_start - request_start, "external read dst")?;
+            let dst_end = checked_add_usize(dst_start, read_len, "external read dst end")?;
+            let bytes = slot.storage.read_range(read_offset, read_len)?;
+            output[dst_start..dst_end].copy_from_slice(bytes.as_ref());
+        }
+
+        Ok(output)
+    }
+
+    fn external_raw_slots(&self) -> Result<Arc<Vec<ResolvedExternalRawSlot>>> {
+        if let Some(slots) = self.external_slots.get() {
+            return Ok(slots.clone());
+        }
+
+        let slots = Arc::new(self.load_external_raw_slots()?);
+        let _ = self.external_slots.set(slots.clone());
+        Ok(self
+            .external_slots
+            .get()
+            .expect("external slot cache must exist after initialization")
+            .clone())
+    }
+
+    fn load_external_raw_slots(&self) -> Result<Vec<ResolvedExternalRawSlot>> {
+        let Some(external_files) = self.external_files.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let heap = LocalHeap::parse_at_storage(
+            self.context.storage.as_ref(),
+            external_files.heap_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let mut logical_offset = 0u64;
+        let mut slots = Vec::with_capacity(external_files.slots.len());
+        for slot in &external_files.slots {
+            let filename =
+                heap.get_string_storage(slot.name_offset, self.context.storage.as_ref())?;
+            let storage = self
+                .context
+                .resolve_external_file(&filename)?
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "external raw data file '{filename}' could not be resolved"
+                    ))
+                })?;
+            let size = if Cursor::is_undefined_offset(slot.size, self.length_size()) {
+                u64::MAX.saturating_sub(logical_offset)
+            } else {
+                slot.size
+            };
+
+            slots.push(ResolvedExternalRawSlot {
+                logical_offset,
+                storage,
+                file_offset: slot.offset,
+                size,
+            });
+
+            if Cursor::is_undefined_offset(slot.size, self.length_size()) {
+                break;
+            }
+            logical_offset = logical_offset.checked_add(slot.size).ok_or_else(|| {
+                Error::InvalidData("external raw data logical offset overflows".into())
+            })?;
+        }
+
+        Ok(slots)
     }
 
     fn read_chunked<T: H5Type>(
@@ -2200,7 +2357,9 @@ impl Dataset {
             return self.make_fill_array_from_shape::<T>(0, &resolved.result_shape);
         }
 
-        if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
+        if self.external_files.is_none()
+            && (Cursor::is_undefined_offset(address, self.offset_size()) || size == 0)
+        {
             return self
                 .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
@@ -2256,7 +2415,15 @@ impl Dataset {
             )));
         }
 
-        let storage_len = checked_usize(size, "contiguous dataset size")?;
+        let storage_len = if self.external_files.is_some() {
+            checked_mul_usize(
+                checked_usize(self.num_elements(), "dataset element count")?,
+                layout.elem_size,
+                "external dataset size",
+            )?
+        } else {
+            checked_usize(size, "contiguous dataset size")?
+        };
         let tail_start = contiguous_slice_tail_start(shape, resolved);
         let block_elements = contiguous_slice_block_elements(resolved, tail_start)?;
         let block_bytes = checked_mul_usize(
@@ -2355,16 +2522,7 @@ impl Dataset {
                 )));
             }
 
-            let file_offset = checked_add_u64(
-                address,
-                u64::try_from(source_start).map_err(|_| {
-                    Error::InvalidData(
-                        "contiguous slice source offset exceeds u64 capacity".to_string(),
-                    )
-                })?,
-                "contiguous slice file offset",
-            )?;
-            let block = self.context.read_range(file_offset, block_bytes)?;
+            let block = self.read_contiguous_logical_range(address, source_start, block_bytes)?;
             if block.len() != block_bytes {
                 return Err(Error::InvalidData(format!(
                     "contiguous slice read returned {} bytes, expected {}",
@@ -2372,7 +2530,7 @@ impl Dataset {
                     block_bytes
                 )));
             }
-            result_buf[dst_start..dst_end].copy_from_slice(block.as_ref());
+            result_buf[dst_start..dst_end].copy_from_slice(&block);
 
             let mut carry = true;
             for d in (0..tail_start).rev() {

@@ -137,6 +137,8 @@ impl Nc4File {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
         Nc4File::from_hdf5(hdf5, options.metadata_mode)
@@ -155,6 +157,8 @@ impl Nc4File {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
         Nc4File::from_hdf5(hdf5, options.metadata_mode)
@@ -176,6 +180,8 @@ impl Nc4File {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
         Nc4File::from_hdf5(hdf5, options.metadata_mode)

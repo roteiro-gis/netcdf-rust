@@ -206,6 +206,7 @@ fn test_nc4_from_bytes_with_options() {
             chunk_cache_slots: 17,
             metadata_mode: netcdf_reader::NcMetadataMode::Strict,
             filter_registry: None,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -230,6 +231,7 @@ fn test_nc4_from_storage_with_options() {
             chunk_cache_slots: 17,
             metadata_mode: netcdf_reader::NcMetadataMode::Strict,
             filter_registry: None,
+            ..Default::default()
         },
     )
     .unwrap();

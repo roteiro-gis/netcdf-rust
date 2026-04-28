@@ -387,11 +387,10 @@ fn load_dense_attribute_messages(
             _ => continue,
         };
 
-        let managed_bytes =
-            match heap.get_managed_object(&heap_id, file_data, offset_size, length_size) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
+        let managed_bytes = match heap.get_object(&heap_id, file_data, offset_size, length_size) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
 
         let mut attr_cursor = Cursor::new(&managed_bytes);
         if let Ok(attr) = messages::attribute::parse(
@@ -436,7 +435,7 @@ fn load_dense_attribute_messages_storage(
         };
 
         let managed_bytes =
-            match heap.get_managed_object_storage(&heap_id, storage, offset_size, length_size) {
+            match heap.get_object_storage(&heap_id, storage, offset_size, length_size) {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };

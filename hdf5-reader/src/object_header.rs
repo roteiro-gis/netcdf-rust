@@ -91,8 +91,9 @@ impl ObjectHeader {
 
     /// Resolve shared messages by following references to other object headers.
     ///
-    /// For `SharedInOhdr`, the referenced object header is parsed and the first
-    /// matching message type is extracted. `SharedInSohm` returns an error (rare).
+    /// For `SharedInOhdr`, the referenced object header is parsed and the
+    /// matching message type is extracted. `SharedInSohm` requires the
+    /// storage-backed resolver because the SOHM table lives in file metadata.
     pub fn resolve_shared_messages(
         &mut self,
         data: &[u8],
@@ -103,28 +104,24 @@ impl ObjectHeader {
         let mut resolved = Vec::with_capacity(old_messages.len());
         for msg in old_messages {
             match msg {
-                HdfMessage::Shared(SharedMessage::SharedInOhdr { address }) => {
+                HdfMessage::Shared(SharedMessage::SharedInOhdr {
+                    message_type,
+                    address,
+                }) => {
                     match Self::parse_at(data, address, offset_size, length_size) {
                         Ok(target_header) => {
-                            // Extract the actual message(s) from the target header.
-                            // Typically there is exactly one "real" message (the
-                            // committed datatype, fill value, etc.).
-                            for target_msg in target_header.messages {
-                                match target_msg {
-                                    HdfMessage::Nil
-                                    | HdfMessage::ObjectHeaderContinuation
-                                    | HdfMessage::Shared(_) => continue,
-                                    other => {
-                                        resolved.push(other);
-                                        break;
-                                    }
-                                }
+                            if let Some(target_msg) =
+                                select_shared_message(target_header, message_type)
+                            {
+                                resolved.push(target_msg);
                             }
                         }
                         Err(_) => {
                             // If we can't parse the target, keep the shared ref
-                            resolved
-                                .push(HdfMessage::Shared(SharedMessage::SharedInOhdr { address }));
+                            resolved.push(HdfMessage::Shared(SharedMessage::SharedInOhdr {
+                                message_type,
+                                address,
+                            }));
                         }
                     }
                 }
@@ -148,36 +145,58 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<()> {
+        self.resolve_shared_messages_storage_with_sohm(
+            storage,
+            offset_size,
+            length_size,
+            |_heap_id, _message_type| Ok(None),
+        )
+    }
+
+    /// Resolve shared messages using random-access storage and a SOHM resolver.
+    pub(crate) fn resolve_shared_messages_storage_with_sohm<F>(
+        &mut self,
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+        mut resolve_sohm: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8], u16) -> Result<Option<HdfMessage>>,
+    {
         let old_messages = std::mem::take(&mut self.messages);
         let mut resolved = Vec::with_capacity(old_messages.len());
         for msg in old_messages {
             match msg {
-                HdfMessage::Shared(SharedMessage::SharedInOhdr { address }) => {
-                    match Self::parse_at_storage(storage, address, offset_size, length_size) {
-                        Ok(target_header) => {
-                            for target_msg in target_header.messages {
-                                match target_msg {
-                                    HdfMessage::Nil
-                                    | HdfMessage::ObjectHeaderContinuation
-                                    | HdfMessage::Shared(_) => continue,
-                                    other => {
-                                        resolved.push(other);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            resolved
-                                .push(HdfMessage::Shared(SharedMessage::SharedInOhdr { address }));
+                HdfMessage::Shared(SharedMessage::SharedInOhdr {
+                    message_type,
+                    address,
+                }) => match Self::parse_at_storage(storage, address, offset_size, length_size) {
+                    Ok(target_header) => {
+                        if let Some(target_msg) = select_shared_message(target_header, message_type)
+                        {
+                            resolved.push(target_msg);
                         }
                     }
-                }
-                HdfMessage::Shared(SharedMessage::SharedInSohm { .. }) => {
-                    self.messages = resolved;
-                    return Err(Error::Other(
-                        "SOHM table lookup not yet supported — file uses shared object header messages".to_string(),
-                    ));
+                    Err(_) => {
+                        resolved.push(HdfMessage::Shared(SharedMessage::SharedInOhdr {
+                            message_type,
+                            address,
+                        }));
+                    }
+                },
+                HdfMessage::Shared(SharedMessage::SharedInSohm {
+                    message_type,
+                    heap_id,
+                }) => {
+                    if let Some(message) = resolve_sohm(&heap_id, message_type)? {
+                        resolved.push(message);
+                    } else {
+                        self.messages = resolved;
+                        return Err(Error::Other(format!(
+                            "SOHM entry for message type {message_type:#x} not found"
+                        )));
+                    }
                 }
                 other => resolved.push(other),
             }
@@ -347,6 +366,7 @@ impl ObjectHeader {
                 // reference, not the message payload itself.
                 let shared_msg = crate::messages::shared::parse(
                     &mut Cursor::new(msg_data),
+                    msg_type,
                     offset_size,
                     length_size,
                     msg_data_size,
@@ -630,6 +650,7 @@ impl ObjectHeader {
             if is_shared {
                 let shared_msg = crate::messages::shared::parse(
                     &mut Cursor::new(msg_data),
+                    msg_type,
                     offset_size,
                     length_size,
                     msg_data_size,
@@ -691,6 +712,7 @@ impl ObjectHeader {
             if is_shared {
                 let shared_msg = crate::messages::shared::parse(
                     &mut Cursor::new(msg_data),
+                    msg_type,
                     offset_size,
                     length_size,
                     msg_data_size,
@@ -764,6 +786,7 @@ impl ObjectHeader {
             if is_shared {
                 let shared_msg = crate::messages::shared::parse(
                     &mut Cursor::new(msg_data),
+                    msg_type,
                     offset_size,
                     length_size,
                     msg_data_size,
@@ -888,6 +911,52 @@ impl ObjectHeader {
             messages,
             continuations,
         )
+    }
+}
+
+fn select_shared_message(header: ObjectHeader, message_type: u16) -> Option<HdfMessage> {
+    let mut first_real_message = None;
+    for message in header.messages {
+        match message {
+            HdfMessage::Nil | HdfMessage::ObjectHeaderContinuation | HdfMessage::Shared(_) => {
+                continue;
+            }
+            other if message_matches_type(&other, message_type) => return Some(other),
+            other => {
+                if first_real_message.is_none() {
+                    first_real_message = Some(other);
+                }
+            }
+        }
+    }
+    first_real_message
+}
+
+fn message_matches_type(message: &HdfMessage, message_type: u16) -> bool {
+    use crate::messages::*;
+
+    match (message_type, message) {
+        (MSG_DATASPACE, HdfMessage::Dataspace(_))
+        | (MSG_DATATYPE, HdfMessage::Datatype(_))
+        | (MSG_FILL_VALUE, HdfMessage::FillValue(_))
+        | (MSG_FILL_VALUE_OLD, HdfMessage::FillValue(_))
+        | (MSG_DATA_LAYOUT, HdfMessage::DataLayout(_))
+        | (MSG_FILTER_PIPELINE, HdfMessage::FilterPipeline(_))
+        | (MSG_ATTRIBUTE, HdfMessage::Attribute(_))
+        | (MSG_ATTRIBUTE_INFO, HdfMessage::AttributeInfo(_))
+        | (MSG_LINK, HdfMessage::Link(_))
+        | (MSG_LINK_INFO, HdfMessage::LinkInfo(_))
+        | (MSG_GROUP_INFO, HdfMessage::GroupInfo(_))
+        | (MSG_SYMBOL_TABLE, HdfMessage::SymbolTable(_))
+        | (MSG_CONTINUATION, HdfMessage::Continuation(_))
+        | (MSG_MODIFICATION_TIME, HdfMessage::ModificationTime(_))
+        | (MSG_MODIFICATION_TIME_OLD, HdfMessage::ModificationTime(_))
+        | (MSG_BTREE_K, HdfMessage::BTreeK(_))
+        | (MSG_EXTERNAL_FILES, HdfMessage::ExternalFiles(_))
+        | (MSG_SHARED_TABLE, HdfMessage::SharedTable(_))
+        | (MSG_COMMENT, HdfMessage::Comment(_))
+        | (MSG_REFERENCE_COUNT, HdfMessage::ReferenceCount(_)) => true,
+        _ => false,
     }
 }
 
