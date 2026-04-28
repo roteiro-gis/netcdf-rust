@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+## 0.4.0 - 2026-04-28
+
 - Added coordinate-variable metadata helpers and CF discovery APIs for coordinate axes and time coordinates, including NetCDF-4 dimension-scale coordinate variables.
 - Added exact CF calendar decoding via `CfDateTime`, including noleap, all_leap, 360_day, Julian, and standard Gregorian reform calendar arithmetic.
+- Expanded HDF5 compatibility with SOHM shared-message lookup, fractal heap tiny and unfiltered huge objects, external raw data file reads, and optional external-link resolution.
+- Added HDF5 external file/link resolver APIs, including filesystem resolvers and path-backed external raw data resolution by default for direct HDF5 opens.
+- Improved HDF5 contiguous and chunked read validation, full-chunk caching behavior, corruption-test coverage, and fuzz/CI release checks.
 
 ## 0.3.0 - 2026-04-16
 
