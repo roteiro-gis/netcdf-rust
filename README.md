@@ -107,6 +107,8 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Unified string reads for classic char arrays and NetCDF-4 string variables
 - Type promotion to `f64`, unpacking, masking, and combined CF helpers
 - Coordinate-variable lookup plus CF axis/time discovery when `cf` is enabled
+- Exact CF time decoding for standard, proleptic Gregorian, noleap, all_leap,
+  360_day, and Julian calendars when `cf` is enabled
 - Slice reads, lazy slice iteration, and parallel NC4 slice reads
 - Cache and filter configuration through `NcOpenOptions`, including in-memory and storage-backed opens
 
@@ -171,7 +173,6 @@ publish order for `hdf5-reader` and `netcdf-reader`.
 - ScaleOffset floating-point E-scale mode is not supported by the HDF5 decoder path
 - SOHM (shared object header message table) resolution returns a descriptive error
 - Fractal heap huge/tiny objects are not yet supported (managed objects work)
-- CF time decoding uses Gregorian approximation for non-standard calendars (noleap, 360_day)
 
 ## License
 
