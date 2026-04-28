@@ -935,29 +935,29 @@ fn select_shared_message(header: ObjectHeader, message_type: u16) -> Option<HdfM
 fn message_matches_type(message: &HdfMessage, message_type: u16) -> bool {
     use crate::messages::*;
 
-    match (message_type, message) {
+    matches!(
+        (message_type, message),
         (MSG_DATASPACE, HdfMessage::Dataspace(_))
-        | (MSG_DATATYPE, HdfMessage::Datatype(_))
-        | (MSG_FILL_VALUE, HdfMessage::FillValue(_))
-        | (MSG_FILL_VALUE_OLD, HdfMessage::FillValue(_))
-        | (MSG_DATA_LAYOUT, HdfMessage::DataLayout(_))
-        | (MSG_FILTER_PIPELINE, HdfMessage::FilterPipeline(_))
-        | (MSG_ATTRIBUTE, HdfMessage::Attribute(_))
-        | (MSG_ATTRIBUTE_INFO, HdfMessage::AttributeInfo(_))
-        | (MSG_LINK, HdfMessage::Link(_))
-        | (MSG_LINK_INFO, HdfMessage::LinkInfo(_))
-        | (MSG_GROUP_INFO, HdfMessage::GroupInfo(_))
-        | (MSG_SYMBOL_TABLE, HdfMessage::SymbolTable(_))
-        | (MSG_CONTINUATION, HdfMessage::Continuation(_))
-        | (MSG_MODIFICATION_TIME, HdfMessage::ModificationTime(_))
-        | (MSG_MODIFICATION_TIME_OLD, HdfMessage::ModificationTime(_))
-        | (MSG_BTREE_K, HdfMessage::BTreeK(_))
-        | (MSG_EXTERNAL_FILES, HdfMessage::ExternalFiles(_))
-        | (MSG_SHARED_TABLE, HdfMessage::SharedTable(_))
-        | (MSG_COMMENT, HdfMessage::Comment(_))
-        | (MSG_REFERENCE_COUNT, HdfMessage::ReferenceCount(_)) => true,
-        _ => false,
-    }
+            | (MSG_DATATYPE, HdfMessage::Datatype(_))
+            | (MSG_FILL_VALUE, HdfMessage::FillValue(_))
+            | (MSG_FILL_VALUE_OLD, HdfMessage::FillValue(_))
+            | (MSG_DATA_LAYOUT, HdfMessage::DataLayout(_))
+            | (MSG_FILTER_PIPELINE, HdfMessage::FilterPipeline(_))
+            | (MSG_ATTRIBUTE, HdfMessage::Attribute(_))
+            | (MSG_ATTRIBUTE_INFO, HdfMessage::AttributeInfo(_))
+            | (MSG_LINK, HdfMessage::Link(_))
+            | (MSG_LINK_INFO, HdfMessage::LinkInfo(_))
+            | (MSG_GROUP_INFO, HdfMessage::GroupInfo(_))
+            | (MSG_SYMBOL_TABLE, HdfMessage::SymbolTable(_))
+            | (MSG_CONTINUATION, HdfMessage::Continuation(_))
+            | (MSG_MODIFICATION_TIME, HdfMessage::ModificationTime(_))
+            | (MSG_MODIFICATION_TIME_OLD, HdfMessage::ModificationTime(_))
+            | (MSG_BTREE_K, HdfMessage::BTreeK(_))
+            | (MSG_EXTERNAL_FILES, HdfMessage::ExternalFiles(_))
+            | (MSG_SHARED_TABLE, HdfMessage::SharedTable(_))
+            | (MSG_COMMENT, HdfMessage::Comment(_))
+            | (MSG_REFERENCE_COUNT, HdfMessage::ReferenceCount(_))
+    )
 }
 
 #[cfg(test)]

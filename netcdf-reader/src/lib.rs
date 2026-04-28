@@ -651,12 +651,6 @@ pub struct NcOpenOptions {
     /// Custom filter registry (NC4 only).
     #[cfg(feature = "netcdf4")]
     pub filter_registry: Option<hdf5_reader::FilterRegistry>,
-    /// Resolver for NC4/HDF5 external raw data files.
-    #[cfg(feature = "netcdf4")]
-    pub external_file_resolver: Option<std::sync::Arc<dyn hdf5_reader::ExternalFileResolver>>,
-    /// Optional resolver for NC4/HDF5 external links.
-    #[cfg(feature = "netcdf4")]
-    pub external_link_resolver: Option<std::sync::Arc<dyn hdf5_reader::ExternalLinkResolver>>,
 }
 
 impl Default for NcOpenOptions {
@@ -667,10 +661,6 @@ impl Default for NcOpenOptions {
             metadata_mode: NcMetadataMode::Strict,
             #[cfg(feature = "netcdf4")]
             filter_registry: None,
-            #[cfg(feature = "netcdf4")]
-            external_file_resolver: None,
-            #[cfg(feature = "netcdf4")]
-            external_link_resolver: None,
         }
     }
 }
@@ -703,8 +693,7 @@ impl NcFile {
                             chunk_cache_bytes: options.chunk_cache_bytes,
                             chunk_cache_slots: options.chunk_cache_slots,
                             filter_registry: options.filter_registry,
-                            external_file_resolver: options.external_file_resolver,
-                            external_link_resolver: options.external_link_resolver,
+                            ..Default::default()
                         },
                     )?;
                     let nc4 = nc4::Nc4File::from_hdf5(hdf5, options.metadata_mode)?;
