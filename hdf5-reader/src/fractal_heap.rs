@@ -5,9 +5,8 @@
 //! scheme with direct and indirect blocks. Objects are addressed by a
 //! heap ID that encodes the offset and length within the heap.
 //!
-//! This module parses the heap header and provides managed-object extraction
-//! from direct blocks. Huge and tiny object types are recognized but not
-//! fully implemented yet.
+//! This module parses the heap header and provides object extraction for
+//! managed, tiny, and unfiltered huge object IDs.
 
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
@@ -30,6 +29,8 @@ pub struct FractalHeap {
     pub heap_id_len: u16,
     /// Size in bytes of I/O filter info (0 if none).
     pub io_filters_len: u16,
+    /// Heap status flags.
+    pub flags: u8,
     /// Maximum size of a managed object (larger objects become "huge").
     pub max_managed_object_size: u64,
     /// Next huge object ID to assign.
@@ -72,6 +73,8 @@ pub struct FractalHeap {
     pub io_filter_size: Option<u64>,
     /// Filter mask for root direct block (present only when io_filters_len > 0).
     pub io_filter_mask: Option<u32>,
+    /// Encoded filter pipeline for heap blocks/huge objects.
+    pub io_filter_info: Vec<u8>,
 }
 
 impl FractalHeap {
@@ -119,7 +122,7 @@ impl FractalHeap {
 
         let heap_id_len = cursor.read_u16_le()?;
         let io_filters_len = cursor.read_u16_le()?;
-        let _flags = cursor.read_u8()?;
+        let flags = cursor.read_u8()?;
 
         let max_managed_object_size = cursor.read_u32_le()? as u64;
         let next_huge_id = cursor.read_length(length_size)?;
@@ -149,6 +152,11 @@ impl FractalHeap {
         } else {
             (None, None)
         };
+        let io_filter_info = if io_filters_len > 0 {
+            cursor.read_bytes(usize::from(io_filters_len))?.to_vec()
+        } else {
+            Vec::new()
+        };
 
         // Verify checksum.
         let checksum_end = cursor.position();
@@ -164,6 +172,7 @@ impl FractalHeap {
         Ok(FractalHeap {
             heap_id_len,
             io_filters_len,
+            flags,
             max_managed_object_size,
             next_huge_id,
             btree_huge_objects_address,
@@ -185,6 +194,7 @@ impl FractalHeap {
             current_rows_in_root_indirect,
             io_filter_size,
             io_filter_mask,
+            io_filter_info,
         })
     }
 
@@ -205,75 +215,85 @@ impl FractalHeap {
         Self::parse(&mut cursor, offset_size, length_size)
     }
 
-    /// Extract a managed object given a heap ID.
-    ///
-    /// The heap ID for managed objects (type nibble = 0) encodes:
-    /// - Bits for the version/type (first nibble: 0 = managed)
-    /// - Offset within the heap (variable number of bits based on `max_heap_size`)
-    /// - Length of the object
-    ///
-    /// This implementation handles the common case where the root block is a
-    /// single direct block (i.e., `current_rows_in_root_indirect == 0`).
-    /// Indirect block traversal is provided for single-level indirect blocks.
+    /// Extract any fractal heap object given a heap ID.
+    pub fn get_object(
+        &self,
+        heap_id: &[u8],
+        file_data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>> {
+        match self.heap_id_kind(heap_id)? {
+            HeapIdKind::Managed => self.get_managed_object_impl(heap_id, file_data, offset_size),
+            HeapIdKind::Huge => self.get_huge_object(heap_id, file_data, offset_size, length_size),
+            HeapIdKind::Tiny => self.decode_tiny_object(heap_id),
+        }
+    }
+
+    /// Extract any fractal heap object from random-access storage.
+    pub fn get_object_storage(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>> {
+        match self.heap_id_kind(heap_id)? {
+            HeapIdKind::Managed => {
+                self.get_managed_object_storage_impl(heap_id, storage, offset_size)
+            }
+            HeapIdKind::Huge => {
+                self.get_huge_object_storage(heap_id, storage, offset_size, length_size)
+            }
+            HeapIdKind::Tiny => self.decode_tiny_object(heap_id),
+        }
+    }
+
+    /// Extract a fractal heap object. Kept for existing callers; now also
+    /// handles tiny and huge IDs.
     pub fn get_managed_object(
         &self,
         heap_id: &[u8],
         file_data: &[u8],
         offset_size: u8,
-        _length_size: u8,
+        length_size: u8,
     ) -> Result<Vec<u8>> {
-        if heap_id.is_empty() {
-            return Err(Error::InvalidData("empty fractal heap ID".into()));
+        self.get_object(heap_id, file_data, offset_size, length_size)
+    }
+
+    /// Extract a fractal heap object from random-access storage. Kept for
+    /// existing callers; now also handles tiny and huge IDs.
+    pub fn get_managed_object_storage(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>> {
+        self.get_object_storage(heap_id, storage, offset_size, length_size)
+    }
+
+    fn get_managed_object_impl(
+        &self,
+        heap_id: &[u8],
+        file_data: &[u8],
+        offset_size: u8,
+    ) -> Result<Vec<u8>> {
+        if self.io_filters_len > 0 {
+            return Err(Error::Other(
+                "filtered fractal heap managed objects are not supported".to_string(),
+            ));
         }
 
-        // First nibble is the type: 0 = managed, 1 = tiny, 2 = huge.
-        let id_type = (heap_id[0] >> 4) & 0x03;
-        match id_type {
-            0 => {} // managed — handled below
-            1 => {
-                return Err(Error::Other(
-                    "fractal heap tiny objects not yet supported".to_string(),
-                ));
-            }
-            2 => {
-                return Err(Error::Other(
-                    "fractal heap huge objects not yet supported".to_string(),
-                ));
-            }
-            other => {
-                return Err(Error::InvalidData(format!(
-                    "unknown fractal heap ID type {}",
-                    other
-                )));
-            }
-        }
-
-        // Decode the offset and length from the heap ID.
-        // The offset uses `max_heap_size` bits, and the length uses the remaining
-        // bits in the heap ID.
-        let offset_bits = self.max_heap_size as usize;
-
-        // Build a u64 from the heap ID bytes (skipping the type nibble).
-        // The first 4 bits are the type/version nibble. The remaining bits
-        // are: offset (offset_bits) then length.
-        let total_bits = (heap_id.len() * 8) - 4; // minus 4 for type nibble
-        let length_bits = total_bits.saturating_sub(offset_bits);
-
-        // Extract bits from the heap ID.
-        let (heap_offset, obj_length) = decode_managed_heap_id(heap_id, offset_bits, length_bits)?;
+        let (heap_offset, obj_length) = self.decode_managed_heap_id(heap_id)?;
 
         if obj_length == 0 {
             return Ok(Vec::new());
         }
 
-        // Find the direct block containing this offset.
         let (block_address, block_offset_in_heap, _block_size) =
             self.find_direct_block(heap_offset, file_data, offset_size)?;
-
-        // Parse the direct block header to find where object data begins.
         let db_header_size = self.direct_block_header_size(offset_size);
-
-        // The object's position within the direct block.
         let offset_in_block = heap_offset - block_offset_in_heap;
         let data_start = block_address as usize + db_header_size + offset_in_block as usize;
         let data_end = data_start + obj_length as usize;
@@ -289,44 +309,19 @@ impl FractalHeap {
         Ok(file_data[data_start..data_end].to_vec())
     }
 
-    /// Extract a managed object from random-access storage.
-    pub fn get_managed_object_storage(
+    fn get_managed_object_storage_impl(
         &self,
         heap_id: &[u8],
         storage: &dyn Storage,
         offset_size: u8,
-        _length_size: u8,
     ) -> Result<Vec<u8>> {
-        if heap_id.is_empty() {
-            return Err(Error::InvalidData("empty fractal heap ID".into()));
+        if self.io_filters_len > 0 {
+            return Err(Error::Other(
+                "filtered fractal heap managed objects are not supported".to_string(),
+            ));
         }
 
-        let id_type = (heap_id[0] >> 4) & 0x03;
-        match id_type {
-            0 => {}
-            1 => {
-                return Err(Error::Other(
-                    "fractal heap tiny objects not yet supported".to_string(),
-                ));
-            }
-            2 => {
-                return Err(Error::Other(
-                    "fractal heap huge objects not yet supported".to_string(),
-                ));
-            }
-            other => {
-                return Err(Error::InvalidData(format!(
-                    "unknown fractal heap ID type {}",
-                    other
-                )));
-            }
-        }
-
-        let offset_bits = self.max_heap_size as usize;
-        let total_bits = (heap_id.len() * 8) - 4;
-        let length_bits = total_bits.saturating_sub(offset_bits);
-        let (heap_offset, obj_length) = decode_managed_heap_id(heap_id, offset_bits, length_bits)?;
-
+        let (heap_offset, obj_length) = self.decode_managed_heap_id(heap_id)?;
         if obj_length == 0 {
             return Ok(Vec::new());
         }
@@ -345,6 +340,225 @@ impl FractalHeap {
             Error::InvalidData("fractal heap object exceeds platform usize capacity".into())
         })?;
         Ok(storage.read_range(data_start, len)?.to_vec())
+    }
+
+    fn get_huge_object(
+        &self,
+        heap_id: &[u8],
+        file_data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>> {
+        let (address, length) = self.resolve_huge_object_location(
+            heap_id,
+            Some(file_data),
+            None,
+            offset_size,
+            length_size,
+        )?;
+        let start = usize::try_from(address).map_err(|_| Error::OffsetOutOfBounds(address))?;
+        let len = usize::try_from(length).map_err(|_| {
+            Error::InvalidData("huge fractal heap object exceeds platform usize capacity".into())
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::OffsetOutOfBounds(address))?;
+        if end > file_data.len() {
+            return Err(Error::UnexpectedEof {
+                offset: address,
+                needed: length,
+                available: file_data.len().saturating_sub(start) as u64,
+            });
+        }
+        Ok(file_data[start..end].to_vec())
+    }
+
+    fn get_huge_object_storage(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>> {
+        let (address, length) = self.resolve_huge_object_location(
+            heap_id,
+            None,
+            Some(storage),
+            offset_size,
+            length_size,
+        )?;
+        let len = usize::try_from(length).map_err(|_| {
+            Error::InvalidData("huge fractal heap object exceeds platform usize capacity".into())
+        })?;
+        Ok(storage.read_range(address, len)?.to_vec())
+    }
+
+    fn resolve_huge_object_location(
+        &self,
+        heap_id: &[u8],
+        file_data: Option<&[u8]>,
+        storage: Option<&dyn Storage>,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<(u64, u64)> {
+        let direct_unfiltered_len = 1 + usize::from(offset_size) + usize::from(length_size);
+        let direct_filtered_len = direct_unfiltered_len + 4 + usize::from(length_size);
+
+        if self.io_filters_len > 0 && heap_id.len() >= direct_filtered_len {
+            return Err(Error::Other(
+                "filtered fractal heap huge objects are not supported".to_string(),
+            ));
+        }
+
+        if self.io_filters_len == 0 && heap_id.len() >= direct_unfiltered_len {
+            let mut cursor = Cursor::new(&heap_id[1..]);
+            let address = cursor.read_offset(offset_size)?;
+            let length = cursor.read_length(length_size)?;
+            return Ok((address, length));
+        }
+
+        if heap_id.len() < 1 + usize::from(length_size) {
+            return Err(Error::InvalidData(
+                "huge fractal heap ID is too short".into(),
+            ));
+        }
+        if Cursor::is_undefined_offset(self.btree_huge_objects_address, offset_size) {
+            return Err(Error::UndefinedAddress);
+        }
+
+        let mut key_cursor = Cursor::new(&heap_id[1..]);
+        let object_id = key_cursor.read_length(length_size)?;
+
+        let header = if let Some(storage) = storage {
+            crate::btree_v2::BTreeV2Header::parse_at_storage(
+                storage,
+                self.btree_huge_objects_address,
+                offset_size,
+                length_size,
+            )?
+        } else {
+            let data = file_data.expect("file_data must exist when storage is None");
+            let mut cursor = Cursor::new(data);
+            cursor.set_position(self.btree_huge_objects_address);
+            crate::btree_v2::BTreeV2Header::parse(&mut cursor, offset_size, length_size)?
+        };
+
+        let records = if let Some(storage) = storage {
+            crate::btree_v2::collect_btree_v2_records_storage(
+                storage,
+                &header,
+                offset_size,
+                length_size,
+                None,
+                &[],
+                None,
+            )?
+        } else {
+            crate::btree_v2::collect_btree_v2_records(
+                file_data.expect("file_data must exist when storage is None"),
+                &header,
+                offset_size,
+                length_size,
+                None,
+                &[],
+                None,
+            )?
+        };
+
+        for record in records {
+            match record {
+                crate::btree_v2::BTreeV2Record::HugeIndirectNonFiltered {
+                    address,
+                    length,
+                    object_id: record_id,
+                } if record_id == object_id => return Ok((address, length)),
+                crate::btree_v2::BTreeV2Record::HugeIndirectFiltered {
+                    object_id: record_id,
+                    ..
+                } if record_id == object_id => {
+                    return Err(Error::Other(
+                        "filtered fractal heap huge objects are not supported".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Err(Error::InvalidData(format!(
+            "huge fractal heap object ID {} not found",
+            object_id
+        )))
+    }
+
+    fn decode_tiny_object(&self, heap_id: &[u8]) -> Result<Vec<u8>> {
+        let extended = self.heap_id_len > 18;
+        let (data_start, len) = if extended {
+            if heap_id.len() < 2 {
+                return Err(Error::InvalidData(
+                    "extended tiny heap ID is too short".into(),
+                ));
+            }
+            let encoded = (u16::from(heap_id[0] & 0x0F) << 8) | u16::from(heap_id[1]);
+            (2usize, usize::from(encoded) + 1)
+        } else {
+            (1usize, usize::from(heap_id[0] & 0x0F) + 1)
+        };
+        let data_end = data_start
+            .checked_add(len)
+            .ok_or_else(|| Error::InvalidData("tiny heap object length overflows".into()))?;
+        if data_end > heap_id.len() {
+            return Err(Error::InvalidData(format!(
+                "tiny heap object needs {} bytes, heap ID has {}",
+                data_end,
+                heap_id.len()
+            )));
+        }
+        Ok(heap_id[data_start..data_end].to_vec())
+    }
+
+    fn heap_id_kind(&self, heap_id: &[u8]) -> Result<HeapIdKind> {
+        if heap_id.is_empty() {
+            return Err(Error::InvalidData("empty fractal heap ID".into()));
+        }
+        let version = heap_id[0] >> 6;
+        if version != 0 {
+            return Err(Error::InvalidData(format!(
+                "unsupported fractal heap ID version {}",
+                version
+            )));
+        }
+        match (heap_id[0] >> 4) & 0x03 {
+            0 => Ok(HeapIdKind::Managed),
+            1 => Ok(HeapIdKind::Huge),
+            2 => Ok(HeapIdKind::Tiny),
+            other => Err(Error::InvalidData(format!(
+                "unknown fractal heap ID type {}",
+                other
+            ))),
+        }
+    }
+
+    fn decode_managed_heap_id(&self, heap_id: &[u8]) -> Result<(u64, u64)> {
+        let (offset_bytes, length_bytes) = self.managed_id_widths();
+        let needed = 1 + offset_bytes + length_bytes;
+        if heap_id.len() < needed {
+            return Err(Error::InvalidData(format!(
+                "managed fractal heap ID too short: need {} bytes, have {}",
+                needed,
+                heap_id.len()
+            )));
+        }
+        let mut cursor = Cursor::new(&heap_id[1..needed]);
+        let heap_offset = cursor.read_uvar(offset_bytes)?;
+        let obj_length = cursor.read_uvar(length_bytes)?;
+        Ok((heap_offset, obj_length))
+    }
+
+    fn managed_id_widths(&self) -> (usize, usize) {
+        let offset_bytes = usize::from(self.max_heap_size).div_ceil(8).max(1);
+        let max_len = self.max_direct_block_size.min(self.max_managed_object_size);
+        let length_bytes = bytes_needed_to_encode(max_len).max(1);
+        (offset_bytes, length_bytes)
     }
 
     /// Find the direct block containing a given heap offset.
@@ -583,110 +797,79 @@ impl FractalHeap {
         rows
     }
 
-    /// Size in bytes of a direct block header (including checksum when applicable).
-    ///
-    /// Per the HDF5 spec, direct blocks include a checksum when the heap has
-    /// NO I/O filters. When I/O filters are present, the filters handle
-    /// integrity and the checksum is omitted.
+    /// Size in bytes of a direct block header (including checksum when present).
     fn direct_block_header_size(&self, offset_size: u8) -> usize {
         // Signature(4) + Version(1) + Heap header address(offset_size) +
         // Block offset within heap (max_heap_size bits, rounded up to bytes)
         let offset_bytes = (self.max_heap_size as usize).div_ceil(8);
         let base = 4 + 1 + offset_size as usize + offset_bytes;
-        if self.io_filters_len == 0 {
-            base + 4 // checksum present when no I/O filters
+        if (self.flags & 0x02) != 0 {
+            base + 4
         } else {
             base
         }
     }
 }
 
-/// Decode the offset and length from a managed-object heap ID.
-///
-/// The first nibble (4 bits) is the type (already checked). The remaining
-/// bits contain the offset (offset_bits wide) followed by the length.
-fn decode_managed_heap_id(
-    heap_id: &[u8],
-    offset_bits: usize,
-    length_bits: usize,
-) -> Result<(u64, u64)> {
-    // Convert heap_id to a bit stream, skipping the first 4 bits (type nibble).
-    // We work with the bytes directly.
-    let total_bits = offset_bits + length_bits;
-    let available_bits = heap_id.len() * 8 - 4;
-    if total_bits > available_bits {
-        return Err(Error::InvalidData(format!(
-            "fractal heap ID too short: need {} bits for offset+length, have {}",
-            total_bits, available_bits
-        )));
-    }
-
-    let offset = extract_bits(heap_id, 4, offset_bits);
-    let length = extract_bits(heap_id, 4 + offset_bits, length_bits);
-
-    Ok((offset, length))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeapIdKind {
+    Managed,
+    Huge,
+    Tiny,
 }
 
-/// Extract `num_bits` bits starting at bit position `start_bit` from a byte
-/// slice (MSB-first bit ordering within each byte).
-fn extract_bits(data: &[u8], start_bit: usize, num_bits: usize) -> u64 {
-    if num_bits == 0 {
-        return 0;
+fn bytes_needed_to_encode(value: u64) -> usize {
+    if value <= u8::MAX as u64 {
+        1
+    } else if value <= u16::MAX as u64 {
+        2
+    } else if value <= 0x00FF_FFFF {
+        3
+    } else if value <= u32::MAX as u64 {
+        4
+    } else if value <= 0x00FF_FFFF_FFFF {
+        5
+    } else if value <= 0x0000_FFFF_FFFF_FFFF {
+        6
+    } else if value <= 0x00FF_FFFF_FFFF_FFFF {
+        7
+    } else {
+        8
     }
-    let mut value: u64 = 0;
-    for i in 0..num_bits {
-        let bit_pos = start_bit + i;
-        let byte_idx = bit_pos / 8;
-        let bit_idx = 7 - (bit_pos % 8); // MSB first
-        if byte_idx < data.len() {
-            let bit = (data[byte_idx] >> bit_idx) & 1;
-            value = (value << 1) | bit as u64;
-        }
-    }
-    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_extract_bits() {
-        // 0xAB = 1010_1011
-        let data = [0xAB];
-        assert_eq!(extract_bits(&data, 0, 4), 0b1010); // 0xA
-        assert_eq!(extract_bits(&data, 4, 4), 0b1011); // 0xB
-        assert_eq!(extract_bits(&data, 0, 8), 0xAB);
-    }
-
-    #[test]
-    fn test_extract_bits_cross_byte() {
-        let data = [0xFF, 0x00];
-        assert_eq!(extract_bits(&data, 4, 8), 0b1111_0000);
-    }
-
-    #[test]
-    fn test_decode_managed_heap_id() {
-        // Type nibble = 0 (managed), offset = 0, length = 100
-        // offset_bits = 16, length_bits = 12
-        // Total bits needed: 4 + 16 + 12 = 32 = 4 bytes
-        // Byte layout:
-        //   byte 0: type(4 bits=0000) + offset_hi(4 bits=0000)
-        //   byte 1: offset_lo(8 bits=0000_0000)
-        //   byte 2: offset_lo(4 bits=0000) + length_hi(4 bits=0000)
-        //   byte 3: length_lo(8 bits=0110_0100) = 100
-        // Wait, let's compute more carefully.
-        // offset = 0 -> 16 bits all zero
-        // length = 100 -> 12 bits: 0000_0110_0100
-        // Full bit stream after type nibble: 0000_0000_0000_0000 | 0000_0110_0100
-        // = 0x00 0x00 0x06 0x40 (but only 28 bits)
-        // With type nibble 0: 0000 | 0000_0000_0000_0000 | 0000_0110_0100
-        // Packed into bytes: 0000_0000 0000_0000 0000_0000 0110_0100
-        //                    0x00       0x00       0x00       0x64
-        let heap_id = [0x00, 0x00, 0x00, 0x64];
-        let (offset, length) = decode_managed_heap_id(&heap_id, 16, 12).unwrap();
-        assert_eq!(offset, 0);
-        assert_eq!(length, 100);
+    fn base_heap() -> FractalHeap {
+        FractalHeap {
+            heap_id_len: 8,
+            io_filters_len: 0,
+            flags: 0x02,
+            max_managed_object_size: 128,
+            next_huge_id: 0,
+            btree_huge_objects_address: u64::MAX,
+            free_space_managed_address: 0,
+            managed_space_amount: 0,
+            managed_alloc_amount: 0,
+            managed_iter_offset: 0,
+            managed_objects_count: 0,
+            huge_objects_size: 0,
+            huge_objects_count: 0,
+            tiny_objects_size: 0,
+            tiny_objects_count: 0,
+            table_width: 4,
+            starting_block_size: 256,
+            max_direct_block_size: 4096,
+            max_heap_size: 16,
+            starting_row_root_indirect: 0,
+            root_block_address: 0,
+            current_rows_in_root_indirect: 0,
+            io_filter_size: None,
+            io_filter_mask: None,
+            io_filter_info: Vec::new(),
+        }
     }
 
     #[test]
@@ -694,6 +877,7 @@ mod tests {
         let heap = FractalHeap {
             heap_id_len: 8,
             io_filters_len: 0,
+            flags: 0x02,
             max_managed_object_size: 0,
             next_huge_id: 0,
             btree_huge_objects_address: 0,
@@ -715,6 +899,7 @@ mod tests {
             current_rows_in_root_indirect: 0,
             io_filter_size: None,
             io_filter_mask: None,
+            io_filter_info: Vec::new(),
         };
 
         assert_eq!(heap.block_size_for_row(0), 256);
@@ -724,10 +909,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_tiny_object() {
+        let heap = base_heap();
+        let heap_id = [0x20 | 3, b't', b'i', b'n', b'y'];
+        let result = heap.get_object(&heap_id, &[], 8, 8).unwrap();
+        assert_eq!(result, b"tiny");
+    }
+
+    #[test]
+    fn test_get_huge_direct_object() {
+        let heap = base_heap();
+        let mut file_data = vec![0u8; 128];
+        file_data[64..68].copy_from_slice(b"huge");
+
+        let mut heap_id = Vec::new();
+        heap_id.push(0x10);
+        heap_id.extend_from_slice(&64u64.to_le_bytes());
+        heap_id.extend_from_slice(&4u64.to_le_bytes());
+
+        let result = heap.get_object(&heap_id, &file_data, 8, 8).unwrap();
+        assert_eq!(result, b"huge");
+    }
+
+    #[test]
     fn test_direct_block_header_size() {
         let heap = FractalHeap {
             heap_id_len: 8,
             io_filters_len: 0,
+            flags: 0x02,
             max_managed_object_size: 0,
             next_huge_id: 0,
             btree_huge_objects_address: 0,
@@ -749,9 +958,10 @@ mod tests {
             current_rows_in_root_indirect: 0,
             io_filter_size: None,
             io_filter_mask: None,
+            io_filter_info: Vec::new(),
         };
 
-        // No I/O filters => checksum present.
+        // Flag bit 1 => checksum present.
         // sig(4) + ver(1) + addr(8) + offset_bytes(2) + checksum(4) = 19
         assert_eq!(heap.direct_block_header_size(8), 19);
 
@@ -776,6 +986,7 @@ mod tests {
         let heap = FractalHeap {
             heap_id_len: 8,
             io_filters_len: 0,
+            flags: 0x02,
             max_managed_object_size: 128,
             next_huge_id: 0,
             btree_huge_objects_address: u64::MAX,
@@ -797,6 +1008,7 @@ mod tests {
             current_rows_in_root_indirect: 0,
             io_filter_size: None,
             io_filter_mask: None,
+            io_filter_info: Vec::new(),
         };
 
         // Build file data with the direct block.

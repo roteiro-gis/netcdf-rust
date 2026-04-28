@@ -318,6 +318,46 @@ fn test_fill_value() {
 }
 
 #[test]
+fn test_external_raw_data_file() {
+    let path = skip_if_missing!("external_raw.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.as_slice().unwrap(), &(0..12).collect::<Vec<i32>>()[..]);
+
+    let selection = hdf5_reader::SliceInfo {
+        selections: vec![hdf5_reader::SliceInfoElem::Slice {
+            start: 3,
+            end: 7,
+            step: 1,
+        }],
+    };
+    let sliced: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
+    assert_eq!(sliced.as_slice().unwrap(), &[3, 4, 5, 6]);
+}
+
+#[test]
+fn test_external_link_resolver() {
+    let path = skip_if_missing!("external_links.h5");
+    let base_dir = path.parent().unwrap();
+    let file = hdf5_reader::Hdf5File::open_with_options(
+        &path,
+        hdf5_reader::OpenOptions {
+            external_link_resolver: Some(Arc::new(
+                hdf5_reader::FilesystemExternalLinkResolver::new(base_dir),
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ds = file.dataset("/linked_data").unwrap();
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[4, 5, 6]);
+}
+
+#[test]
 fn test_fletcher32() {
     let path = skip_if_missing!("fletcher32.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
@@ -370,6 +410,7 @@ fn test_from_bytes_with_options() {
             chunk_cache_bytes: 1024,
             chunk_cache_slots: 17,
             filter_registry: None,
+            ..Default::default()
         },
     )
     .unwrap();

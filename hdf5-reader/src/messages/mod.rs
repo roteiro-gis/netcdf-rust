@@ -19,6 +19,7 @@ pub mod link;
 pub mod link_info;
 pub mod modification_time;
 pub mod shared;
+pub mod shared_table;
 pub mod symbol_table_msg;
 
 // Re-exports for convenience.
@@ -120,6 +121,8 @@ pub enum HdfMessage {
     BTreeK(btree_k::BTreeKMessage),
     /// External data files.
     ExternalFiles(external_files::ExternalFilesMessage),
+    /// Pointer to the file-level SOHM master table.
+    SharedTable(shared_table::SharedTableMessage),
     /// Shared message wrapper.
     Shared(shared::SharedMessage),
     /// Object header continuation (marker only — the parser follows the
@@ -220,6 +223,10 @@ pub fn parse_message(
         MSG_EXTERNAL_FILES => {
             let msg = external_files::parse(cursor, offset_size, length_size, msg_size)?;
             Ok(HdfMessage::ExternalFiles(msg))
+        }
+        MSG_SHARED_TABLE => {
+            let msg = shared_table::parse(cursor, offset_size, length_size, msg_size)?;
+            Ok(HdfMessage::SharedTable(msg))
         }
         MSG_COMMENT => {
             let comment = cursor.read_fixed_string(msg_size)?;

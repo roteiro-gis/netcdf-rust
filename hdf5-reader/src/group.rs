@@ -27,10 +27,17 @@ pub struct Group {
     pub(crate) root_address: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ChildEntry {
     name: String,
+    location: ObjectLocation,
+}
+
+#[derive(Clone)]
+struct ObjectLocation {
+    context: Arc<FileContext>,
     address: u64,
+    root_address: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +98,14 @@ impl Group {
         self.context.get_or_parse_header(addr)
     }
 
+    fn local_location(&self, address: u64) -> ObjectLocation {
+        ObjectLocation {
+            context: self.context.clone(),
+            address,
+            root_address: self.root_address,
+        }
+    }
+
     /// List all child groups.
     pub fn groups(&self) -> Result<Vec<Group>> {
         let (groups, _) = self.resolve_member_objects()?;
@@ -110,10 +125,10 @@ impl Group {
             match self.child_object_kind(child)? {
                 ChildObjectKind::Group | ChildObjectKind::Other => {
                     groups.push(Group::new(
-                        self.context.clone(),
-                        child.address,
+                        child.location.context.clone(),
+                        child.location.address,
                         child.name.clone(),
-                        self.root_address,
+                        child.location.root_address,
                     ));
                 }
                 ChildObjectKind::Dataset => {
@@ -133,20 +148,20 @@ impl Group {
             if child.name == name {
                 return match self.child_object_kind(child)? {
                     ChildObjectKind::Group => Ok(Group::new(
-                        self.context.clone(),
-                        child.address,
+                        child.location.context.clone(),
+                        child.location.address,
                         child.name.clone(),
-                        self.root_address,
+                        child.location.root_address,
                     )),
                     ChildObjectKind::Dataset => Err(Error::GroupNotFound(format!(
                         "'{}' is a dataset, not a group",
                         name
                     ))),
                     ChildObjectKind::Other => Ok(Group::new(
-                        self.context.clone(),
-                        child.address,
+                        child.location.context.clone(),
+                        child.location.address,
                         child.name.clone(),
-                        self.root_address,
+                        child.location.root_address,
                     )),
                 };
             }
@@ -266,14 +281,16 @@ impl Group {
 
         if !found_symbol_table {
             // New-style group: use compact links from header messages
-            self.resolve_link_targets(&links, link_depth, &mut children);
+            self.resolve_link_targets(&links, link_depth, &mut children)?;
 
             // Dense-link storage can coexist with compact links, so merge both.
             if let Some(ref li) = link_info {
                 if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
                     for child in self.resolve_dense_links_storage(li, link_depth)? {
                         let is_duplicate = children.iter().any(|existing| {
-                            existing.name == child.name && existing.address == child.address
+                            existing.name == child.name
+                                && existing.location.address == child.location.address
+                                && Arc::ptr_eq(&existing.location.context, &child.location.context)
                         });
                         if !is_duplicate {
                             children.push(child);
@@ -292,28 +309,36 @@ impl Group {
         links: &[LinkMessage],
         link_depth: u32,
         children: &mut Vec<ChildEntry>,
-    ) {
+    ) -> Result<()> {
         for link in links {
             match &link.target {
                 LinkTarget::Hard { address } => {
                     children.push(ChildEntry {
                         name: link.name.clone(),
-                        address: *address,
+                        location: self.local_location(*address),
                     });
                 }
                 LinkTarget::Soft { path } => {
-                    if let Ok(address) = self.resolve_soft_link_depth(path, link_depth) {
+                    if let Ok(location) = self.resolve_soft_link_depth(path, link_depth) {
                         children.push(ChildEntry {
                             name: link.name.clone(),
-                            address,
+                            location,
                         });
                     }
                 }
-                LinkTarget::External { .. } => {
-                    // External links reference other files; skip.
+                LinkTarget::External { filename, path } => {
+                    if let Some(location) =
+                        self.resolve_external_link_depth(filename, path, link_depth)?
+                    {
+                        children.push(ChildEntry {
+                            name: link.name.clone(),
+                            location,
+                        });
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     /// Resolve old-style group children via B-tree v1 + local heap.
@@ -351,7 +376,7 @@ impl Group {
                 let name = heap.get_string(entry.link_name_offset, file_data)?;
                 children.push(ChildEntry {
                     name,
-                    address: entry.object_header_address,
+                    location: self.local_location(entry.object_header_address),
                 });
             }
         }
@@ -413,7 +438,7 @@ impl Group {
                     heap.get_string_storage(entry.link_name_offset, self.context.storage.as_ref())?;
                 children.push(ChildEntry {
                     name,
-                    address: entry.object_header_address,
+                    location: self.local_location(entry.object_header_address),
                 });
             }
         }
@@ -459,12 +484,8 @@ impl Group {
                 _ => continue,
             };
 
-            let managed_bytes = heap.get_managed_object(
-                heap_id,
-                file_data,
-                self.offset_size(),
-                self.length_size(),
-            )?;
+            let managed_bytes =
+                heap.get_object(heap_id, file_data, self.offset_size(), self.length_size())?;
 
             let mut link_cursor = Cursor::new(&managed_bytes);
             let link_msg = link::parse(
@@ -478,18 +499,27 @@ impl Group {
                 LinkTarget::Hard { address } => {
                     children.push(ChildEntry {
                         name: link_msg.name.clone(),
-                        address: *address,
+                        location: self.local_location(*address),
                     });
                 }
                 LinkTarget::Soft { path } => {
-                    if let Ok(address) = self.resolve_soft_link_depth(path, link_depth) {
+                    if let Ok(location) = self.resolve_soft_link_depth(path, link_depth) {
                         children.push(ChildEntry {
                             name: link_msg.name.clone(),
-                            address,
+                            location,
                         });
                     }
                 }
-                LinkTarget::External { .. } => {}
+                LinkTarget::External { filename, path } => {
+                    if let Some(location) =
+                        self.resolve_external_link_depth(filename, path, link_depth)?
+                    {
+                        children.push(ChildEntry {
+                            name: link_msg.name.clone(),
+                            location,
+                        });
+                    }
+                }
             }
         }
 
@@ -533,7 +563,7 @@ impl Group {
                 _ => continue,
             };
 
-            let managed_bytes = heap.get_managed_object_storage(
+            let managed_bytes = heap.get_object_storage(
                 heap_id,
                 self.context.storage.as_ref(),
                 self.offset_size(),
@@ -552,18 +582,27 @@ impl Group {
                 LinkTarget::Hard { address } => {
                     children.push(ChildEntry {
                         name: link_msg.name.clone(),
-                        address: *address,
+                        location: self.local_location(*address),
                     });
                 }
                 LinkTarget::Soft { path } => {
-                    if let Ok(address) = self.resolve_soft_link_depth(path, link_depth) {
+                    if let Ok(location) = self.resolve_soft_link_depth(path, link_depth) {
                         children.push(ChildEntry {
                             name: link_msg.name.clone(),
-                            address,
+                            location,
                         });
                     }
                 }
-                LinkTarget::External { .. } => {}
+                LinkTarget::External { filename, path } => {
+                    if let Some(location) =
+                        self.resolve_external_link_depth(filename, path, link_depth)?
+                    {
+                        children.push(ChildEntry {
+                            name: link_msg.name.clone(),
+                            location,
+                        });
+                    }
+                }
             }
         }
 
@@ -574,17 +613,17 @@ impl Group {
         Ok(self
             .resolve_children()?
             .into_iter()
-            .find(|child| child.address == address)
+            .find(|child| child.location.address == address)
             .map(|child| child.name))
     }
 
     fn child_context(&self, child: &ChildEntry) -> String {
-        format!("child '{}' at {:#x}", child.name, child.address)
+        format!("child '{}' at {:#x}", child.name, child.location.address)
     }
 
     fn child_object_kind(&self, child: &ChildEntry) -> Result<ChildObjectKind> {
         let header = self
-            .cached_header(child.address)
+            .cached_child_header(child)
             .map_err(|err| err.with_context(self.child_context(child)))?;
 
         Ok(classify_child_header(header.as_ref()))
@@ -592,7 +631,7 @@ impl Group {
 
     fn try_open_child_dataset(&self, child: &ChildEntry) -> Result<Option<Dataset>> {
         let header = self
-            .cached_header(child.address)
+            .cached_child_header(child)
             .map_err(|err| err.with_context(self.child_context(child)))?;
 
         if classify_child_header(header.as_ref()) != ChildObjectKind::Dataset {
@@ -601,9 +640,9 @@ impl Group {
 
         Dataset::from_parsed_header(
             crate::dataset::DatasetParseContext {
-                context: self.context.clone(),
+                context: child.location.context.clone(),
             },
-            child.address,
+            child.location.address,
             child.name.clone(),
             header.as_ref(),
         )
@@ -611,13 +650,62 @@ impl Group {
         .map_err(|err| err.with_context(self.child_context(child)))
     }
 
+    fn cached_child_header(
+        &self,
+        child: &ChildEntry,
+    ) -> Result<Arc<crate::object_header::ObjectHeader>> {
+        child
+            .location
+            .context
+            .get_or_parse_header(child.location.address)
+    }
+
     /// Maximum nesting depth for soft link resolution.
     const MAX_SOFT_LINK_DEPTH: u32 = 16;
 
-    fn resolve_soft_link_depth(&self, path: &str, depth: u32) -> Result<u64> {
+    fn resolve_soft_link_depth(&self, path: &str, depth: u32) -> Result<ObjectLocation> {
+        self.resolve_path_location(path, depth, "soft link")
+    }
+
+    fn resolve_external_link_depth(
+        &self,
+        filename: &str,
+        path: &str,
+        depth: u32,
+    ) -> Result<Option<ObjectLocation>> {
         if depth >= Self::MAX_SOFT_LINK_DEPTH {
             return Err(Error::Other(format!(
-                "soft link resolution exceeded maximum depth ({}) — possible cycle at '{}'",
+                "external link resolution exceeded maximum depth ({}) at '{}:{}'",
+                Self::MAX_SOFT_LINK_DEPTH,
+                filename,
+                path,
+            )));
+        }
+
+        let Some(resolver) = self.context.external_link_resolver.as_ref() else {
+            return Ok(None);
+        };
+        let Some(file) = resolver.resolve_external_link(filename)? else {
+            return Ok(None);
+        };
+        let root = file.root_group()?;
+        Ok(Some(root.resolve_path_location(
+            path,
+            depth + 1,
+            "external link",
+        )?))
+    }
+
+    fn resolve_path_location(
+        &self,
+        path: &str,
+        depth: u32,
+        link_kind: &str,
+    ) -> Result<ObjectLocation> {
+        if depth >= Self::MAX_SOFT_LINK_DEPTH {
+            return Err(Error::Other(format!(
+                "{} resolution exceeded maximum depth ({}) — possible cycle at '{}'",
+                link_kind,
                 Self::MAX_SOFT_LINK_DEPTH,
                 path,
             )));
@@ -630,7 +718,7 @@ impl Group {
             .collect();
 
         if parts.is_empty() {
-            return Ok(self.root_address);
+            return Ok(self.local_location(self.root_address));
         }
 
         let start_addr = if path.starts_with('/') {
@@ -654,13 +742,13 @@ impl Group {
         let children = current_group.resolve_children_with_link_depth(depth + 1)?;
         for child in &children {
             if child.name == target_name {
-                return Ok(child.address);
+                return Ok(child.location.clone());
             }
         }
 
         Err(Error::Other(format!(
-            "soft link target '{}' not found",
-            path
+            "{} target '{}' not found",
+            link_kind, path
         )))
     }
 }

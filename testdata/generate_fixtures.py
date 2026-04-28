@@ -135,6 +135,22 @@ def generate_hdf5_fixtures(base_dir):
         # Dataset with no explicit fill value (HDF5 library default for i32 is 0)
         f.create_dataset("nofill", shape=(10,), dtype=np.int32)
 
+    # ---- 11b. external_raw.h5 ----
+    # Tests: contiguous dataset raw data stored in an external binary file.
+    path = os.path.join(hdf5_dir, "external_raw.h5")
+    external_name = "external_raw.bin"
+    external_path = os.path.join(hdf5_dir, external_name)
+    print(f"  Generating {path}")
+    external_data = np.arange(12, dtype=np.int32)
+    external_data.tofile(external_path)
+    with h5py.File(path, "w") as f:
+        f.create_dataset(
+            "data",
+            shape=external_data.shape,
+            dtype=external_data.dtype,
+            external=[(external_name, 0, external_data.nbytes)],
+        )
+
     # ---- 12. fletcher32.h5 ----
     # Tests: Fletcher32 checksum filter on dataset chunks.
     path = os.path.join(hdf5_dir, "fletcher32.h5")
@@ -185,6 +201,17 @@ def generate_hdf5_fixtures(base_dir):
         f["my_type"] = dt  # commit the type
         # Reference the committed type
         ds = f.create_dataset("data", data=np.array([1.0, 2.0, 3.0]), dtype=f["my_type"].dtype)
+
+    # ---- 17b. external_links.h5 ----
+    # Tests: optional external-link resolver across HDF5 files.
+    target_path = os.path.join(hdf5_dir, "external_link_target.h5")
+    path = os.path.join(hdf5_dir, "external_links.h5")
+    print(f"  Generating {target_path}")
+    with h5py.File(target_path, "w") as f:
+        f.create_dataset("target_data", data=np.array([4, 5, 6], dtype=np.int32))
+    print(f"  Generating {path}")
+    with h5py.File(path, "w") as f:
+        f["linked_data"] = h5py.ExternalLink("external_link_target.h5", "/target_data")
 
     # ---- 18. fixed_array_chunked.h5 ----
     # Tests: Fixed Array chunk indexing (libver='latest', fixed-size chunked).

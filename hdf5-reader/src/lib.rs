@@ -14,6 +14,7 @@ pub mod fixed_array;
 pub mod fractal_heap;
 pub mod global_heap;
 pub mod local_heap;
+pub mod shared_message_table;
 pub mod symbol_table;
 
 // Level 2 — Data Objects
@@ -35,7 +36,7 @@ pub mod filters;
 pub mod cache;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use memmap2::Mmap;
@@ -44,7 +45,9 @@ use memmap2::Mmap;
 use cache::ChunkCache;
 use error::{Error, Result};
 use group::Group;
+use messages::HdfMessage;
 use object_header::ObjectHeader;
+use shared_message_table::SharedMessageTableRef;
 use storage::DynStorage;
 use superblock::Superblock;
 
@@ -69,6 +72,10 @@ pub struct OpenOptions {
     pub chunk_cache_slots: usize,
     /// Custom filter registry. If `None`, the default built-in filters are used.
     pub filter_registry: Option<FilterRegistry>,
+    /// Resolver for HDF5 external raw data files.
+    pub external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
+    /// Optional resolver for HDF5 external links.
+    pub external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
 }
 
 impl Default for OpenOptions {
@@ -77,7 +84,94 @@ impl Default for OpenOptions {
             chunk_cache_bytes: 64 * 1024 * 1024,
             chunk_cache_slots: 521,
             filter_registry: None,
+            external_file_resolver: None,
+            external_link_resolver: None,
         }
+    }
+}
+
+/// Resolves file names from HDF5 External Data Files messages to storage.
+pub trait ExternalFileResolver: Send + Sync {
+    fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>>;
+}
+
+/// Resolves HDF5 external links to another opened file.
+pub trait ExternalLinkResolver: Send + Sync {
+    fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>>;
+}
+
+/// Filesystem resolver for external raw data files.
+#[derive(Debug, Clone)]
+pub struct FilesystemExternalFileResolver {
+    base_dir: PathBuf,
+}
+
+impl FilesystemExternalFileResolver {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+        }
+    }
+
+    fn path_for(&self, filename: &str) -> PathBuf {
+        let path = Path::new(filename);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        }
+    }
+}
+
+impl ExternalFileResolver for FilesystemExternalFileResolver {
+    fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>> {
+        let path = self.path_for(filename);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(FileStorage::open(path)?)))
+    }
+}
+
+/// Filesystem resolver for external links. Linked files are cached after the
+/// first successful open.
+pub struct FilesystemExternalLinkResolver {
+    base_dir: PathBuf,
+    cache: parking_lot::Mutex<HashMap<PathBuf, Hdf5File>>,
+}
+
+impl FilesystemExternalLinkResolver {
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            cache: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn path_for(&self, filename: &str) -> PathBuf {
+        let path = Path::new(filename);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base_dir.join(path)
+        }
+    }
+}
+
+impl ExternalLinkResolver for FilesystemExternalLinkResolver {
+    fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>> {
+        let path = self.path_for(filename);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        if let Some(file) = self.cache.lock().get(&path).cloned() {
+            return Ok(Some(file));
+        }
+
+        let file = Hdf5File::open(&path)?;
+        self.cache.lock().insert(path, file.clone());
+        Ok(Some(file))
     }
 }
 
@@ -89,6 +183,7 @@ pub type HeaderCache = Arc<parking_lot::Mutex<HashMap<u64, Arc<ObjectHeader>>>>;
 /// This is the main entry point for reading HDF5 files. Storage is random-
 /// access and range-based, so metadata and data reads do not require an eager
 /// whole-file mapping.
+#[derive(Clone)]
 pub struct Hdf5File {
     context: Arc<FileContext>,
 }
@@ -100,6 +195,10 @@ pub(crate) struct FileContext {
     pub(crate) header_cache: HeaderCache,
     pub(crate) dataset_path_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<DatasetTemplate>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
+    pub(crate) external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
+    pub(crate) external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
+    pub(crate) external_file_cache: parking_lot::Mutex<HashMap<String, DynStorage>>,
+    sohm_table: OnceLock<std::result::Result<Option<SharedMessageTableRef>, String>>,
     full_file_cache: OnceLock<StorageBuffer>,
 }
 
@@ -139,15 +238,90 @@ impl FileContext {
             self.superblock.offset_size,
             self.superblock.length_size,
         )?;
-        hdr.resolve_shared_messages_storage(
+        hdr.resolve_shared_messages_storage_with_sohm(
             self.storage.as_ref(),
             self.superblock.offset_size,
             self.superblock.length_size,
+            |heap_id, message_type| self.resolve_sohm_message(heap_id, message_type),
         )?;
         let arc = Arc::new(hdr);
         let mut cache = self.header_cache.lock();
         cache.insert(addr, Arc::clone(&arc));
         Ok(arc)
+    }
+
+    fn resolve_sohm_message(
+        &self,
+        heap_id: &[u8],
+        message_type: u16,
+    ) -> Result<Option<HdfMessage>> {
+        let Some(table) = self.sohm_table()? else {
+            return Ok(None);
+        };
+        table.resolve_heap_message(
+            heap_id,
+            message_type,
+            self.storage.as_ref(),
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )
+    }
+
+    fn sohm_table(&self) -> Result<Option<SharedMessageTableRef>> {
+        let cached = self
+            .sohm_table
+            .get_or_init(|| self.load_sohm_table().map_err(|err| err.to_string()));
+        match cached {
+            Ok(table) => Ok(table.clone()),
+            Err(message) => Err(Error::InvalidData(format!(
+                "failed to load SOHM table: {message}"
+            ))),
+        }
+    }
+
+    fn load_sohm_table(&self) -> Result<Option<SharedMessageTableRef>> {
+        let Some(extension_address) = self.superblock.extension_address else {
+            return Ok(None);
+        };
+        let extension = ObjectHeader::parse_at_storage(
+            self.storage.as_ref(),
+            extension_address,
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )?;
+
+        let shared_table = extension.messages.iter().find_map(|message| match message {
+            HdfMessage::SharedTable(table) => Some(table),
+            _ => None,
+        });
+        let Some(shared_table) = shared_table else {
+            return Ok(None);
+        };
+
+        let table = crate::shared_message_table::SharedMessageTable::parse_at_storage(
+            self.storage.as_ref(),
+            shared_table.table_address,
+            shared_table.num_indices,
+            self.superblock.offset_size,
+        )?;
+        Ok(Some(Arc::new(table)))
+    }
+
+    pub(crate) fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>> {
+        if let Some(storage) = self.external_file_cache.lock().get(filename).cloned() {
+            return Ok(Some(storage));
+        }
+
+        let Some(resolver) = self.external_file_resolver.as_ref() else {
+            return Ok(None);
+        };
+        let Some(storage) = resolver.resolve_external_file(filename)? else {
+            return Ok(None);
+        };
+        self.external_file_cache
+            .lock()
+            .insert(filename.to_string(), storage.clone());
+        Ok(Some(storage))
     }
 }
 
@@ -159,6 +333,8 @@ impl Hdf5File {
             options.chunk_cache_slots,
         ));
         let registry = options.filter_registry.unwrap_or_default();
+        let external_file_resolver = options.external_file_resolver;
+        let external_link_resolver = options.external_link_resolver;
 
         Ok(Hdf5File {
             context: Arc::new(FileContext {
@@ -168,6 +344,10 @@ impl Hdf5File {
                 header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 filter_registry: Arc::new(registry),
+                external_file_resolver,
+                external_link_resolver,
+                external_file_cache: parking_lot::Mutex::new(HashMap::new()),
+                sohm_table: OnceLock::new(),
                 full_file_cache: OnceLock::new(),
             }),
         })
@@ -180,6 +360,16 @@ impl Hdf5File {
 
     /// Open an HDF5 file with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let mut options = options;
+        if options.external_file_resolver.is_none() {
+            let base_dir = path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            options.external_file_resolver =
+                Some(Arc::new(FilesystemExternalFileResolver::new(base_dir)));
+        }
         Self::from_storage_with_options(Arc::new(FileStorage::open(path)?), options)
     }
 
@@ -284,10 +474,12 @@ impl Hdf5File {
         let dataset = group
             .dataset(parts[parts.len() - 1])
             .map_err(|e| e.with_context(path))?;
-        self.context
-            .dataset_path_cache
-            .lock()
-            .insert(normalized_path, dataset.template());
+        if Arc::ptr_eq(&dataset.context, &self.context) {
+            self.context
+                .dataset_path_cache
+                .lock()
+                .insert(normalized_path, dataset.template());
+        }
         Ok(dataset)
     }
 
@@ -324,5 +516,20 @@ mod tests {
         let data = b"this is not an HDF5 file";
         let result = Hdf5File::from_bytes(data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn filesystem_external_file_resolver_reads_relative_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+        let storage = resolver
+            .resolve_external_file("raw.bin")
+            .unwrap()
+            .expect("raw file should resolve");
+        let bytes = storage.read_range(2, 3).unwrap();
+        assert_eq!(bytes.as_ref(), b"cde");
     }
 }

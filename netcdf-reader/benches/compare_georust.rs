@@ -1521,6 +1521,7 @@ fn bench_read_full_internal_parallel_nocache(c: &mut Criterion) {
                 chunk_cache_bytes: 0,
                 chunk_cache_slots: 1,
                 filter_registry: None,
+                ..Default::default()
             },
         )
         .unwrap();
