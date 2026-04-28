@@ -8,7 +8,7 @@
 //!
 //! Priority follows CF Conventions Table 1: axis > standard_name > units > positive.
 
-use crate::types::NcVariable;
+use crate::types::{NcDimension, NcGroup, NcVariable};
 
 /// The axis role of a coordinate variable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +23,17 @@ pub enum CfAxisType {
     Z,
     /// Cannot be determined.
     Unknown,
+}
+
+/// A discovered CF axis backed by a NetCDF coordinate variable.
+#[derive(Debug, Clone, Copy)]
+pub struct CfCoordinateAxis<'a> {
+    /// The coordinate variable carrying the CF axis metadata.
+    pub variable: &'a NcVariable,
+    /// The dimension represented by the coordinate variable.
+    pub dimension: &'a NcDimension,
+    /// The inferred CF axis type.
+    pub axis_type: CfAxisType,
 }
 
 /// Identify the CF axis type of a variable.
@@ -120,10 +131,51 @@ pub fn identify_axis(var: &NcVariable) -> CfAxisType {
     CfAxisType::Unknown
 }
 
+/// Discover CF axes from coordinate variables in a group.
+///
+/// Only true coordinate variables are considered: one-dimensional variables
+/// whose name matches their dimension name. Variables whose axis role cannot
+/// be inferred are omitted.
+pub fn discover_coordinate_axes(group: &NcGroup) -> Vec<CfCoordinateAxis<'_>> {
+    group
+        .coordinate_variables()
+        .filter_map(discover_axis_for_coordinate_variable)
+        .collect()
+}
+
+/// Discover CF axes used by a data variable from its coordinate variables.
+///
+/// The returned axes follow the variable's dimension order and are resolved
+/// through the containing group.
+pub fn discover_variable_axes<'a>(
+    var: &NcVariable,
+    group: &'a NcGroup,
+) -> Vec<CfCoordinateAxis<'a>> {
+    var.dimensions()
+        .iter()
+        .filter_map(|dim| group.coordinate_variable(&dim.name))
+        .filter_map(discover_axis_for_coordinate_variable)
+        .collect()
+}
+
+fn discover_axis_for_coordinate_variable(var: &NcVariable) -> Option<CfCoordinateAxis<'_>> {
+    let dimension = var.coordinate_dimension()?;
+    let axis_type = identify_axis(var);
+    if axis_type == CfAxisType::Unknown {
+        return None;
+    }
+
+    Some(CfCoordinateAxis {
+        variable: var,
+        dimension,
+        axis_type,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{NcAttrValue, NcAttribute, NcType, NcVariable};
+    use crate::types::{NcAttrValue, NcAttribute, NcDimension, NcType, NcVariable};
 
     fn make_var(attrs: Vec<NcAttribute>) -> NcVariable {
         NcVariable {
@@ -135,6 +187,35 @@ mod tests {
             _data_size: 0,
             is_record_var: false,
             record_size: 0,
+        }
+    }
+
+    fn make_coordinate_var(
+        name: &str,
+        size: u64,
+        dtype: NcType,
+        attrs: Vec<NcAttribute>,
+    ) -> NcVariable {
+        NcVariable {
+            name: name.into(),
+            dimensions: vec![NcDimension {
+                name: name.into(),
+                size,
+                is_unlimited: false,
+            }],
+            dtype,
+            attributes: attrs,
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 0,
+        }
+    }
+
+    fn attr(name: &str, value: &str) -> NcAttribute {
+        NcAttribute {
+            name: name.into(),
+            value: NcAttrValue::Chars(value.into()),
         }
     }
 
@@ -212,5 +293,127 @@ mod tests {
             },
         ]);
         assert_eq!(identify_axis(&var), CfAxisType::X);
+    }
+
+    #[test]
+    fn test_discover_coordinate_axes_from_group() {
+        let time = make_coordinate_var(
+            "time",
+            4,
+            NcType::Double,
+            vec![attr("units", "hours since 2000-01-01")],
+        );
+        let lat = make_coordinate_var(
+            "lat",
+            6,
+            NcType::Double,
+            vec![attr("units", "degrees_north")],
+        );
+        let lon = make_coordinate_var(
+            "lon",
+            12,
+            NcType::Double,
+            vec![attr("units", "degrees_east")],
+        );
+        let station = NcVariable {
+            name: "station".into(),
+            dimensions: vec![NcDimension {
+                name: "obs".into(),
+                size: 4,
+                is_unlimited: false,
+            }],
+            dtype: NcType::Int,
+            attributes: vec![attr("axis", "X")],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 0,
+        };
+        let group = crate::types::NcGroup {
+            name: "/".into(),
+            dimensions: vec![
+                time.dimensions()[0].clone(),
+                lat.dimensions()[0].clone(),
+                lon.dimensions()[0].clone(),
+            ],
+            variables: vec![time, lat, lon, station],
+            attributes: vec![],
+            groups: vec![],
+        };
+
+        let axes = discover_coordinate_axes(&group);
+        let discovered: Vec<(&str, CfAxisType)> = axes
+            .iter()
+            .map(|axis| (axis.variable.name(), axis.axis_type))
+            .collect();
+        assert_eq!(
+            discovered,
+            vec![
+                ("time", CfAxisType::T),
+                ("lat", CfAxisType::Y),
+                ("lon", CfAxisType::X)
+            ]
+        );
+    }
+
+    #[test]
+    fn test_discover_variable_axes_follows_dimension_order() {
+        let time = make_coordinate_var(
+            "time",
+            4,
+            NcType::Double,
+            vec![attr("units", "hours since 2000-01-01")],
+        );
+        let lat = make_coordinate_var(
+            "lat",
+            6,
+            NcType::Double,
+            vec![attr("units", "degrees_north")],
+        );
+        let lon = make_coordinate_var(
+            "lon",
+            12,
+            NcType::Double,
+            vec![attr("units", "degrees_east")],
+        );
+        let temperature = NcVariable {
+            name: "temperature".into(),
+            dimensions: vec![
+                time.dimensions()[0].clone(),
+                lat.dimensions()[0].clone(),
+                lon.dimensions()[0].clone(),
+            ],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 0,
+        };
+        let group = crate::types::NcGroup {
+            name: "/".into(),
+            dimensions: vec![
+                time.dimensions()[0].clone(),
+                lat.dimensions()[0].clone(),
+                lon.dimensions()[0].clone(),
+            ],
+            variables: vec![lon, time, lat, temperature.clone()],
+            attributes: vec![],
+            groups: vec![],
+        };
+
+        let axes = discover_variable_axes(&temperature, &group);
+        let discovered: Vec<(&str, CfAxisType)> = axes
+            .iter()
+            .map(|axis| (axis.dimension.name.as_str(), axis.axis_type))
+            .collect();
+        assert_eq!(
+            discovered,
+            vec![
+                ("time", CfAxisType::T),
+                ("lat", CfAxisType::Y),
+                ("lon", CfAxisType::X)
+            ]
+        );
     }
 }

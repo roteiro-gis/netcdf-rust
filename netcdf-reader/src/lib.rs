@@ -138,6 +138,15 @@ fn read_magic_prefix(reader: &mut impl Read) -> std::io::Result<([u8; 8], usize)
     Ok((magic, read_len))
 }
 
+#[cfg(feature = "cf")]
+fn parent_group_path(path: &str) -> &str {
+    let trimmed = path.trim_matches('/');
+    trimmed
+        .rsplit_once('/')
+        .map(|(group_path, _)| group_path)
+        .unwrap_or("")
+}
+
 impl NcFile {
     /// Open a NetCDF file from a path.
     ///
@@ -314,6 +323,46 @@ impl NcFile {
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.dimension(name),
         }
+    }
+
+    /// Find the coordinate variable for a dimension name or path.
+    pub fn coordinate_variable(&self, name: &str) -> Result<&NcVariable> {
+        self.root_group()?
+            .coordinate_variable(name)
+            .ok_or_else(|| Error::VariableNotFound(format!("coordinate variable for {name}")))
+    }
+
+    /// Discover CF axes from coordinate variables in a group.
+    #[cfg(feature = "cf")]
+    pub fn cf_coordinate_axes(&self, group_path: &str) -> Result<Vec<cf::CfCoordinateAxis<'_>>> {
+        let group = self.group(group_path)?;
+        Ok(cf::discover_coordinate_axes(group))
+    }
+
+    /// Discover CF axes used by a variable from its coordinate variables.
+    #[cfg(feature = "cf")]
+    pub fn cf_variable_axes(&self, name: &str) -> Result<Vec<cf::CfCoordinateAxis<'_>>> {
+        let variable = self.variable(name)?;
+        let group = self.group(parent_group_path(name))?;
+        Ok(cf::discover_variable_axes(variable, group))
+    }
+
+    /// Discover CF time coordinate variables in a group.
+    #[cfg(feature = "cf")]
+    pub fn cf_time_coordinates(&self, group_path: &str) -> Result<Vec<cf::CfTimeCoordinate<'_>>> {
+        let group = self.group(group_path)?;
+        cf::discover_time_coordinates(group)
+    }
+
+    /// Discover the CF time coordinate used by a variable, if one exists.
+    #[cfg(feature = "cf")]
+    pub fn cf_variable_time_coordinate(
+        &self,
+        name: &str,
+    ) -> Result<Option<cf::CfTimeCoordinate<'_>>> {
+        let variable = self.variable(name)?;
+        let group = self.group(parent_group_path(name))?;
+        cf::discover_variable_time_coordinate(variable, group)
     }
 
     /// Find a group attribute by name or path relative to the root group.

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Added coordinate-variable metadata helpers and CF discovery APIs for coordinate axes and time coordinates, including NetCDF-4 dimension-scale coordinate variables.
+
 ## 0.3.0 - 2026-04-16
 
 - Added range-backed open APIs in `hdf5-reader` and `netcdf-reader`, including `from_storage`/`from_storage_with_options`, plus public `Storage`/`DynStorage` reexports for custom backends.
