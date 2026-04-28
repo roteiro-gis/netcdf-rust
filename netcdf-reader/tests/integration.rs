@@ -74,6 +74,44 @@ fn create_nc4_coordinate_variable_fixture(path: &Path) {
     }
 }
 
+#[cfg(all(feature = "netcdf4", feature = "cf"))]
+fn create_nc4_cf_coordinate_variable_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("time", 2).unwrap();
+    file.add_dimension("lat", 3).unwrap();
+    {
+        let mut time = file.add_variable::<f64>("time", &["time"]).unwrap();
+        time.put_attribute("units", "hours since 2000-01-01 00:00:00")
+            .unwrap();
+        time.put_attribute("calendar", "standard").unwrap();
+    }
+    {
+        let mut lat = file.add_variable::<f64>("lat", &["lat"]).unwrap();
+        lat.put_attribute("units", "degrees_north").unwrap();
+    }
+    {
+        let mut temp = file
+            .add_variable::<f32>("temperature", &["time", "lat"])
+            .unwrap();
+        temp.put_attribute("units", "K").unwrap();
+    }
+    file.enddef().unwrap();
+
+    {
+        let mut time = file.variable_mut("time").unwrap();
+        time.put_values(&[0.0_f64, 24.0], (..,)).unwrap();
+    }
+    {
+        let mut lat = file.variable_mut("lat").unwrap();
+        lat.put_values(&[-45.0_f64, 0.0, 45.0], (..,)).unwrap();
+    }
+    {
+        let mut temp = file.variable_mut("temperature").unwrap();
+        temp.put_values(&[270.0_f32, 271.0, 272.0, 273.0, 274.0, 275.0], (.., ..))
+            .unwrap();
+    }
+}
+
 #[cfg(feature = "netcdf4")]
 fn create_nc4_dimension_only_fixture(path: &Path) {
     let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
@@ -286,6 +324,62 @@ fn test_nc4_coordinate_dimension_scale_is_variable_metadata() {
     let names: Vec<&str> = file.variables().unwrap().iter().map(|v| v.name()).collect();
     assert!(names.contains(&"lat"));
     assert!(names.contains(&"temp"));
+}
+
+#[cfg(all(feature = "netcdf4", feature = "cf"))]
+#[test]
+fn test_nc4_coordinate_variables_drive_cf_axis_and_time_discovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("cf_coordinate_variable.nc");
+    create_nc4_cf_coordinate_variable_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    assert!(file.variable("time").unwrap().is_coordinate_variable());
+    assert_eq!(file.coordinate_variable("lat").unwrap().name(), "lat");
+
+    let mut axes: Vec<(&str, netcdf_reader::cf::CfAxisType)> = file
+        .cf_coordinate_axes("")
+        .unwrap()
+        .iter()
+        .map(|axis| (axis.variable.name(), axis.axis_type))
+        .collect();
+    axes.sort_by(|left, right| left.0.cmp(right.0));
+    assert_eq!(
+        axes,
+        vec![
+            ("lat", netcdf_reader::cf::CfAxisType::Y),
+            ("time", netcdf_reader::cf::CfAxisType::T)
+        ]
+    );
+
+    let variable_axes: Vec<netcdf_reader::cf::CfAxisType> = file
+        .cf_variable_axes("temperature")
+        .unwrap()
+        .iter()
+        .map(|axis| axis.axis_type)
+        .collect();
+    assert_eq!(
+        variable_axes,
+        vec![
+            netcdf_reader::cf::CfAxisType::T,
+            netcdf_reader::cf::CfAxisType::Y
+        ]
+    );
+
+    let time = file
+        .cf_variable_time_coordinate("temperature")
+        .unwrap()
+        .unwrap();
+    assert_eq!(time.variable.name(), "time");
+    assert_eq!(time.time_ref.unit, netcdf_reader::cf::CfTimeUnit::Hours);
+
+    let raw = file.read_variable_as_f64("time").unwrap();
+    let values: Vec<f64> = raw.iter().copied().collect();
+    let decoded = netcdf_reader::cf::decode_time_coordinate_values(time.variable, &values)
+        .unwrap()
+        .unwrap();
+    assert_eq!(decoded[0].format("%Y-%m-%d").to_string(), "2000-01-01");
+    assert_eq!(decoded[1].format("%Y-%m-%d").to_string(), "2000-01-02");
 }
 
 #[cfg(feature = "netcdf4")]

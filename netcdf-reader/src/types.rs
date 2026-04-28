@@ -214,6 +214,30 @@ impl NcVariable {
         &self.dimensions
     }
 
+    /// Returns the dimension for a CF/NetCDF coordinate variable.
+    ///
+    /// A coordinate variable is one-dimensional and has the same name as its
+    /// dimension. NetCDF-4 stores these as HDF5 dimension scales, but they are
+    /// exposed here with the same shape as classic NetCDF coordinate variables.
+    pub fn coordinate_dimension(&self) -> Option<&NcDimension> {
+        match self.dimensions.as_slice() {
+            [dim] if dim.name == self.name => Some(dim),
+            _ => None,
+        }
+    }
+
+    /// Returns true when this variable is a CF/NetCDF coordinate variable.
+    pub fn is_coordinate_variable(&self) -> bool {
+        self.coordinate_dimension().is_some()
+    }
+
+    /// Returns true when this variable is the coordinate variable for a named
+    /// dimension.
+    pub fn is_coordinate_variable_for(&self, dimension_name: &str) -> bool {
+        self.coordinate_dimension()
+            .is_some_and(|dim| dim.name == dimension_name)
+    }
+
     /// Variable data type.
     pub fn dtype(&self) -> &NcType {
         &self.dtype
@@ -275,6 +299,26 @@ impl NcGroup {
         let (group_path, dimension_name) = split_parent_path(name)?;
         let group = self.group(group_path)?;
         group.dimensions.iter().find(|d| d.name == dimension_name)
+    }
+
+    /// Find the coordinate variable for a dimension in this group.
+    ///
+    /// `name` may be a local dimension name or a path relative to this group,
+    /// for example `time` or `forecast/time`.
+    pub fn coordinate_variable(&self, name: &str) -> Option<&NcVariable> {
+        let (group_path, dimension_name) = split_parent_path(name)?;
+        let group = self.group(group_path)?;
+        group
+            .variables
+            .iter()
+            .find(|var| var.is_coordinate_variable_for(dimension_name))
+    }
+
+    /// Iterate over coordinate variables declared in this group.
+    pub fn coordinate_variables(&self) -> impl Iterator<Item = &NcVariable> {
+        self.variables
+            .iter()
+            .filter(|var| var.is_coordinate_variable())
     }
 
     /// Find an attribute by name in this group.
@@ -496,6 +540,55 @@ mod tests {
                 .unwrap(),
             "hPa"
         );
+    }
+
+    #[test]
+    fn test_coordinate_variable_detection_and_lookup() {
+        let time_dim = NcDimension {
+            name: "time".to_string(),
+            size: 3,
+            is_unlimited: false,
+        };
+        let lat_dim = NcDimension {
+            name: "lat".to_string(),
+            size: 2,
+            is_unlimited: false,
+        };
+        let time = NcVariable {
+            name: "time".to_string(),
+            dimensions: vec![time_dim.clone()],
+            dtype: NcType::Double,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 8,
+        };
+        let temperature = NcVariable {
+            name: "temperature".to_string(),
+            dimensions: vec![time_dim.clone(), lat_dim.clone()],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 4,
+        };
+        let group = NcGroup {
+            name: "/".to_string(),
+            dimensions: vec![time_dim, lat_dim],
+            variables: vec![time.clone(), temperature],
+            attributes: vec![],
+            groups: vec![],
+        };
+
+        assert!(time.is_coordinate_variable());
+        assert_eq!(time.coordinate_dimension().unwrap().name, "time");
+        assert_eq!(group.coordinate_variable("time").unwrap().name(), "time");
+        assert!(group.coordinate_variable("lat").is_none());
+
+        let names: Vec<&str> = group.coordinate_variables().map(NcVariable::name).collect();
+        assert_eq!(names, vec!["time"]);
     }
 
     #[test]

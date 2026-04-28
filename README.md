@@ -106,6 +106,7 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Unified typed reads across formats
 - Unified string reads for classic char arrays and NetCDF-4 string variables
 - Type promotion to `f64`, unpacking, masking, and combined CF helpers
+- Coordinate-variable lookup plus CF axis/time discovery when `cf` is enabled
 - Slice reads, lazy slice iteration, and parallel NC4 slice reads
 - Cache and filter configuration through `NcOpenOptions`, including in-memory and storage-backed opens
 
