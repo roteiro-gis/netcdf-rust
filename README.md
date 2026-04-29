@@ -1,5 +1,10 @@
 # netcdf-rust
 
+[![hdf5-reader crates.io](https://img.shields.io/crates/v/hdf5-reader.svg)](https://crates.io/crates/hdf5-reader)
+[![hdf5-reader docs.rs](https://docs.rs/hdf5-reader/badge.svg)](https://docs.rs/hdf5-reader)
+[![netcdf-reader crates.io](https://img.shields.io/crates/v/netcdf-reader.svg)](https://crates.io/crates/netcdf-reader)
+[![netcdf-reader docs.rs](https://docs.rs/netcdf-reader/badge.svg)](https://docs.rs/netcdf-reader)
+
 Pure-Rust, read-only decoders for HDF5 and NetCDF. No C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
 
 ## Crates
