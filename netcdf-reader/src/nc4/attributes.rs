@@ -11,7 +11,7 @@
 //! - `NAME`: dimension scale name
 
 use hdf5_reader::group::Group;
-use hdf5_reader::messages::datatype::Datatype;
+use hdf5_reader::messages::datatype::{Datatype, VarLenKind};
 
 use crate::error::{Error, Result};
 use crate::types::{NcAttrValue, NcAttribute};
@@ -142,16 +142,19 @@ fn convert_attribute_value(
                 read_attr(attr.read_strings().map(NcAttrValue::Strings))
             }
         }
-        Datatype::VarLen { base }
-            if attr.num_elements() == 1
-                && matches!(
-                    base.as_ref(),
-                    Datatype::FixedPoint {
-                        size: 1,
-                        signed: false,
-                        ..
-                    }
-                ) =>
+        Datatype::VarLen {
+            base,
+            kind: VarLenKind::String,
+            ..
+        } if attr.num_elements() == 1
+            && matches!(
+                base.as_ref(),
+                Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    ..
+                }
+            ) =>
         {
             read_attr(attr.read_string().map(NcAttrValue::Chars))
         }

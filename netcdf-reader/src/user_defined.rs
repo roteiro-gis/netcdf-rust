@@ -1,6 +1,6 @@
 //! Decoders for NetCDF-4 user-defined data values.
 
-use hdf5_reader::{ByteOrder, Dataset, Datatype, StringPadding, StringSize};
+use hdf5_reader::{ByteOrder, Dataset, Datatype, StringPadding, StringSize, VarLenKind};
 use ndarray::{ArrayD, IxDyn};
 
 use crate::error::{Error, Result};
@@ -260,7 +260,14 @@ impl<'a> NcValueView<'a> {
     /// Decode a non-string vlen value into owned values.
     pub fn vlen_values(&self) -> Result<Vec<NcValue>> {
         match self.dtype {
-            Datatype::VarLen { base } => decode_vlen_values(self.dataset, base, self.bytes),
+            Datatype::VarLen {
+                kind: VarLenKind::String,
+                ..
+            } => Err(Error::TypeMismatch {
+                expected: "non-string vlen value".to_string(),
+                actual: format!("{:?}", self.dtype),
+            }),
+            Datatype::VarLen { base, .. } => decode_vlen_values(self.dataset, base, self.bytes),
             other => Err(Error::TypeMismatch {
                 expected: "vlen value".to_string(),
                 actual: format!("{other:?}"),
@@ -399,7 +406,18 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
                 values,
             }))
         }
-        Datatype::VarLen { base } => Ok(NcValue::VLen(decode_vlen_values(dataset, base, bytes)?)),
+        Datatype::VarLen {
+            base,
+            kind: VarLenKind::String,
+            padding,
+            ..
+        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) => {
+            let raw = dataset.resolve_vlen_reference_bytes(bytes, 1)?;
+            Ok(NcValue::String(decode_string_bytes(&raw, *padding)?))
+        }
+        Datatype::VarLen { base, .. } => {
+            Ok(NcValue::VLen(decode_vlen_values(dataset, base, bytes)?))
+        }
         other => Err(Error::InvalidData(format!(
             "unsupported NetCDF-4 user-defined datatype: {other:?}"
         ))),

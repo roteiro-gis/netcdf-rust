@@ -4,7 +4,7 @@ use crate::messages::datatype::Datatype;
 // Re-export types from the datatype message module so users don't need to
 // reach into messages::datatype.
 pub use crate::messages::datatype::{
-    CompoundField, EnumMember, ReferenceType, StringEncoding, StringPadding, StringSize,
+    CompoundField, EnumMember, ReferenceType, StringEncoding, StringPadding, StringSize, VarLenKind,
 };
 
 /// Trait for types that can be read from HDF5 datasets.

@@ -57,7 +57,7 @@ use dataset::DatasetTemplate;
 pub use dataset::{Dataset, SliceInfo, SliceInfoElem};
 pub use datatype_api::{
     dtype_element_size, CompoundField, EnumMember, H5Type, ReferenceType, StringEncoding,
-    StringPadding, StringSize,
+    StringPadding, StringSize, VarLenKind,
 };
 pub use error::ByteOrder;
 pub use filters::FilterRegistry;

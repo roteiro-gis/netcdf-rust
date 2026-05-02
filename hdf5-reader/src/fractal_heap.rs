@@ -8,6 +8,9 @@
 //! This module parses the heap header and provides object extraction for
 //! managed, tiny, and unfiltered huge object IDs.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
@@ -75,6 +78,37 @@ pub struct FractalHeap {
     pub io_filter_mask: Option<u32>,
     /// Encoded filter pipeline for heap blocks/huge objects.
     pub io_filter_info: Vec<u8>,
+}
+
+/// Cache of verified direct blocks for repeated object lookups in one heap.
+#[derive(Debug, Default)]
+pub struct FractalHeapDirectBlockCache {
+    blocks: HashMap<(u64, u64), Arc<Vec<u8>>>,
+}
+
+impl FractalHeapDirectBlockCache {
+    fn get_verified_block_storage(
+        &mut self,
+        heap: &FractalHeap,
+        block_address: u64,
+        block_size: u64,
+        storage: &dyn Storage,
+        offset_size: u8,
+    ) -> Result<Arc<Vec<u8>>> {
+        let key = (block_address, block_size);
+        if let Some(block) = self.blocks.get(&key) {
+            return Ok(block.clone());
+        }
+
+        let size = usize::try_from(block_size).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        let block = storage.read_range(block_address, size)?.to_vec();
+        heap.verify_direct_block_bytes(&block, offset_size)?;
+        let block = Arc::new(block);
+        self.blocks.insert(key, block.clone());
+        Ok(block)
+    }
 }
 
 impl FractalHeap {
@@ -240,10 +274,27 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Vec<u8>> {
+        let mut cache = FractalHeapDirectBlockCache::default();
+        self.get_object_storage_cached(heap_id, storage, offset_size, length_size, &mut cache)
+    }
+
+    /// Extract any fractal heap object from storage, reusing verified direct
+    /// blocks across managed object lookups.
+    pub fn get_object_storage_cached(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+        direct_block_cache: &mut FractalHeapDirectBlockCache,
+    ) -> Result<Vec<u8>> {
         match self.heap_id_kind(heap_id)? {
-            HeapIdKind::Managed => {
-                self.get_managed_object_storage_impl(heap_id, storage, offset_size)
-            }
+            HeapIdKind::Managed => self.get_managed_object_storage_cached_impl(
+                heap_id,
+                storage,
+                offset_size,
+                direct_block_cache,
+            ),
             HeapIdKind::Huge => {
                 self.get_huge_object_storage(heap_id, storage, offset_size, length_size)
             }
@@ -311,11 +362,12 @@ impl FractalHeap {
         Ok(file_data[data_start..data_end].to_vec())
     }
 
-    fn get_managed_object_storage_impl(
+    fn get_managed_object_storage_cached_impl(
         &self,
         heap_id: &[u8],
         storage: &dyn Storage,
         offset_size: u8,
+        direct_block_cache: &mut FractalHeapDirectBlockCache,
     ) -> Result<Vec<u8>> {
         if self.io_filters_len > 0 {
             return Err(Error::Other(
@@ -330,15 +382,37 @@ impl FractalHeap {
 
         let (block_address, block_offset_in_heap, block_size) =
             self.find_direct_block_storage(heap_offset, storage, offset_size)?;
-        self.verify_direct_block_storage(block_address, block_size, storage, offset_size)?;
-        let offset_in_block = heap_offset - block_offset_in_heap;
-        let data_start = block_address
-            .checked_add(offset_in_block)
-            .ok_or(Error::OffsetOutOfBounds(block_address))?;
+        let block = direct_block_cache.get_verified_block_storage(
+            self,
+            block_address,
+            block_size,
+            storage,
+            offset_size,
+        )?;
+        let offset_in_block = heap_offset
+            .checked_sub(block_offset_in_heap)
+            .ok_or_else(|| {
+                Error::InvalidData("fractal heap object precedes direct block".into())
+            })?;
+        let start = usize::try_from(offset_in_block)
+            .map_err(|_| Error::InvalidData("fractal heap object offset exceeds usize".into()))?;
         let len = usize::try_from(obj_length).map_err(|_| {
             Error::InvalidData("fractal heap object exceeds platform usize capacity".into())
         })?;
-        Ok(storage.read_range(data_start, len)?.to_vec())
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::OffsetOutOfBounds(block_address))?;
+        if end > block.len() {
+            let data_start = block_address
+                .checked_add(offset_in_block)
+                .ok_or(Error::OffsetOutOfBounds(block_address))?;
+            return Err(Error::UnexpectedEof {
+                offset: data_start,
+                needed: obj_length,
+                available: block.len().saturating_sub(start) as u64,
+            });
+        }
+        Ok(block[start..end].to_vec())
     }
 
     fn get_huge_object(
@@ -834,20 +908,6 @@ impl FractalHeap {
         self.verify_direct_block_bytes(&file_data[start..end], offset_size)
     }
 
-    fn verify_direct_block_storage(
-        &self,
-        block_address: u64,
-        block_size: u64,
-        storage: &dyn Storage,
-        offset_size: u8,
-    ) -> Result<()> {
-        let block_size = usize::try_from(block_size).map_err(|_| {
-            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
-        })?;
-        let block = storage.read_range(block_address, block_size)?;
-        self.verify_direct_block_bytes(block.as_ref(), offset_size)
-    }
-
     fn verify_direct_block_bytes(&self, block: &[u8], offset_size: u8) -> Result<()> {
         if block.len() < self.direct_block_header_size(offset_size) {
             return Err(Error::InvalidData(format!(
@@ -914,6 +974,8 @@ fn bytes_needed_to_encode(value: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{Storage, StorageBuffer};
+    use std::sync::{Arc, Mutex};
 
     fn base_heap() -> FractalHeap {
         FractalHeap {
@@ -942,6 +1004,33 @@ mod tests {
             io_filter_size: None,
             io_filter_mask: None,
             io_filter_info: Vec::new(),
+        }
+    }
+
+    struct CountingStorage {
+        data: Vec<u8>,
+        reads: Arc<Mutex<Vec<(u64, usize)>>>,
+    }
+
+    impl Storage for CountingStorage {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
+            self.reads.lock().unwrap().push((offset, len));
+            let start = usize::try_from(offset).map_err(|_| Error::OffsetOutOfBounds(offset))?;
+            let end = start
+                .checked_add(len)
+                .ok_or(Error::OffsetOutOfBounds(offset))?;
+            if end > self.data.len() {
+                return Err(Error::UnexpectedEof {
+                    offset,
+                    needed: len as u64,
+                    available: self.len().saturating_sub(offset),
+                });
+            }
+            Ok(StorageBuffer::from_vec(self.data[start..end].to_vec()))
         }
     }
 
@@ -1112,5 +1201,89 @@ mod tests {
             .get_managed_object(&heap_id, &file_data, offset_size, 8)
             .unwrap();
         assert_eq!(result, obj_data);
+    }
+
+    #[test]
+    fn test_get_object_storage_cached_reads_direct_block_once() {
+        let offset_size: u8 = 8;
+        let max_heap_size: u16 = 16;
+        let starting_block_size: u64 = 256;
+        let db_header_size = 19usize;
+        let block_address: u64 = 1000;
+
+        let heap = FractalHeap {
+            heap_id_len: 8,
+            io_filters_len: 0,
+            flags: 0x02,
+            max_managed_object_size: 128,
+            next_huge_id: 0,
+            btree_huge_objects_address: u64::MAX,
+            free_space_managed_address: 0,
+            managed_space_amount: starting_block_size,
+            managed_alloc_amount: starting_block_size,
+            managed_iter_offset: 0,
+            managed_objects_count: 2,
+            huge_objects_size: 0,
+            huge_objects_count: 0,
+            tiny_objects_size: 0,
+            tiny_objects_count: 0,
+            table_width: 4,
+            starting_block_size,
+            max_direct_block_size: 4096,
+            max_heap_size,
+            starting_row_root_indirect: 0,
+            root_block_address: block_address,
+            current_rows_in_root_indirect: 0,
+            io_filter_size: None,
+            io_filter_mask: None,
+            io_filter_info: Vec::new(),
+        };
+
+        let file_size = block_address as usize + starting_block_size as usize;
+        let mut file_data = vec![0u8; file_size];
+        let ba = block_address as usize;
+        file_data[ba..ba + 4].copy_from_slice(b"FHDB");
+        file_data[ba + 4] = 0;
+
+        let obj1_offset = db_header_size;
+        let obj2_offset = db_header_size + 16;
+        file_data[ba + obj1_offset..ba + obj1_offset + 4].copy_from_slice(b"one!");
+        file_data[ba + obj2_offset..ba + obj2_offset + 4].copy_from_slice(b"two!");
+
+        let checksum_pos = ba + db_header_size - 4;
+        let mut checksum_data = file_data[ba..ba + starting_block_size as usize].to_vec();
+        checksum_data[checksum_pos - ba..checksum_pos - ba + 4].fill(0);
+        let checksum = jenkins_lookup3(&checksum_data);
+        file_data[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let storage = CountingStorage {
+            data: file_data,
+            reads: reads.clone(),
+        };
+        let mut cache = FractalHeapDirectBlockCache::default();
+        let heap_id1 = [0x00, obj1_offset as u8, 0x00, 0x04];
+        let heap_id2 = [0x00, obj2_offset as u8, 0x00, 0x04];
+
+        assert_eq!(
+            heap.get_object_storage_cached(&heap_id1, &storage, offset_size, 8, &mut cache)
+                .unwrap(),
+            b"one!"
+        );
+        assert_eq!(
+            heap.get_object_storage_cached(&heap_id2, &storage, offset_size, 8, &mut cache)
+                .unwrap(),
+            b"two!"
+        );
+
+        let direct_block_reads = reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(offset, len)| {
+                offset == block_address && len == starting_block_size as usize
+            })
+            .count();
+        assert_eq!(direct_block_reads, 1);
     }
 }

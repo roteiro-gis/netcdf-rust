@@ -5,7 +5,7 @@ use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::attribute_info::AttributeInfoMessage;
 use crate::messages::dataspace::DataspaceType;
-use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringSize};
+use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringSize, VarLenKind};
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
 use crate::storage::Storage;
@@ -38,17 +38,18 @@ impl Attribute {
             DataspaceType::Null => vec![0],
             DataspaceType::Simple => msg.dataspace.dims.clone(),
         };
-        let raw_data =
-            if let (Some(file_data), Datatype::VarLen { base }) = (file_data, &msg.datatype) {
-                if is_byte_vlen(base) && shape.is_empty() {
-                    resolve_vlen_bytes(&msg.raw_data, file_data, offset_size)
-                        .unwrap_or_else(|| msg.raw_data.clone())
-                } else {
-                    msg.raw_data.clone()
-                }
+        let raw_data = if let (Some(file_data), Datatype::VarLen { base, kind, .. }) =
+            (file_data, &msg.datatype)
+        {
+            if *kind == VarLenKind::String && is_byte_vlen(base) && shape.is_empty() {
+                resolve_vlen_bytes(&msg.raw_data, file_data, offset_size)
+                    .unwrap_or_else(|| msg.raw_data.clone())
             } else {
                 msg.raw_data.clone()
-            };
+            }
+        } else {
+            msg.raw_data.clone()
+        };
         Attribute {
             name: msg.name,
             datatype: msg.datatype,
@@ -97,9 +98,11 @@ impl Attribute {
     /// and offset_size — this method will return an error directing you there.
     pub fn read_string(&self) -> Result<String> {
         match &self.datatype {
-            Datatype::VarLen { base } if is_byte_vlen(base) => {
-                decode_varlen_byte_string(&self.raw_data)
-            }
+            Datatype::VarLen {
+                base,
+                kind: VarLenKind::String,
+                ..
+            } if is_byte_vlen(base) => decode_varlen_byte_string(&self.raw_data),
             Datatype::String {
                 size,
                 encoding,
@@ -750,6 +753,9 @@ mod tests {
                     signed: false,
                     byte_order: ByteOrder::LittleEndian,
                 }),
+                kind: VarLenKind::String,
+                encoding: StringEncoding::Utf8,
+                padding: StringPadding::NullTerminate,
             },
             shape: vec![],
             raw_data: b"test_dataset".to_vec(),
