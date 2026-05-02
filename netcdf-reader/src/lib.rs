@@ -26,6 +26,8 @@ pub mod unpack;
 
 #[cfg(feature = "netcdf4")]
 pub mod nc4;
+#[cfg(feature = "netcdf4")]
+pub mod user_defined;
 
 #[cfg(feature = "cf")]
 pub mod cf;
@@ -36,6 +38,10 @@ pub use hdf5_reader::storage::DynStorage;
 #[cfg(feature = "netcdf4")]
 pub use hdf5_reader::{BytesStorage, FileStorage, MmapStorage, Storage, StorageBuffer};
 pub use types::*;
+#[cfg(feature = "netcdf4")]
+pub use user_defined::{
+    NcArrayValue, NcCompoundFieldView, NcCompoundValueField, NcEnumValue, NcValue, NcValueView,
+};
 
 use std::fs::File;
 use std::io::Read;
@@ -464,6 +470,41 @@ impl NcFile {
             NcFileInner::Classic(c) => c.read_variable_as_strings(name),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => n.read_variable_as_strings(name),
+        }
+    }
+
+    /// Read a NetCDF-4 user-defined variable into dynamic values.
+    ///
+    /// This supports enum, opaque, compound, fixed-size array, and non-string
+    /// vlen datatypes. Primitive values nested inside those types are decoded
+    /// according to the HDF5 datatype byte order.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_user_defined(&self, name: &str) -> Result<ArrayD<NcValue>> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 user-defined variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => n.read_variable_user_defined(name),
+        }
+    }
+
+    /// Read a NetCDF-4 user-defined variable through a caller-provided decoder.
+    ///
+    /// The decoder receives one [`NcValueView`] per logical variable element,
+    /// allowing direct construction of application structs without allocating
+    /// an intermediate [`NcValue`] tree.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_user_defined_with<T, F>(&self, name: &str, decoder: F) -> Result<ArrayD<T>>
+    where
+        F: FnMut(NcValueView<'_>) -> Result<T>,
+    {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 user-defined variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => n.read_variable_user_defined_with(name, decoder),
         }
     }
 

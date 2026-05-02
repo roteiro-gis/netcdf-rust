@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added NetCDF-4 user-defined type read APIs for enum, opaque, compound,
+  fixed-size array, and non-string vlen variables, with both dynamic `NcValue`
+  decoding and custom borrowed `NcValueView` decoders.
+- Fixed dense-group fractal heap handling for generated NetCDF-4 files that
+  store committed user-defined types alongside variables.
+
 ## 0.4.0 - 2026-04-28
 
 - Added coordinate-variable metadata helpers and CF discovery APIs for coordinate axes and time coordinates, including NetCDF-4 dimension-scale coordinate variables.

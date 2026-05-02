@@ -14,6 +14,56 @@ pub struct NcCompoundField {
     pub dtype: NcType,
 }
 
+/// A typed integer value used by NetCDF-4 enum definitions and values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NcIntegerValue {
+    I8(i8),
+    U8(u8),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+}
+
+impl NcIntegerValue {
+    /// Return the value as `i128` when it is lossless for the signed domain.
+    pub fn as_i128(self) -> Option<i128> {
+        match self {
+            NcIntegerValue::I8(value) => Some(value as i128),
+            NcIntegerValue::U8(value) => Some(value as i128),
+            NcIntegerValue::I16(value) => Some(value as i128),
+            NcIntegerValue::U16(value) => Some(value as i128),
+            NcIntegerValue::I32(value) => Some(value as i128),
+            NcIntegerValue::U32(value) => Some(value as i128),
+            NcIntegerValue::I64(value) => Some(value as i128),
+            NcIntegerValue::U64(value) => Some(i128::from(value)),
+        }
+    }
+
+    /// Return the value as `u128` when it is non-negative.
+    pub fn as_u128(self) -> Option<u128> {
+        match self {
+            NcIntegerValue::I8(value) => u128::try_from(value).ok(),
+            NcIntegerValue::U8(value) => Some(value as u128),
+            NcIntegerValue::I16(value) => u128::try_from(value).ok(),
+            NcIntegerValue::U16(value) => Some(value as u128),
+            NcIntegerValue::I32(value) => u128::try_from(value).ok(),
+            NcIntegerValue::U32(value) => Some(value as u128),
+            NcIntegerValue::I64(value) => u128::try_from(value).ok(),
+            NcIntegerValue::U64(value) => Some(value as u128),
+        }
+    }
+}
+
+/// A named member of a NetCDF-4 enum type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NcEnumMember {
+    pub name: String,
+    pub value: NcIntegerValue,
+}
+
 /// NetCDF data types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NcType {
@@ -41,6 +91,11 @@ pub enum NcType {
     UInt64,
     /// NetCDF-4 only (variable-length string)
     String,
+    /// NetCDF-4 enum type with an integer base type.
+    Enum {
+        base: Box<NcType>,
+        members: Vec<NcEnumMember>,
+    },
     /// NetCDF-4 compound type (struct with named fields).
     Compound {
         size: u32,
@@ -64,6 +119,7 @@ impl NcType {
             NcType::Int64 | NcType::UInt64 | NcType::Double => 8,
             // Variable-length string; no fixed element size, but pointer-sized in memory.
             NcType::String => std::mem::size_of::<usize>(),
+            NcType::Enum { base, .. } => base.size(),
             NcType::Compound { size, .. } => *size as usize,
             NcType::Opaque { size, .. } => *size as usize,
             NcType::Array { base, dims } => {
@@ -89,6 +145,7 @@ impl NcType {
             NcType::UInt64 => Some(11),
             // Extended types are not valid in classic format.
             NcType::String
+            | NcType::Enum { .. }
             | NcType::Compound { .. }
             | NcType::Opaque { .. }
             | NcType::Array { .. }

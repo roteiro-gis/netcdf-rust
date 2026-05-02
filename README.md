@@ -35,6 +35,9 @@ let data = file.read_variable_as_f64("temperature")?;
 // String variables (classic char arrays and NetCDF-4 NC_STRING)
 let names = file.read_variable_as_strings("station_name")?;
 
+// NetCDF-4 user-defined variables (enum, opaque, compound, array, vlen)
+let quality = file.read_variable_user_defined("quality")?;
+
 // CF conventions: unpack packed integer data (scale_factor + add_offset)
 let unpacked = file.read_variable_unpacked("temperature")?;
 
@@ -111,6 +114,8 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Automatic format detection
 - Unified typed reads across formats
 - Unified string reads for classic char arrays and NetCDF-4 string variables
+- NetCDF-4 user-defined reads for enum, opaque, compound, fixed-size array,
+  and non-string vlen variables, including custom borrowed decoders
 - Type promotion to `f64`, unpacking, masking, and combined CF helpers
 - Coordinate-variable lookup plus CF axis/time discovery when `cf` is enabled
 - Exact CF time decoding for standard, proleptic Gregorian, noleap, all_leap,
