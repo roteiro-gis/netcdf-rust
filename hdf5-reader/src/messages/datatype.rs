@@ -49,6 +49,17 @@ pub enum StringPadding {
     SpacePad,
 }
 
+/// HDF5 variable-length datatype flavor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarLenKind {
+    /// Variable-length sequence of values.
+    Sequence,
+    /// Variable-length string.
+    String,
+    /// Unknown HDF5 vlen kind; retained for metadata fidelity.
+    Unknown(u8),
+}
+
 /// A field within a compound datatype.
 #[derive(Debug, Clone)]
 pub struct CompoundField {
@@ -103,7 +114,12 @@ pub enum Datatype {
         members: Vec<EnumMember>,
     },
     /// Variable-length sequence or string (class 9).
-    VarLen { base: Box<Datatype> },
+    VarLen {
+        base: Box<Datatype>,
+        kind: VarLenKind,
+        encoding: StringEncoding,
+        padding: StringPadding,
+    },
     /// Opaque blob (class 5).
     Opaque { size: u32, tag: String },
     /// Object or region reference (class 7).
@@ -247,19 +263,10 @@ fn parse_time(cursor: &mut Cursor<'_>, size: u32) -> Result<Datatype> {
 
 fn parse_string(flags: u32, size: u32) -> Result<Datatype> {
     // Bits 0-3: padding type
-    let padding = match flags & 0x0F {
-        0 => StringPadding::NullTerminate,
-        1 => StringPadding::NullPad,
-        2 => StringPadding::SpacePad,
-        _ => StringPadding::NullTerminate,
-    };
+    let padding = string_padding_from_bits(flags & 0x0F);
 
     // Bits 4-7: character set
-    let encoding = match (flags >> 4) & 0x0F {
-        0 => StringEncoding::Ascii,
-        1 => StringEncoding::Utf8,
-        _ => StringEncoding::Ascii,
-    };
+    let encoding = string_encoding_from_bits((flags >> 4) & 0x0F);
 
     // No additional property bytes for string class.
 
@@ -444,18 +451,42 @@ fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Datatype
 
 fn parse_varlen(cursor: &mut Cursor<'_>, flags: u32, _size: u32) -> Result<Datatype> {
     // Bits 0-3: type (0 = sequence, 1 = string)
-    let _vlen_type = flags & 0x0F;
+    let kind = match flags & 0x0F {
+        0 => VarLenKind::Sequence,
+        1 => VarLenKind::String,
+        other => VarLenKind::Unknown(other as u8),
+    };
     // Bits 4-7: padding type (for strings)
-    let _padding = (flags >> 4) & 0x0F;
+    let padding = string_padding_from_bits((flags >> 4) & 0x0F);
     // Bits 8-11: character set (for strings)
-    let _charset = (flags >> 8) & 0x0F;
+    let encoding = string_encoding_from_bits((flags >> 8) & 0x0F);
 
     // Base type follows
     let (base_dt, _base_size) = parse_datatype_description(cursor)?;
 
     Ok(Datatype::VarLen {
         base: Box::new(base_dt),
+        kind,
+        encoding,
+        padding,
     })
+}
+
+fn string_padding_from_bits(bits: u32) -> StringPadding {
+    match bits {
+        0 => StringPadding::NullTerminate,
+        1 => StringPadding::NullPad,
+        2 => StringPadding::SpacePad,
+        _ => StringPadding::NullTerminate,
+    }
+}
+
+fn string_encoding_from_bits(bits: u32) -> StringEncoding {
+    match bits {
+        0 => StringEncoding::Ascii,
+        1 => StringEncoding::Utf8,
+        _ => StringEncoding::Ascii,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -665,6 +696,71 @@ mod tests {
                 assert_eq!(*padding, StringPadding::SpacePad);
             }
             other => panic!("expected String, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_varlen_string_preserves_flags() {
+        let mut data = Vec::new();
+        // class=9, version=1, flags: kind=string, padding=space-pad, charset=utf8
+        let flags: u32 = 0x01 | (0x02 << 4) | (0x01 << 8);
+        data.extend_from_slice(&class_word(9, 1, flags).to_le_bytes());
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&class_word(0, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&8u16.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, data.len()).unwrap();
+        match &msg.datatype {
+            Datatype::VarLen {
+                base,
+                kind,
+                encoding,
+                padding,
+            } => {
+                assert_eq!(*kind, VarLenKind::String);
+                assert_eq!(*encoding, StringEncoding::Utf8);
+                assert_eq!(*padding, StringPadding::SpacePad);
+                assert!(matches!(
+                    base.as_ref(),
+                    Datatype::FixedPoint {
+                        size: 1,
+                        signed: false,
+                        byte_order: ByteOrder::LittleEndian
+                    }
+                ));
+            }
+            other => panic!("expected VarLen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_varlen_sequence_preserves_kind() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&class_word(9, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&class_word(0, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&32u16.to_le_bytes());
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, data.len()).unwrap();
+        match &msg.datatype {
+            Datatype::VarLen { kind, base, .. } => {
+                assert_eq!(*kind, VarLenKind::Sequence);
+                assert!(matches!(
+                    base.as_ref(),
+                    Datatype::FixedPoint {
+                        size: 4,
+                        signed: false,
+                        byte_order: ByteOrder::LittleEndian
+                    }
+                ));
+            }
+            other => panic!("expected VarLen, got {:?}", other),
         }
     }
 

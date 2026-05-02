@@ -20,12 +20,12 @@
 //! | Compound { .. }               | Compound |
 //! | Opaque { .. }                 | Opaque   |
 //! | Array { base, dims }          | Array    |
-//! | VarLen { base=u8 }            | String*  |
+//! | VarLen { kind=String, base=u8 } | String*  |
 //! | VarLen { base }               | VLen     |
 //!
 //! * Some NetCDF-4 string variables are stored as HDF5 vlen bytes.
 
-use hdf5_reader::messages::datatype::Datatype;
+use hdf5_reader::messages::datatype::{Datatype, VarLenKind};
 use hdf5_reader::ByteOrder;
 
 use crate::error::{Error, Result};
@@ -94,19 +94,12 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
                 dims: dims.clone(),
             })
         }
-        Datatype::VarLen { base }
-            if matches!(
-                base.as_ref(),
-                Datatype::FixedPoint {
-                    size: 1,
-                    signed: false,
-                    ..
-                }
-            ) =>
-        {
-            Ok(NcType::String)
-        }
-        Datatype::VarLen { base } => {
+        Datatype::VarLen {
+            base,
+            kind: VarLenKind::String,
+            ..
+        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) => Ok(NcType::String),
+        Datatype::VarLen { base, .. } => {
             let base_nc = hdf5_to_nc_type(base)?;
             Ok(NcType::VLen {
                 base: Box::new(base_nc),
@@ -267,9 +260,33 @@ mod tests {
                     signed: false,
                     byte_order: bo,
                 }),
+                kind: VarLenKind::String,
+                encoding: hdf5_reader::StringEncoding::Utf8,
+                padding: hdf5_reader::StringPadding::NullTerminate,
             })
             .unwrap(),
             NcType::String
+        );
+    }
+
+    #[test]
+    fn test_sequence_varlen_u8_maps_to_vlen() {
+        let bo = ByteOrder::LittleEndian;
+        assert_eq!(
+            hdf5_to_nc_type(&Datatype::VarLen {
+                base: Box::new(Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    byte_order: bo,
+                }),
+                kind: VarLenKind::Sequence,
+                encoding: hdf5_reader::StringEncoding::Ascii,
+                padding: hdf5_reader::StringPadding::NullTerminate,
+            })
+            .unwrap(),
+            NcType::VLen {
+                base: Box::new(NcType::UByte)
+            }
         );
     }
 }

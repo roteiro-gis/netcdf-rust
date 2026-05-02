@@ -7,9 +7,10 @@ use crate::btree_v1;
 use crate::btree_v2;
 use crate::dataset::Dataset;
 use crate::error::{Error, Result};
-use crate::fractal_heap::FractalHeap;
+use crate::fractal_heap::{FractalHeap, FractalHeapDirectBlockCache};
 use crate::io::Cursor;
 use crate::local_heap::LocalHeap;
+use crate::messages::datatype::VarLenKind;
 use crate::messages::link::{self, LinkMessage, LinkTarget};
 use crate::messages::link_info::LinkInfoMessage;
 use crate::messages::symbol_table_msg::SymbolTableMessage;
@@ -206,11 +207,14 @@ impl Group {
         .into_iter()
         .map(|attr| {
             let raw_data = match &attr.datatype {
-                crate::messages::datatype::Datatype::VarLen { base }
-                    if matches!(
-                        base.as_ref(),
-                        crate::messages::datatype::Datatype::FixedPoint { size: 1, .. }
-                    ) && attr.dataspace.num_elements() == 1 =>
+                crate::messages::datatype::Datatype::VarLen {
+                    base,
+                    kind: VarLenKind::String,
+                    ..
+                } if matches!(
+                    base.as_ref(),
+                    crate::messages::datatype::Datatype::FixedPoint { size: 1, .. }
+                ) && attr.dataspace.num_elements() == 1 =>
                 {
                     resolve_vlen_bytes_storage(
                         &attr.raw_data,
@@ -556,6 +560,7 @@ impl Group {
         )?;
 
         let mut children = Vec::new();
+        let mut direct_block_cache = FractalHeapDirectBlockCache::default();
         for record in &records {
             let heap_id = match record {
                 btree_v2::BTreeV2Record::LinkNameHash { heap_id, .. }
@@ -563,11 +568,12 @@ impl Group {
                 _ => continue,
             };
 
-            let managed_bytes = heap.get_object_storage(
+            let managed_bytes = heap.get_object_storage_cached(
                 heap_id,
                 self.context.storage.as_ref(),
                 self.offset_size(),
                 self.length_size(),
+                &mut direct_block_cache,
             )?;
 
             let mut link_cursor = Cursor::new(&managed_bytes);

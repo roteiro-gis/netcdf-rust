@@ -10,8 +10,8 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::attribute_api::{
-    collect_attribute_messages_storage, decode_string, decode_varlen_byte_string,
-    read_one_vlen_string_storage, resolve_vlen_bytes_storage, Attribute,
+    collect_attribute_messages_storage, decode_string, read_one_vlen_string_storage,
+    resolve_vlen_bytes_storage, Attribute,
 };
 use crate::cache::{ChunkCache, ChunkKey};
 use crate::chunk_index;
@@ -22,7 +22,7 @@ use crate::io::Cursor;
 use crate::local_heap::LocalHeap;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::dataspace::{DataspaceMessage, DataspaceType};
-use crate::messages::datatype::{Datatype, StringSize};
+use crate::messages::datatype::{Datatype, StringSize, VarLenKind};
 use crate::messages::external_files::ExternalFilesMessage;
 use crate::messages::fill_value::{FillTime, FillValueMessage};
 use crate::messages::filter_pipeline::FilterPipelineMessage;
@@ -893,7 +893,12 @@ impl Dataset {
                 }
                 Ok(strings)
             }
-            Datatype::VarLen { base } => {
+            Datatype::VarLen {
+                base,
+                kind: VarLenKind::String,
+                encoding,
+                padding,
+            } => {
                 if !matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) {
                     return Err(Error::TypeMismatch {
                         expected: "String dataset".into(),
@@ -926,7 +931,7 @@ impl Dataset {
                         self.length_size(),
                     )
                     .unwrap_or_default();
-                    strings.push(decode_varlen_byte_string(&value)?);
+                    strings.push(decode_string(&value, *padding, *encoding)?);
                 }
                 Ok(strings)
             }
@@ -1070,7 +1075,7 @@ impl Dataset {
     /// decoding, external raw-data resolution, and fill-value materialization.
     /// Numeric values remain in the dataset datatype's byte order.
     pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
@@ -1093,6 +1098,14 @@ impl Dataset {
     /// Size in bytes of one HDF5 variable-length reference in this file.
     pub fn vlen_reference_size(&self) -> usize {
         4 + self.offset_size() as usize + 4
+    }
+
+    /// Size in bytes of one logical raw element in this file.
+    ///
+    /// Variable-length strings and sequences are stored as global-heap
+    /// references whose width depends on the file offset size.
+    pub fn raw_element_size(&self) -> usize {
+        raw_element_size_for_datatype(&self.datatype, self.vlen_reference_size())
     }
 
     /// Resolve one HDF5 variable-length reference into logical element bytes.
@@ -1322,7 +1335,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
@@ -1487,7 +1500,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
 
         if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
@@ -1567,7 +1580,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
@@ -2721,9 +2734,12 @@ impl Dataset {
 
 fn attribute_from_message_storage(message: &AttributeMessage, context: &FileContext) -> Attribute {
     let raw_data = match &message.datatype {
-        Datatype::VarLen { base }
-            if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. })
-                && message.dataspace.num_elements() == 1 =>
+        Datatype::VarLen {
+            base,
+            kind: VarLenKind::String,
+            ..
+        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. })
+            && message.dataspace.num_elements() == 1 =>
         {
             resolve_vlen_bytes_storage(
                 &message.raw_data,
@@ -2769,6 +2785,31 @@ fn normalize_layout(layout: DataLayout, dataspace: &DataspaceMessage) -> DataLay
             }
         }
         other => other,
+    }
+}
+
+fn raw_element_size_for_datatype(dtype: &Datatype, vlen_reference_size: usize) -> usize {
+    match dtype {
+        Datatype::String {
+            size: StringSize::Variable,
+            ..
+        }
+        | Datatype::VarLen { .. } => vlen_reference_size,
+        Datatype::Array { base, dims } => {
+            let base_size = raw_element_size_for_datatype(base, vlen_reference_size);
+            let count: u64 = dims.iter().product();
+            base_size * count as usize
+        }
+        Datatype::Enum { base, .. } => raw_element_size_for_datatype(base, vlen_reference_size),
+        Datatype::FixedPoint { size, .. }
+        | Datatype::FloatingPoint { size, .. }
+        | Datatype::Bitfield { size, .. }
+        | Datatype::Reference { size, .. } => *size as usize,
+        Datatype::String {
+            size: StringSize::Fixed(len),
+            ..
+        } => *len as usize,
+        Datatype::Compound { size, .. } | Datatype::Opaque { size, .. } => *size as usize,
     }
 }
 
@@ -3419,6 +3460,32 @@ mod tests {
     fn test_slice_info_all() {
         let s = SliceInfo::all(3);
         assert_eq!(s.selections.len(), 3);
+    }
+
+    #[test]
+    fn test_raw_element_size_uses_file_vlen_reference_width() {
+        let dtype = Datatype::VarLen {
+            base: Box::new(Datatype::FixedPoint {
+                size: 1,
+                signed: false,
+                byte_order: crate::error::ByteOrder::LittleEndian,
+            }),
+            kind: VarLenKind::Sequence,
+            encoding: crate::messages::datatype::StringEncoding::Ascii,
+            padding: crate::messages::datatype::StringPadding::NullTerminate,
+        };
+
+        assert_eq!(raw_element_size_for_datatype(&dtype, 12), 12);
+        assert_eq!(
+            raw_element_size_for_datatype(
+                &Datatype::Array {
+                    base: Box::new(dtype),
+                    dims: vec![2, 3],
+                },
+                12,
+            ),
+            72
+        );
     }
 
     #[test]
