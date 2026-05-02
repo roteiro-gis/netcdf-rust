@@ -16,20 +16,20 @@
 //! | FloatingPoint { size=4 }      | Float    |
 //! | FloatingPoint { size=8 }      | Double   |
 //! | String (any)                  | String   |
-//! | Enum { base=byte }            | Byte*    |
+//! | Enum { base=byte }            | Enum     |
 //! | Compound { .. }               | Compound |
 //! | Opaque { .. }                 | Opaque   |
 //! | Array { base, dims }          | Array    |
 //! | VarLen { base=u8 }            | String*  |
-//! | VarLen { base!=u8 }           | VLen     |
+//! | VarLen { base }               | VLen     |
 //!
-//! * Enums are mapped to their base integer type.
-//! * NetCDF-4 `NC_STRING` is stored as HDF5 variable-length bytes.
+//! * Some NetCDF-4 string variables are stored as HDF5 vlen bytes.
 
 use hdf5_reader::messages::datatype::Datatype;
+use hdf5_reader::ByteOrder;
 
 use crate::error::{Error, Result};
-use crate::types::{NcCompoundField, NcType};
+use crate::types::{NcCompoundField, NcEnumMember, NcIntegerValue, NcType};
 
 /// Map an HDF5 datatype to a NetCDF type.
 pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
@@ -57,10 +57,18 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
             ))),
         },
         Datatype::String { .. } => Ok(NcType::String),
-        Datatype::Enum { base, .. } => {
-            // Enums map to their base integer type.
-            hdf5_to_nc_type(base)
-        }
+        Datatype::Enum { base, members } => Ok(NcType::Enum {
+            base: Box::new(hdf5_to_nc_type(base)?),
+            members: members
+                .iter()
+                .map(|member| {
+                    Ok(NcEnumMember {
+                        name: member.name.clone(),
+                        value: decode_enum_integer(base, &member.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }),
         Datatype::Compound { size, fields } => {
             let mut nc_fields = Vec::with_capacity(fields.len());
             for f in fields {
@@ -107,6 +115,77 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
         _ => Err(Error::InvalidData(format!(
             "HDF5 datatype {:?} has no NetCDF-4 equivalent",
             dtype
+        ))),
+    }
+}
+
+pub(crate) fn decode_enum_integer(base: &Datatype, bytes: &[u8]) -> Result<NcIntegerValue> {
+    match base {
+        Datatype::FixedPoint {
+            size,
+            signed,
+            byte_order,
+        } => decode_fixed_point_integer(bytes, *size, *signed, *byte_order),
+        other => Err(Error::InvalidData(format!(
+            "NetCDF-4 enum base type must be integer, got {other:?}"
+        ))),
+    }
+}
+
+pub(crate) fn decode_fixed_point_integer(
+    bytes: &[u8],
+    size: u8,
+    signed: bool,
+    byte_order: ByteOrder,
+) -> Result<NcIntegerValue> {
+    fn read<const N: usize>(bytes: &[u8], byte_order: ByteOrder) -> Result<[u8; N]> {
+        if bytes.len() < N {
+            return Err(Error::InvalidData(format!(
+                "integer value too short: need {} bytes, have {}",
+                N,
+                bytes.len()
+            )));
+        }
+        let mut out = [0u8; N];
+        out.copy_from_slice(&bytes[..N]);
+        #[cfg(target_endian = "little")]
+        if byte_order == ByteOrder::BigEndian {
+            out.reverse();
+        }
+        #[cfg(target_endian = "big")]
+        if byte_order == ByteOrder::LittleEndian {
+            out.reverse();
+        }
+        Ok(out)
+    }
+
+    match (size, signed) {
+        (1, true) => Ok(NcIntegerValue::I8(i8::from_ne_bytes(read::<1>(
+            bytes, byte_order,
+        )?))),
+        (1, false) => Ok(NcIntegerValue::U8(u8::from_ne_bytes(read::<1>(
+            bytes, byte_order,
+        )?))),
+        (2, true) => Ok(NcIntegerValue::I16(i16::from_ne_bytes(read::<2>(
+            bytes, byte_order,
+        )?))),
+        (2, false) => Ok(NcIntegerValue::U16(u16::from_ne_bytes(read::<2>(
+            bytes, byte_order,
+        )?))),
+        (4, true) => Ok(NcIntegerValue::I32(i32::from_ne_bytes(read::<4>(
+            bytes, byte_order,
+        )?))),
+        (4, false) => Ok(NcIntegerValue::U32(u32::from_ne_bytes(read::<4>(
+            bytes, byte_order,
+        )?))),
+        (8, true) => Ok(NcIntegerValue::I64(i64::from_ne_bytes(read::<8>(
+            bytes, byte_order,
+        )?))),
+        (8, false) => Ok(NcIntegerValue::U64(u64::from_ne_bytes(read::<8>(
+            bytes, byte_order,
+        )?))),
+        _ => Err(Error::InvalidData(format!(
+            "unsupported NetCDF-4 enum integer size {size}"
         ))),
     }
 }

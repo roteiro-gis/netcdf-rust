@@ -1064,7 +1064,12 @@ impl Dataset {
         self.decode_raw_data::<T>(data)
     }
 
-    fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+    /// Read the dataset as logical element bytes.
+    ///
+    /// The returned bytes are after layout handling, chunk decompression, filter
+    /// decoding, external raw-data resolution, and fill-value materialization.
+    /// Numeric values remain in the dataset datatype's byte order.
+    pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
         let elem_size = dtype_element_size(&self.datatype);
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
@@ -1083,6 +1088,65 @@ impl Dataset {
         };
 
         result.map_err(|e| e.with_context(&self.name))
+    }
+
+    /// Size in bytes of one HDF5 variable-length reference in this file.
+    pub fn vlen_reference_size(&self) -> usize {
+        4 + self.offset_size() as usize + 4
+    }
+
+    /// Resolve one HDF5 variable-length reference into logical element bytes.
+    ///
+    /// `base_element_size` is the byte width of one value in the vlen sequence.
+    /// The sequence length stored in the reference is interpreted as an element
+    /// count and multiplied by this size.
+    pub fn resolve_vlen_reference_bytes(
+        &self,
+        reference: &[u8],
+        base_element_size: usize,
+    ) -> Result<Vec<u8>> {
+        if reference.len() < self.vlen_reference_size() {
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' vlen reference too short: need {} bytes, have {}",
+                self.name,
+                self.vlen_reference_size(),
+                reference.len()
+            )));
+        }
+
+        let mut cursor = Cursor::new(reference);
+        let seq_len = cursor.read_u32_le()? as usize;
+        let heap_addr = cursor.read_offset(self.offset_size())?;
+        let obj_index = cursor.read_u32_le()? as u16;
+
+        if Cursor::is_undefined_offset(heap_addr, self.offset_size()) || obj_index == 0 {
+            return Ok(Vec::new());
+        }
+
+        let expected_bytes =
+            checked_mul_usize(seq_len, base_element_size, "vlen sequence byte size")?;
+        let collection = crate::global_heap::GlobalHeapCollection::parse_at_storage(
+            self.context.storage.as_ref(),
+            heap_addr,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+        let object = collection.get_object(obj_index).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "dataset '{}' references missing vlen heap object {}",
+                self.name, obj_index
+            ))
+        })?;
+        if object.data.len() < expected_bytes {
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' vlen heap object too short: need {} bytes, have {}",
+                self.name,
+                expected_bytes,
+                object.data.len()
+            )));
+        }
+
+        Ok(object.data[..expected_bytes].to_vec())
     }
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {

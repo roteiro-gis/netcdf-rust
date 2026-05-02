@@ -458,6 +458,73 @@ fn max_internal_records(
     (available - extra) / entry_size
 }
 
+fn node_checksum_bounds(
+    cursor: &Cursor<'_>,
+    start: u64,
+    node_size: u32,
+    compact_end: u64,
+    context: &'static str,
+) -> Result<usize> {
+    let start = usize::try_from(start)
+        .map_err(|_| Error::InvalidData(format!("B-tree v2 {context} offset is too large")))?;
+    let node_size = usize::try_from(node_size)
+        .map_err(|_| Error::InvalidData(format!("B-tree v2 {context} size is too large")))?;
+    if node_size < 10 {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 {context} node is too small: {node_size} bytes"
+        )));
+    }
+
+    let checksum_pos = usize::try_from(compact_end)
+        .map_err(|_| Error::InvalidData(format!("B-tree v2 {context} checksum is too large")))?;
+    if checksum_pos < start {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 {context} payload starts before node"
+        )));
+    }
+    let node_end = start
+        .checked_add(node_size)
+        .ok_or_else(|| Error::InvalidData(format!("B-tree v2 {context} size overflow")))?;
+
+    if node_end > cursor.data().len() {
+        return Err(Error::UnexpectedEof {
+            offset: start as u64,
+            needed: node_size as u64,
+            available: cursor.data().len().saturating_sub(start) as u64,
+        });
+    }
+    let checksum_end = checksum_pos
+        .checked_add(4)
+        .ok_or_else(|| Error::InvalidData(format!("B-tree v2 {context} checksum overflow")))?;
+    if checksum_end > node_end {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 {context} contents exceed node size"
+        )));
+    }
+
+    Ok(checksum_pos)
+}
+
+fn verify_node_checksum(
+    cursor: &mut Cursor<'_>,
+    start: u64,
+    node_size: u32,
+    compact_end: u64,
+    context: &'static str,
+) -> Result<()> {
+    let checksum_pos = node_checksum_bounds(cursor, start, node_size, compact_end, context)?;
+    cursor.set_position(checksum_pos as u64);
+    let stored_checksum = cursor.read_u32_le()?;
+    let computed = jenkins_lookup3(&cursor.data()[start as usize..checksum_pos]);
+    if computed != stored_checksum {
+        return Err(Error::ChecksumMismatch {
+            expected: stored_checksum,
+            actual: computed,
+        });
+    }
+    Ok(())
+}
+
 /// Parse a leaf node and collect its records.
 #[allow(clippy::too_many_arguments)]
 fn parse_leaf_node(
@@ -509,16 +576,13 @@ fn parse_leaf_node(
         }
     }
 
-    // Verify checksum: covers signature through the end of records.
-    let checksum_data_end = cursor.position();
-    let stored_checksum = cursor.read_u32_le()?;
-    let computed = jenkins_lookup3(&cursor.data()[start as usize..checksum_data_end as usize]);
-    if computed != stored_checksum {
-        return Err(Error::ChecksumMismatch {
-            expected: stored_checksum,
-            actual: computed,
-        });
-    }
+    verify_node_checksum(
+        cursor,
+        start,
+        header.node_size,
+        cursor.position(),
+        "leaf node",
+    )?;
 
     Ok(())
 }
@@ -636,16 +700,14 @@ fn parse_internal_node(
         }
     }
 
-    // Verify checksum.
-    let checksum_data_end = cursor.position();
-    let stored_checksum = cursor.read_u32_le()?;
-    let computed = jenkins_lookup3(&cursor.data()[start as usize..checksum_data_end as usize]);
-    if computed != stored_checksum {
-        return Err(Error::ChecksumMismatch {
-            expected: stored_checksum,
-            actual: computed,
-        });
-    }
+    let compact_end = cursor.position();
+    verify_node_checksum(
+        &mut cursor,
+        start,
+        header.node_size,
+        compact_end,
+        "internal node",
+    )?;
 
     // The records from this internal node are NOT included in the leaf
     // collection — they are separators. We do NOT add them to results.
@@ -835,13 +897,10 @@ fn parse_leaf_node_storage(
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
-    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+    let node_len = usize::try_from(header.node_size).map_err(|_| {
         Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
     })?;
-    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
-        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
-    })?;
-    let node_bytes = storage.read_range(address, read_len)?;
+    let node_bytes = storage.read_range(address, node_len)?;
     let mut cursor = Cursor::new(node_bytes.as_ref());
     parse_leaf_node(
         &mut cursor,
@@ -872,13 +931,10 @@ fn parse_internal_node_storage(
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
-    let _node_len = usize::try_from(header.node_size).map_err(|_| {
+    let node_len = usize::try_from(header.node_size).map_err(|_| {
         Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
     })?;
-    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
-        Error::InvalidData("B-tree v2 node read exceeds platform usize capacity".into())
-    })?;
-    let node_bytes = storage.read_range(address, read_len)?;
+    let node_bytes = storage.read_range(address, node_len)?;
     let mut cursor = Cursor::new(node_bytes.as_ref());
     let start = cursor.position();
 
@@ -949,15 +1005,14 @@ fn parse_internal_node_storage(
         }
     }
 
-    let checksum_data_end = cursor.position();
-    let stored_checksum = cursor.read_u32_le()?;
-    let computed = jenkins_lookup3(&cursor.data()[start as usize..checksum_data_end as usize]);
-    if computed != stored_checksum {
-        return Err(Error::ChecksumMismatch {
-            expected: stored_checksum,
-            actual: computed,
-        });
-    }
+    let compact_end = cursor.position();
+    verify_node_checksum(
+        &mut cursor,
+        start,
+        header.node_size,
+        compact_end,
+        "internal node",
+    )?;
 
     records.extend(node_records);
 
@@ -1241,11 +1296,10 @@ mod tests {
         leaf.extend_from_slice(&0x11223344u32.to_le_bytes());
         leaf.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
 
-        // Checksum covers everything so far.
+        // The checksum covers the populated node payload. The node allocation
+        // may be larger and is padded after the checksum.
         let checksum = jenkins_lookup3(&leaf);
         leaf.extend_from_slice(&checksum.to_le_bytes());
-
-        // Pad to node_size (not strictly needed for parsing, but realistic).
         leaf.resize(node_size as usize, 0);
 
         let mut records = Vec::new();

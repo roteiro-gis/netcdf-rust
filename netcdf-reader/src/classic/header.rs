@@ -389,6 +389,7 @@ fn read_attr_values(
             Ok(NcAttrValue::UInt64s(values))
         }
         NcType::String
+        | NcType::Enum { .. }
         | NcType::Compound { .. }
         | NcType::Opaque { .. }
         | NcType::Array { .. }

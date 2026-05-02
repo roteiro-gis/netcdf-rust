@@ -89,7 +89,8 @@ impl FractalHeap {
     /// - Max managed object size (u32 LE)
     /// - Next huge object ID (`length_size` bytes)
     /// - B-tree address for huge objects (`offset_size` bytes)
-    /// - Free-space managed objects address (`length_size` bytes)
+    /// - Managed free-space amount (`length_size` bytes)
+    /// - Free-space manager address (`offset_size` bytes)
     /// - Managed space amount (`length_size` bytes)
     /// - Managed alloc amount (`length_size` bytes)
     /// - Managed free-space iterator offset (`length_size` bytes)
@@ -127,7 +128,8 @@ impl FractalHeap {
         let max_managed_object_size = cursor.read_u32_le()? as u64;
         let next_huge_id = cursor.read_length(length_size)?;
         let btree_huge_objects_address = cursor.read_offset(offset_size)?;
-        let free_space_managed_address = cursor.read_length(length_size)?;
+        let _managed_free_space_amount = cursor.read_length(length_size)?;
+        let free_space_managed_address = cursor.read_offset(offset_size)?;
         let managed_space_amount = cursor.read_length(length_size)?;
         let managed_alloc_amount = cursor.read_length(length_size)?;
         let managed_iter_offset = cursor.read_length(length_size)?;
@@ -291,11 +293,11 @@ impl FractalHeap {
             return Ok(Vec::new());
         }
 
-        let (block_address, block_offset_in_heap, _block_size) =
+        let (block_address, block_offset_in_heap, block_size) =
             self.find_direct_block(heap_offset, file_data, offset_size)?;
-        let db_header_size = self.direct_block_header_size(offset_size);
+        self.verify_direct_block(block_address, block_size, file_data, offset_size)?;
         let offset_in_block = heap_offset - block_offset_in_heap;
-        let data_start = block_address as usize + db_header_size + offset_in_block as usize;
+        let data_start = block_address as usize + offset_in_block as usize;
         let data_end = data_start + obj_length as usize;
 
         if data_end > file_data.len() {
@@ -326,15 +328,12 @@ impl FractalHeap {
             return Ok(Vec::new());
         }
 
-        let (block_address, block_offset_in_heap, _block_size) =
+        let (block_address, block_offset_in_heap, block_size) =
             self.find_direct_block_storage(heap_offset, storage, offset_size)?;
-        let db_header_size = self.direct_block_header_size(offset_size);
+        self.verify_direct_block_storage(block_address, block_size, storage, offset_size)?;
         let offset_in_block = heap_offset - block_offset_in_heap;
         let data_start = block_address
-            .checked_add(u64::try_from(db_header_size).map_err(|_| {
-                Error::InvalidData("fractal heap direct block header too large".into())
-            })?)
-            .and_then(|value| value.checked_add(offset_in_block))
+            .checked_add(offset_in_block)
             .ok_or(Error::OffsetOutOfBounds(block_address))?;
         let len = usize::try_from(obj_length).map_err(|_| {
             Error::InvalidData("fractal heap object exceeds platform usize capacity".into())
@@ -797,17 +796,91 @@ impl FractalHeap {
         rows
     }
 
-    /// Size in bytes of a direct block header (including checksum when present).
+    /// Size in bytes of an unfiltered direct block header.
     fn direct_block_header_size(&self, offset_size: u8) -> usize {
         // Signature(4) + Version(1) + Heap header address(offset_size) +
-        // Block offset within heap (max_heap_size bits, rounded up to bytes)
+        // Block offset within heap (max_heap_size bits, rounded up to bytes) +
+        // Checksum(4). Managed filtered heaps are rejected before this is used.
         let offset_bytes = (self.max_heap_size as usize).div_ceil(8);
-        let base = 4 + 1 + offset_size as usize + offset_bytes;
-        if (self.flags & 0x02) != 0 {
-            base + 4
-        } else {
-            base
+        4 + 1 + offset_size as usize + offset_bytes + 4
+    }
+
+    fn direct_block_checksum_pos(&self, offset_size: u8) -> usize {
+        self.direct_block_header_size(offset_size) - 4
+    }
+
+    fn verify_direct_block(
+        &self,
+        block_address: u64,
+        block_size: u64,
+        file_data: &[u8],
+        offset_size: u8,
+    ) -> Result<()> {
+        let start =
+            usize::try_from(block_address).map_err(|_| Error::OffsetOutOfBounds(block_address))?;
+        let block_size = usize::try_from(block_size).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        let end = start
+            .checked_add(block_size)
+            .ok_or(Error::OffsetOutOfBounds(block_address))?;
+        if end > file_data.len() {
+            return Err(Error::UnexpectedEof {
+                offset: block_address,
+                needed: block_size as u64,
+                available: file_data.len().saturating_sub(start) as u64,
+            });
         }
+        self.verify_direct_block_bytes(&file_data[start..end], offset_size)
+    }
+
+    fn verify_direct_block_storage(
+        &self,
+        block_address: u64,
+        block_size: u64,
+        storage: &dyn Storage,
+        offset_size: u8,
+    ) -> Result<()> {
+        let block_size = usize::try_from(block_size).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        let block = storage.read_range(block_address, block_size)?;
+        self.verify_direct_block_bytes(block.as_ref(), offset_size)
+    }
+
+    fn verify_direct_block_bytes(&self, block: &[u8], offset_size: u8) -> Result<()> {
+        if block.len() < self.direct_block_header_size(offset_size) {
+            return Err(Error::InvalidData(format!(
+                "fractal heap direct block has {} bytes, expected at least {}",
+                block.len(),
+                self.direct_block_header_size(offset_size)
+            )));
+        }
+        if block[..4] != _FHDB_SIGNATURE {
+            return Err(Error::InvalidData(
+                "invalid fractal heap direct block signature".into(),
+            ));
+        }
+        let version = block[4];
+        if version != 0 {
+            return Err(Error::UnsupportedFractalHeapVersion(version));
+        }
+        let checksum_pos = self.direct_block_checksum_pos(offset_size);
+        let stored_checksum = u32::from_le_bytes(
+            block[checksum_pos..checksum_pos + 4]
+                .try_into()
+                .expect("direct block checksum slice has four bytes"),
+        );
+        let mut checksum_data = block.to_vec();
+        checksum_data[checksum_pos..checksum_pos + 4].fill(0);
+        let computed = jenkins_lookup3(&checksum_data);
+        if computed != stored_checksum {
+            return Err(Error::ChecksumMismatch {
+                expected: stored_checksum,
+                actual: computed,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -961,7 +1034,6 @@ mod tests {
             io_filter_info: Vec::new(),
         };
 
-        // Flag bit 1 => checksum present.
         // sig(4) + ver(1) + addr(8) + offset_bytes(2) + checksum(4) = 19
         assert_eq!(heap.direct_block_header_size(8), 19);
 
@@ -1022,17 +1094,19 @@ mod tests {
                                // heap header address (8 bytes) — doesn't matter for this test
                                // block offset (2 bytes) — 0
 
-        // Write object data at offset 0 within the heap.
+        // Write object data at its direct-block offset, after the block header.
         let obj_data = b"test object data";
-        let obj_start = ba + db_header_size; // offset 0 within heap
+        let obj_start = ba + db_header_size;
         file_data[obj_start..obj_start + obj_data.len()].copy_from_slice(obj_data);
+        let checksum_pos = ba + db_header_size - 4;
+        let mut checksum_data = file_data[ba..ba + starting_block_size as usize].to_vec();
+        checksum_data[checksum_pos - ba..checksum_pos - ba + 4].fill(0);
+        let checksum = jenkins_lookup3(&checksum_data);
+        file_data[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
 
-        // Build heap ID for managed object at offset=0, length=16.
-        // Type nibble = 0, offset = 0 (16 bits), length = 16 (12 bits)
-        // offset_bits = 16, length_bits = (8*4 - 4) - 16 = 12
-        // Bit stream: 0000 | 0000_0000_0000_0000 | 0000_0001_0000
-        //           = 0x00, 0x00, 0x00, 0x10
-        let heap_id = [0x00, 0x00, 0x00, 0x10];
+        // Build heap ID for managed object at its direct-block offset, length=16.
+        // Type nibble = 0, offset = direct block header size (16 bits), length = 16.
+        let heap_id = [0x00, db_header_size as u8, 0x00, 0x10];
 
         let result = heap
             .get_managed_object(&heap_id, &file_data, offset_size, 8)

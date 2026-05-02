@@ -289,6 +289,26 @@ impl Nc4File {
         Ok(dataset.read_strings()?)
     }
 
+    /// Read a variable containing NetCDF-4 user-defined values.
+    pub fn read_variable_user_defined(
+        &self,
+        path: &str,
+    ) -> Result<ArrayD<crate::user_defined::NcValue>> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        crate::user_defined::read_dataset_values(&dataset)
+    }
+
+    /// Read a NetCDF-4 user-defined variable through a custom decoder.
+    pub fn read_variable_user_defined_with<T, F>(&self, path: &str, decoder: F) -> Result<ArrayD<T>>
+    where
+        F: FnMut(crate::user_defined::NcValueView<'_>) -> Result<T>,
+    {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        crate::user_defined::read_dataset_with_decoder(&dataset, decoder)
+    }
+
     #[cfg(feature = "rayon")]
     pub fn read_variable_parallel<T: H5Type>(&self, path: &str) -> Result<ArrayD<T>> {
         let normalized = normalize_dataset_path(path)?;

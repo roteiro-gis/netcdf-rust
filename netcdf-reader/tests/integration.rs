@@ -123,6 +123,156 @@ fn create_nc4_dimension_only_fixture(path: &Path) {
     temp.put_values(&[1.0_f32, 2.0, 3.0], (..,)).unwrap();
 }
 
+#[cfg(feature = "netcdf4")]
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct Quality(u8);
+
+#[cfg(feature = "netcdf4")]
+unsafe impl netcdf::types::NcTypeDescriptor for Quality {
+    fn type_descriptor() -> netcdf::types::NcVariableType {
+        netcdf::types::NcVariableType::Enum(netcdf::types::EnumType {
+            name: "quality_t".to_string(),
+            fieldnames: vec!["bad".to_string(), "good".to_string()],
+            fieldvalues: netcdf::types::EnumTypeValues::U8(vec![1, 2]),
+        })
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct Opaque4([u8; 4]);
+
+#[cfg(feature = "netcdf4")]
+unsafe impl netcdf::types::NcTypeDescriptor for Opaque4 {
+    fn type_descriptor() -> netcdf::types::NcVariableType {
+        netcdf::types::NcVariableType::Opaque(netcdf::types::OpaqueType {
+            name: "opaque4_t".to_string(),
+            size: 4,
+        })
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct Observation {
+    temp: f32,
+    quality: Quality,
+    samples: [i16; 3],
+}
+
+#[cfg(feature = "netcdf4")]
+unsafe impl netcdf::types::NcTypeDescriptor for Observation {
+    fn type_descriptor() -> netcdf::types::NcVariableType {
+        netcdf::types::NcVariableType::Compound(netcdf::types::CompoundType {
+            name: "observation_t".to_string(),
+            size: std::mem::size_of::<Observation>(),
+            fields: vec![
+                netcdf::types::CompoundTypeField {
+                    name: "temp".to_string(),
+                    basetype: <f32 as netcdf::types::NcTypeDescriptor>::type_descriptor(),
+                    arraydims: None,
+                    offset: std::mem::offset_of!(Observation, temp),
+                },
+                netcdf::types::CompoundTypeField {
+                    name: "quality".to_string(),
+                    basetype: <Quality as netcdf::types::NcTypeDescriptor>::type_descriptor(),
+                    arraydims: None,
+                    offset: std::mem::offset_of!(Observation, quality),
+                },
+                netcdf::types::CompoundTypeField {
+                    name: "samples".to_string(),
+                    basetype: <i16 as netcdf::types::NcTypeDescriptor>::type_descriptor(),
+                    arraydims: Some(vec![3]),
+                    offset: std::mem::offset_of!(Observation, samples),
+                },
+            ],
+        })
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct VLenI32 {
+    len: usize,
+    p: *const i32,
+}
+
+#[cfg(feature = "netcdf4")]
+unsafe impl netcdf::types::NcTypeDescriptor for VLenI32 {
+    fn type_descriptor() -> netcdf::types::NcVariableType {
+        netcdf::types::NcVariableType::Vlen(netcdf::types::VlenType {
+            name: "vlen_i32_t".to_string(),
+            basetype: Box::new(<i32 as netcdf::types::NcTypeDescriptor>::type_descriptor()),
+        })
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn create_nc4_user_defined_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("n", 2).unwrap();
+    file.add_type::<Quality>().unwrap();
+    file.add_type::<Opaque4>().unwrap();
+    file.add_type::<VLenI32>().unwrap();
+    file.add_type::<Observation>().unwrap();
+
+    file.add_variable::<Quality>("quality", &["n"]).unwrap();
+    file.add_variable::<Opaque4>("blob", &["n"]).unwrap();
+    file.add_variable::<Observation>("obs", &["n"]).unwrap();
+    file.add_variable::<VLenI32>("seq", &["n"]).unwrap();
+    file.enddef().unwrap();
+
+    file.variable_mut("quality")
+        .unwrap()
+        .put_values(&[Quality(2), Quality(1)], (..,))
+        .unwrap();
+    file.variable_mut("blob")
+        .unwrap()
+        .put_values(&[Opaque4([1, 2, 3, 4]), Opaque4([5, 6, 7, 8])], (..,))
+        .unwrap();
+    file.variable_mut("obs")
+        .unwrap()
+        .put_values(
+            &[
+                Observation {
+                    temp: 12.5,
+                    quality: Quality(2),
+                    samples: [10, 11, 12],
+                },
+                Observation {
+                    temp: 8.25,
+                    quality: Quality(1),
+                    samples: [-1, -2, -3],
+                },
+            ],
+            (..,),
+        )
+        .unwrap();
+
+    let seq0 = [1_i32, 2, 3];
+    let seq1 = [10_i32, 20];
+    file.variable_mut("seq")
+        .unwrap()
+        .put_values(
+            &[
+                VLenI32 {
+                    len: seq0.len(),
+                    p: seq0.as_ptr(),
+                },
+                VLenI32 {
+                    len: seq1.len(),
+                    p: seq1.as_ptr(),
+                },
+            ],
+            (..,),
+        )
+        .unwrap();
+}
+
 // ---- NetCDF-3 tests ----
 
 #[test]
@@ -162,7 +312,14 @@ fn test_cdf5_new_types() {
 #[test]
 fn test_record_vars() {
     let path = skip_if_missing!("netcdf3", "record_vars.nc");
-    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let file = netcdf_reader::NcFile::open_with_options(
+        &path,
+        netcdf_reader::NcOpenOptions {
+            metadata_mode: netcdf_reader::NcMetadataMode::Lossy,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let var = file.variable("series").unwrap();
     assert!(var.dimensions()[0].is_unlimited);
@@ -180,7 +337,14 @@ fn test_record_vars() {
 #[test]
 fn test_nc4_basic() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
-    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let file = netcdf_reader::NcFile::open_with_options(
+        &path,
+        netcdf_reader::NcOpenOptions {
+            metadata_mode: netcdf_reader::NcMetadataMode::Lossy,
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     assert!(matches!(
         file.format(),
@@ -587,6 +751,187 @@ fn test_nc4_string_variable_reads() {
 
     let err = file.read_variable_as_string("names").unwrap_err();
     assert!(matches!(err, netcdf_reader::Error::InvalidData(_)));
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_user_defined_variable_reads() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("user_defined.nc");
+    create_nc4_user_defined_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open_with_options(
+        &path,
+        netcdf_reader::NcOpenOptions {
+            metadata_mode: netcdf_reader::NcMetadataMode::Lossy,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let quality = file.variable("quality").unwrap();
+    match quality.dtype() {
+        netcdf_reader::NcType::Enum { base, members } => {
+            assert!(matches!(base.as_ref(), netcdf_reader::NcType::UByte));
+            assert_eq!(members[0].name, "bad");
+            assert_eq!(members[1].value, netcdf_reader::NcIntegerValue::U8(2));
+        }
+        other => panic!("expected enum dtype, got {other:?}"),
+    }
+
+    let quality_values = file.read_variable_user_defined("quality").unwrap();
+    assert_eq!(quality_values.shape(), &[2]);
+    match &quality_values.as_slice().unwrap()[0] {
+        netcdf_reader::NcValue::Enum(value) => {
+            assert_eq!(value.value, netcdf_reader::NcIntegerValue::U8(2));
+            assert_eq!(value.member.as_deref(), Some("good"));
+        }
+        other => panic!("expected enum value, got {other:?}"),
+    }
+
+    let blob_values = file.read_variable_user_defined("blob").unwrap();
+    assert_eq!(
+        blob_values.as_slice().unwrap()[1],
+        netcdf_reader::NcValue::Opaque(vec![5, 6, 7, 8])
+    );
+
+    let obs = file.variable("obs").unwrap();
+    match obs.dtype() {
+        netcdf_reader::NcType::Compound { fields, .. } => {
+            assert_eq!(fields.len(), 3);
+            assert_eq!(fields[2].name, "samples");
+            assert!(matches!(
+                fields[2].dtype,
+                netcdf_reader::NcType::Array { .. }
+            ));
+        }
+        other => panic!("expected compound dtype, got {other:?}"),
+    }
+
+    let obs_values = file.read_variable_user_defined("obs").unwrap();
+    match &obs_values.as_slice().unwrap()[0] {
+        netcdf_reader::NcValue::Compound(fields) => {
+            assert_eq!(fields[0].name, "temp");
+            assert_eq!(fields[0].value, netcdf_reader::NcValue::Float(12.5));
+            assert_eq!(fields[1].name, "quality");
+            match &fields[1].value {
+                netcdf_reader::NcValue::Enum(value) => {
+                    assert_eq!(value.member.as_deref(), Some("good"));
+                }
+                other => panic!("expected enum field, got {other:?}"),
+            }
+            match &fields[2].value {
+                netcdf_reader::NcValue::Array(array) => {
+                    assert_eq!(array.dims, vec![3]);
+                    assert_eq!(
+                        array.values,
+                        vec![
+                            netcdf_reader::NcValue::Short(10),
+                            netcdf_reader::NcValue::Short(11),
+                            netcdf_reader::NcValue::Short(12),
+                        ]
+                    );
+                }
+                other => panic!("expected array field, got {other:?}"),
+            }
+        }
+        other => panic!("expected compound value, got {other:?}"),
+    }
+
+    let seq = file.variable("seq").unwrap();
+    match seq.dtype() {
+        netcdf_reader::NcType::VLen { base } => {
+            assert!(matches!(base.as_ref(), netcdf_reader::NcType::Int));
+        }
+        other => panic!("expected vlen dtype, got {other:?}"),
+    }
+
+    let seq_values = file.read_variable_user_defined("seq").unwrap();
+    assert_eq!(seq_values.shape(), &[2]);
+    assert_eq!(
+        seq_values.as_slice().unwrap()[0],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Int(1),
+            netcdf_reader::NcValue::Int(2),
+            netcdf_reader::NcValue::Int(3),
+        ])
+    );
+    assert_eq!(
+        seq_values.as_slice().unwrap()[1],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Int(10),
+            netcdf_reader::NcValue::Int(20),
+        ])
+    );
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn test_nc4_user_defined_custom_decoder() {
+    #[derive(Debug, PartialEq)]
+    struct DecodedObservation {
+        temp: f32,
+        quality: String,
+        samples: Vec<i16>,
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("user_defined_decoder.nc");
+    create_nc4_user_defined_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open_with_options(
+        &path,
+        netcdf_reader::NcOpenOptions {
+            metadata_mode: netcdf_reader::NcMetadataMode::Lossy,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let decoded = file
+        .read_variable_user_defined_with("obs", |value| {
+            let temp = value.compound_field("temp")?.f32()?;
+            let quality = value
+                .compound_field("quality")?
+                .enum_value()?
+                .member
+                .ok_or_else(|| {
+                    netcdf_reader::Error::InvalidData("unknown quality enum value".to_string())
+                })?;
+            let samples = value
+                .compound_field("samples")?
+                .array_elements()?
+                .into_iter()
+                .map(|sample| match sample.integer()? {
+                    netcdf_reader::NcIntegerValue::I16(value) => Ok(value),
+                    other => Err(netcdf_reader::Error::TypeMismatch {
+                        expected: "i16 sample".to_string(),
+                        actual: format!("{other:?}"),
+                    }),
+                })
+                .collect::<netcdf_reader::Result<Vec<_>>>()?;
+            Ok(DecodedObservation {
+                temp,
+                quality,
+                samples,
+            })
+        })
+        .unwrap();
+
+    assert_eq!(
+        decoded.as_slice().unwrap(),
+        &[
+            DecodedObservation {
+                temp: 12.5,
+                quality: "good".to_string(),
+                samples: vec![10, 11, 12],
+            },
+            DecodedObservation {
+                temp: 8.25,
+                quality: "bad".to_string(),
+                samples: vec![-1, -2, -3],
+            },
+        ]
+    );
 }
 
 #[cfg(feature = "netcdf4")]
