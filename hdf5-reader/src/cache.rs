@@ -25,17 +25,36 @@ pub struct ChunkKey {
 pub struct ChunkCache {
     inner: Mutex<ChunkCacheState>,
     max_bytes: usize,
+    max_slots: usize,
 }
 
 struct ChunkCacheState {
     cache: LruCache<ChunkKey, Arc<Vec<u8>>>,
     current_bytes: usize,
     in_flight: HashMap<ChunkKey, Arc<InFlightLoad>>,
+    hits: u64,
+    misses: u64,
+    inserts: u64,
+    evictions: u64,
 }
 
 struct InFlightLoad {
     completed: Mutex<bool>,
     ready: Condvar,
+}
+
+/// Point-in-time statistics for a [`ChunkCache`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkCacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub inserts: u64,
+    pub evictions: u64,
+    pub current_bytes: usize,
+    pub entries: usize,
+    pub in_flight: usize,
+    pub max_bytes: usize,
+    pub max_slots: usize,
 }
 
 impl ChunkCache {
@@ -50,15 +69,26 @@ impl ChunkCache {
                 cache: LruCache::new(slots),
                 current_bytes: 0,
                 in_flight: HashMap::new(),
+                hits: 0,
+                misses: 0,
+                inserts: 0,
+                evictions: 0,
             }),
             max_bytes,
+            max_slots: slots.get(),
         }
     }
 
     /// Get a cached chunk, if present. Promotes the entry in LRU order.
     pub fn get(&self, key: &ChunkKey) -> Option<Arc<Vec<u8>>> {
         let mut cache = self.inner.lock();
-        cache.cache.get(key).cloned()
+        let result = cache.cache.get(key).cloned();
+        if result.is_some() {
+            cache.hits += 1;
+        } else {
+            cache.misses += 1;
+        }
+        result
     }
 
     /// Insert a chunk into the cache. Evicts LRU entries if over capacity.
@@ -75,6 +105,7 @@ impl ChunkCache {
         while state.current_bytes + data_len > self.max_bytes && !state.cache.is_empty() {
             if let Some((_, evicted)) = state.cache.pop_lru() {
                 state.current_bytes = state.current_bytes.saturating_sub(evicted.len());
+                state.evictions += 1;
             }
         }
 
@@ -82,6 +113,7 @@ impl ChunkCache {
             state.current_bytes = state.current_bytes.saturating_sub(replaced.len());
         }
         state.current_bytes += data_len;
+        state.inserts += 1;
         state.cache.put(key, arc.clone());
 
         arc
@@ -96,8 +128,10 @@ impl ChunkCache {
             let in_flight = {
                 let mut state = self.inner.lock();
                 if let Some(cached) = state.cache.get(&key).cloned() {
+                    state.hits += 1;
                     return Ok(cached);
                 }
+                state.misses += 1;
 
                 if let Some(in_flight) = state.in_flight.get(&key) {
                     Arc::clone(in_flight)
@@ -125,6 +159,22 @@ impl ChunkCache {
             while !*completed {
                 in_flight.ready.wait(&mut completed);
             }
+        }
+    }
+
+    /// Return current cache statistics.
+    pub fn stats(&self) -> ChunkCacheStats {
+        let state = self.inner.lock();
+        ChunkCacheStats {
+            hits: state.hits,
+            misses: state.misses,
+            inserts: state.inserts,
+            evictions: state.evictions,
+            current_bytes: state.current_bytes,
+            entries: state.cache.len(),
+            in_flight: state.in_flight.len(),
+            max_bytes: self.max_bytes,
+            max_slots: self.max_slots,
         }
     }
 }
@@ -267,5 +317,38 @@ mod tests {
         });
 
         assert_eq!(load_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_cache_stats_track_hits_misses_and_evictions() {
+        let cache = ChunkCache::new(8, 2);
+        let key_a = ChunkKey {
+            dataset_addr: 1,
+            chunk_offsets: SmallVec::from_vec(vec![0]),
+        };
+        let key_b = ChunkKey {
+            dataset_addr: 1,
+            chunk_offsets: SmallVec::from_vec(vec![1]),
+        };
+        let key_c = ChunkKey {
+            dataset_addr: 1,
+            chunk_offsets: SmallVec::from_vec(vec![2]),
+        };
+
+        assert!(cache.get(&key_a).is_none());
+        cache.insert(key_a.clone(), vec![1, 2, 3, 4]);
+        assert!(cache.get(&key_a).is_some());
+        cache.insert(key_b, vec![5, 6, 7, 8]);
+        cache.insert(key_c, vec![9, 10, 11, 12]);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.inserts, 3);
+        assert_eq!(stats.evictions, 1);
+        assert_eq!(stats.entries, 2);
+        assert_eq!(stats.current_bytes, 8);
+        assert_eq!(stats.max_bytes, 8);
+        assert_eq!(stats.max_slots, 2);
     }
 }

@@ -13,10 +13,10 @@ use crate::attribute_api::{
     collect_attribute_messages_storage, decode_string, read_one_vlen_string_storage,
     resolve_vlen_bytes_storage, Attribute,
 };
-use crate::cache::{ChunkCache, ChunkKey};
+use crate::cache::{ChunkCache, ChunkCacheStats, ChunkKey};
 use crate::chunk_index;
 use crate::datatype_api::{dtype_element_size, H5Type};
-use crate::error::{Error, Result};
+use crate::error::{ByteOrder, Error, Result};
 use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
 use crate::local_heap::LocalHeap;
@@ -597,6 +597,7 @@ fn result_strides_for_dims(result_dims: &[usize]) -> Result<Vec<usize>> {
 }
 
 /// A dataset within an HDF5 file.
+#[derive(Clone)]
 pub struct Dataset {
     pub(crate) context: Arc<FileContext>,
     pub(crate) name: String,
@@ -614,6 +615,66 @@ pub struct Dataset {
     full_dataset_bytes: Arc<OnceLock<Arc<Vec<u8>>>>,
     external_slots: Arc<OnceLock<Arc<Vec<ResolvedExternalRawSlot>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
+}
+
+/// One decoded chunk from a chunked dataset.
+pub struct DatasetChunk {
+    offsets: Vec<u64>,
+    shape: Vec<u64>,
+    filter_mask: u32,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl DatasetChunk {
+    /// Dataset coordinates of the first element in this chunk.
+    pub fn offsets(&self) -> &[u64] {
+        &self.offsets
+    }
+
+    /// Logical chunk shape from the dataset layout.
+    pub fn shape(&self) -> &[u64] {
+        &self.shape
+    }
+
+    /// HDF5 filter mask recorded for this chunk.
+    pub fn filter_mask(&self) -> u32 {
+        self.filter_mask
+    }
+
+    /// Decoded logical bytes for this chunk.
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+/// Iterator over decoded chunks in a chunked dataset.
+pub struct DatasetChunkIterator {
+    dataset: Dataset,
+    entries: Vec<chunk_index::ChunkEntry>,
+    index_address: u64,
+    chunk_shape: Vec<u64>,
+    elem_size: usize,
+    next: usize,
+}
+
+impl Iterator for DatasetChunkIterator {
+    type Item = Result<DatasetChunk>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.entries.get(self.next)?;
+        self.next += 1;
+
+        Some(
+            self.dataset
+                .load_exact_chunk_data(entry, self.index_address, &self.chunk_shape, self.elem_size)
+                .map(|bytes| DatasetChunk {
+                    offsets: entry.offsets.clone(),
+                    shape: self.chunk_shape.clone(),
+                    filter_mask: entry.filter_mask,
+                    bytes,
+                }),
+        )
+    }
 }
 
 pub(crate) struct DatasetTemplate {
@@ -787,6 +848,64 @@ impl Dataset {
             DataLayout::Chunked { dims, .. } => Some(dims.clone()),
             _ => None,
         }
+    }
+
+    /// Iterate over decoded chunks for a chunked dataset.
+    pub fn iter_chunks(&self) -> Result<DatasetChunkIterator> {
+        let DataLayout::Chunked {
+            address,
+            dims,
+            chunk_indexing,
+            ..
+        } = &self.layout
+        else {
+            return Err(Error::InvalidData(format!(
+                "dataset '{}' is not chunked",
+                self.name
+            )));
+        };
+
+        if Cursor::is_undefined_offset(*address, self.offset_size()) {
+            return Ok(DatasetChunkIterator {
+                dataset: self.clone(),
+                entries: Vec::new(),
+                index_address: *address,
+                chunk_shape: dims.iter().map(|&d| d as u64).collect(),
+                elem_size: self.raw_element_size(),
+                next: 0,
+            });
+        }
+
+        let ndim = self.ndim();
+        let shape = &self.dataspace.dims;
+        let elem_size = self.raw_element_size();
+        let chunk_shape: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
+        validate_chunk_shape(shape, &chunk_shape)?;
+        let entries = self.collect_chunk_entries(
+            *address,
+            dims,
+            chunk_indexing.as_ref(),
+            ChunkEntrySelection {
+                shape,
+                ndim,
+                elem_size,
+                chunk_bounds: None,
+            },
+        )?;
+
+        Ok(DatasetChunkIterator {
+            dataset: self.clone(),
+            entries,
+            index_address: *address,
+            chunk_shape,
+            elem_size,
+            next: 0,
+        })
+    }
+
+    /// Return current chunk-cache statistics for this dataset's file.
+    pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
+        self.chunk_cache.stats()
     }
 
     /// Fill value, if defined.
@@ -970,6 +1089,40 @@ impl Dataset {
         result.map_err(|e| e.with_context(&self.name))
     }
 
+    /// Read the entire dataset into a caller-provided typed buffer.
+    pub fn read_into<T: H5Type>(&self, dst: &mut [T]) -> Result<()> {
+        let result = (|| {
+            let element_count = checked_usize(self.num_elements(), "dataset element count")?;
+            if dst.len() != element_count {
+                return Err(Error::InvalidData(format!(
+                    "destination has {} elements, dataset requires {}",
+                    dst.len(),
+                    element_count
+                )));
+            }
+
+            let elem_size = self.raw_element_size();
+            if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
+                let dst_bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        dst.as_mut_ptr() as *mut u8,
+                        checked_mul_usize(dst.len(), elem_size, "destination byte length")?,
+                    )
+                };
+                return self.read_raw_bytes_into_inner(dst_bytes);
+            }
+
+            let array = self.read_array::<T>()?;
+            let values = array.as_slice_memory_order().ok_or_else(|| {
+                Error::InvalidData("decoded array is not contiguous in memory order".into())
+            })?;
+            dst.clone_from_slice(values);
+            Ok(())
+        })();
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
     /// Read the entire dataset using internal chunk-level parallelism when possible.
     ///
     /// Non-chunked datasets fall back to `read_array`.
@@ -1075,24 +1228,90 @@ impl Dataset {
     /// decoding, external raw-data resolution, and fill-value materialization.
     /// Numeric values remain in the dataset datatype's byte order.
     pub fn read_raw_bytes(&self) -> Result<Vec<u8>> {
+        let result: Result<Vec<u8>> = (|| {
+            let total_bytes = self.raw_byte_len()?;
+            let mut output = vec![0u8; total_bytes];
+            self.read_raw_bytes_into_inner(&mut output)?;
+            Ok(output)
+        })();
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
+    /// Number of logical raw bytes in the entire dataset.
+    pub fn raw_byte_len(&self) -> Result<usize> {
         let elem_size = self.raw_element_size();
         let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
-        let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
+        checked_mul_usize(total_elements, elem_size, "dataset size in bytes")
+    }
 
-        let result = match &self.layout {
-            DataLayout::Compact { data } => Ok(self.normalize_raw_bytes(data, total_bytes)),
+    /// Read logical raw bytes into a caller-provided buffer.
+    ///
+    /// The destination length must match [`Dataset::raw_byte_len`]. Numeric
+    /// values remain in the dataset datatype's byte order.
+    pub fn read_raw_bytes_into(&self, dst: &mut [u8]) -> Result<()> {
+        let result: Result<()> = (|| {
+            let total_bytes = self.raw_byte_len()?;
+            if dst.len() != total_bytes {
+                return Err(Error::InvalidData(format!(
+                    "destination has {} bytes, dataset requires {}",
+                    dst.len(),
+                    total_bytes
+                )));
+            }
+            self.read_raw_bytes_into_inner(dst)
+        })();
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
+    /// Read logical raw bytes converted to native-endian numeric fields.
+    pub fn read_native_bytes(&self) -> Result<Vec<u8>> {
+        let result: Result<Vec<u8>> = (|| {
+            let total_bytes = self.raw_byte_len()?;
+            let mut output = vec![0u8; total_bytes];
+            self.read_raw_bytes_into_inner(&mut output)?;
+            self.convert_to_native_endian(&mut output)?;
+            Ok(output)
+        })();
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
+    /// Read logical raw bytes into a buffer and convert numeric fields to native endian.
+    pub fn read_native_bytes_into(&self, dst: &mut [u8]) -> Result<()> {
+        let result: Result<()> = (|| {
+            let total_bytes = self.raw_byte_len()?;
+            if dst.len() != total_bytes {
+                return Err(Error::InvalidData(format!(
+                    "destination has {} bytes, dataset requires {}",
+                    dst.len(),
+                    total_bytes
+                )));
+            }
+            self.read_raw_bytes_into_inner(dst)?;
+            self.convert_to_native_endian(dst)
+        })();
+
+        result.map_err(|e| e.with_context(&self.name))
+    }
+
+    fn read_raw_bytes_into_inner(&self, dst: &mut [u8]) -> Result<()> {
+        match &self.layout {
+            DataLayout::Compact { data } => {
+                self.copy_normalized_bytes_into(data, dst);
+                Ok(())
+            }
             DataLayout::Contiguous { address, size } => {
-                self.read_contiguous_bytes(*address, *size, total_bytes)
+                self.read_contiguous_bytes_into(*address, *size, dst)
             }
             DataLayout::Chunked {
                 address,
                 dims,
                 element_size: _,
                 chunk_indexing,
-            } => self.read_chunked_bytes(*address, dims, chunk_indexing.as_ref(), total_bytes),
-        };
-
-        result.map_err(|e| e.with_context(&self.name))
+            } => self.read_chunked_bytes_into(*address, dims, chunk_indexing.as_ref(), dst),
+        }
     }
 
     /// Size in bytes of one HDF5 variable-length reference in this file.
@@ -1182,23 +1401,25 @@ impl Dataset {
         self.decode_raw_data::<T>(raw.as_ref())
     }
 
-    fn read_contiguous_bytes(
-        &self,
-        address: u64,
-        size: u64,
-        total_bytes: usize,
-    ) -> Result<Vec<u8>> {
+    fn read_contiguous_bytes_into(&self, address: u64, size: u64, dst: &mut [u8]) -> Result<()> {
         if self.external_files.is_some() {
-            return self.read_external_range(0, total_bytes);
+            return self.read_external_range_into(0, dst);
         }
 
         if Cursor::is_undefined_offset(address, self.offset_size()) || size == 0 {
-            return Ok(self.make_output_buffer(total_bytes));
+            self.fill_output_buffer(dst);
+            return Ok(());
         }
 
         let sz = checked_usize(size, "contiguous dataset size")?;
-        let raw = self.context.read_range(address, sz)?;
-        Ok(self.normalize_raw_bytes(raw.as_ref(), total_bytes))
+        let read_len = sz.min(dst.len());
+        self.fill_output_buffer(dst);
+        if read_len == 0 {
+            return Ok(());
+        }
+        let raw = self.context.read_range(address, read_len)?;
+        dst[..read_len].copy_from_slice(raw.as_ref());
+        Ok(())
     }
 
     fn read_contiguous_logical_range(
@@ -1222,15 +1443,21 @@ impl Dataset {
     }
 
     fn read_external_range(&self, logical_offset: usize, len: usize) -> Result<Vec<u8>> {
-        let mut output = self.make_output_buffer(len);
-        if len == 0 {
-            return Ok(output);
+        let mut output = vec![0u8; len];
+        self.read_external_range_into(logical_offset, &mut output)?;
+        Ok(output)
+    }
+
+    fn read_external_range_into(&self, logical_offset: usize, dst: &mut [u8]) -> Result<()> {
+        self.fill_output_buffer(dst);
+        if dst.is_empty() {
+            return Ok(());
         }
 
         let request_start = u64::try_from(logical_offset).map_err(|_| {
             Error::InvalidData("external dataset offset exceeds u64 capacity".to_string())
         })?;
-        let request_len = u64::try_from(len).map_err(|_| {
+        let request_len = u64::try_from(dst.len()).map_err(|_| {
             Error::InvalidData("external dataset length exceeds u64 capacity".to_string())
         })?;
         let request_end = request_start
@@ -1253,10 +1480,10 @@ impl Dataset {
             let dst_start = checked_usize(overlap_start - request_start, "external read dst")?;
             let dst_end = checked_add_usize(dst_start, read_len, "external read dst end")?;
             let bytes = slot.storage.read_range(read_offset, read_len)?;
-            output[dst_start..dst_end].copy_from_slice(bytes.as_ref());
+            dst[dst_start..dst_end].copy_from_slice(bytes.as_ref());
         }
 
-        Ok(output)
+        Ok(())
     }
 
     fn external_raw_slots(&self) -> Result<Arc<Vec<ResolvedExternalRawSlot>>> {
@@ -1487,24 +1714,28 @@ impl Dataset {
         self.decode_raw_data::<T>(&flat_data)
     }
 
-    fn read_chunked_bytes(
+    fn read_chunked_bytes_into(
         &self,
         index_address: u64,
         chunk_dims: &[u32],
         chunk_indexing: Option<&ChunkIndexing>,
-        total_bytes: usize,
-    ) -> Result<Vec<u8>> {
+        dst: &mut [u8],
+    ) -> Result<()> {
         if Cursor::is_undefined_offset(index_address, self.offset_size()) {
-            return Ok(self.make_output_buffer(total_bytes));
+            self.fill_output_buffer(dst);
+            return Ok(());
         }
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
         let elem_size = self.raw_element_size();
 
-        if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+        if dst.len() <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
-                return Ok(cached_bytes.as_ref().clone());
+                if cached_bytes.len() == dst.len() {
+                    dst.copy_from_slice(cached_bytes.as_slice());
+                    return Ok(());
+                }
             }
         }
 
@@ -1541,13 +1772,13 @@ impl Dataset {
             }
         };
 
-        let mut flat_data = self.make_output_buffer(total_bytes);
+        self.fill_output_buffer(dst);
         for entry in &entries {
             let chunk_data =
                 self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
             copy_chunk_to_flat_with_strides(
                 &chunk_data,
-                &mut flat_data,
+                dst,
                 ChunkCopyLayout {
                     chunk_offsets: &entry.offsets,
                     chunk_shape: &chunk_shape,
@@ -1559,11 +1790,11 @@ impl Dataset {
             )?;
         }
 
-        if full_chunk_coverage && total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
-            let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
+        if full_chunk_coverage && dst.len() <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
+            let _ = self.full_dataset_bytes.set(Arc::new(dst.to_vec()));
         }
 
-        Ok(flat_data)
+        Ok(())
     }
 
     #[cfg(feature = "rayon")]
@@ -2704,32 +2935,142 @@ impl Dataset {
     }
 
     fn make_output_buffer(&self, total_bytes: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; total_bytes];
+        self.fill_output_buffer(&mut buf);
+        buf
+    }
+
+    fn fill_output_buffer(&self, buf: &mut [u8]) {
+        buf.fill(0);
         if let Some(ref fv) = self.fill_value {
             if let Some(ref fill_bytes) = fv.value {
-                let mut buf = vec![0u8; total_bytes];
                 if !fill_bytes.is_empty() {
                     for chunk in buf.chunks_exact_mut(fill_bytes.len()) {
                         chunk.copy_from_slice(fill_bytes);
                     }
                 }
-                buf
-            } else {
-                vec![0u8; total_bytes]
             }
-        } else {
-            vec![0u8; total_bytes]
         }
     }
 
-    fn normalize_raw_bytes(&self, raw: &[u8], total_bytes: usize) -> Vec<u8> {
-        if raw.len() >= total_bytes {
-            raw[..total_bytes].to_vec()
-        } else {
-            let mut normalized = self.make_output_buffer(total_bytes);
-            normalized[..raw.len()].copy_from_slice(raw);
-            normalized
-        }
+    fn copy_normalized_bytes_into(&self, raw: &[u8], dst: &mut [u8]) {
+        self.fill_output_buffer(dst);
+        let copy_len = raw.len().min(dst.len());
+        dst[..copy_len].copy_from_slice(&raw[..copy_len]);
     }
+
+    fn convert_to_native_endian(&self, bytes: &mut [u8]) -> Result<()> {
+        let count = checked_usize(self.num_elements(), "dataset element count")?;
+        convert_datatype_to_native_endian(&self.datatype, self.vlen_reference_size(), bytes, count)
+    }
+}
+
+fn native_byte_order() -> ByteOrder {
+    if cfg!(target_endian = "little") {
+        ByteOrder::LittleEndian
+    } else {
+        ByteOrder::BigEndian
+    }
+}
+
+fn convert_datatype_to_native_endian(
+    dtype: &Datatype,
+    vlen_reference_size: usize,
+    bytes: &mut [u8],
+    count: usize,
+) -> Result<()> {
+    match dtype {
+        Datatype::FixedPoint {
+            size, byte_order, ..
+        }
+        | Datatype::FloatingPoint { size, byte_order }
+        | Datatype::Bitfield { size, byte_order } => {
+            swap_elements_to_native(bytes, count, *size as usize, *byte_order)
+        }
+        Datatype::Enum { base, .. } => {
+            convert_datatype_to_native_endian(base, vlen_reference_size, bytes, count)
+        }
+        Datatype::Array { base, dims } => {
+            let array_count = dims.iter().try_fold(1usize, |acc, &dim| {
+                checked_mul_usize(
+                    acc,
+                    checked_usize(dim, "array datatype dimension")?,
+                    "array datatype element count",
+                )
+            })?;
+            let total_count =
+                checked_mul_usize(count, array_count, "array datatype total element count")?;
+            convert_datatype_to_native_endian(base, vlen_reference_size, bytes, total_count)
+        }
+        Datatype::Compound { size, fields } => {
+            let record_size = *size as usize;
+            let required = checked_mul_usize(count, record_size, "compound byte length")?;
+            if bytes.len() < required {
+                return Err(Error::InvalidData(format!(
+                    "compound native-endian conversion needs {required} bytes, got {}",
+                    bytes.len()
+                )));
+            }
+
+            for record in 0..count {
+                let record_start =
+                    checked_mul_usize(record, record_size, "compound record byte offset")?;
+                for field in fields {
+                    let field_offset = field.byte_offset as usize;
+                    let field_size =
+                        raw_element_size_for_datatype(&field.datatype, vlen_reference_size);
+                    let field_start = checked_add_usize(
+                        record_start,
+                        field_offset,
+                        "compound field byte offset",
+                    )?;
+                    let field_end =
+                        checked_add_usize(field_start, field_size, "compound field byte end")?;
+                    if field_end > bytes.len() || field_offset + field_size > record_size {
+                        return Err(Error::InvalidData(format!(
+                            "compound field '{}' range exceeds record size",
+                            field.name
+                        )));
+                    }
+                    convert_datatype_to_native_endian(
+                        &field.datatype,
+                        vlen_reference_size,
+                        &mut bytes[field_start..field_end],
+                        1,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+        Datatype::String { .. }
+        | Datatype::VarLen { .. }
+        | Datatype::Opaque { .. }
+        | Datatype::Reference { .. } => Ok(()),
+    }
+}
+
+fn swap_elements_to_native(
+    bytes: &mut [u8],
+    count: usize,
+    elem_size: usize,
+    byte_order: ByteOrder,
+) -> Result<()> {
+    let required = checked_mul_usize(count, elem_size, "native-endian byte length")?;
+    if bytes.len() < required {
+        return Err(Error::InvalidData(format!(
+            "native-endian conversion needs {required} bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    if elem_size <= 1 || byte_order == native_byte_order() {
+        return Ok(());
+    }
+
+    for chunk in bytes[..required].chunks_exact_mut(elem_size) {
+        chunk.reverse();
+    }
+    Ok(())
 }
 
 fn attribute_from_message_storage(message: &AttributeMessage, context: &FileContext) -> Attribute {
