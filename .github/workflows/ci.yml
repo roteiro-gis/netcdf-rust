@@ -95,7 +95,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-fuzz
-        run: cargo install --locked cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1
 
       - name: Run chunked read fuzz smoke under ASan
         working-directory: hdf5-reader
