@@ -131,16 +131,18 @@ impl Nc4File {
 
     /// Open a NetCDF-4 file from disk with custom options.
     pub fn open_with_options(path: &Path, options: crate::NcOpenOptions) -> Result<Self> {
+        let metadata_mode = options.metadata_mode;
         let hdf5 = Hdf5File::open_with_options(
             path,
             hdf5_reader::OpenOptions {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
-                ..Default::default()
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
-        Nc4File::from_hdf5(hdf5, options.metadata_mode)
+        Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
     /// Open a NetCDF-4 file from in-memory bytes.
@@ -150,16 +152,18 @@ impl Nc4File {
 
     /// Open a NetCDF-4 file from in-memory bytes with custom options.
     pub fn from_bytes_with_options(data: &[u8], options: crate::NcOpenOptions) -> Result<Self> {
+        let metadata_mode = options.metadata_mode;
         let hdf5 = Hdf5File::from_bytes_with_options(
             data,
             hdf5_reader::OpenOptions {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
-                ..Default::default()
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
-        Nc4File::from_hdf5(hdf5, options.metadata_mode)
+        Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
     /// Open a NetCDF-4 file from a custom random-access storage backend.
@@ -172,16 +176,18 @@ impl Nc4File {
         storage: DynStorage,
         options: crate::NcOpenOptions,
     ) -> Result<Self> {
+        let metadata_mode = options.metadata_mode;
         let hdf5 = Hdf5File::from_storage_with_options(
             storage,
             hdf5_reader::OpenOptions {
                 chunk_cache_bytes: options.chunk_cache_bytes,
                 chunk_cache_slots: options.chunk_cache_slots,
                 filter_registry: options.filter_registry,
-                ..Default::default()
+                external_file_resolver: options.external_file_resolver,
+                external_link_resolver: options.external_link_resolver,
             },
         )?;
-        Nc4File::from_hdf5(hdf5, options.metadata_mode)
+        Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
     /// The root group.
@@ -257,6 +263,53 @@ impl Nc4File {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
         Ok(dataset.read_array::<T>()?)
+    }
+
+    /// Read a variable into a caller-provided typed buffer.
+    pub fn read_variable_into<T: H5Type>(&self, path: &str, dst: &mut [T]) -> Result<()> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_into::<T>(dst)?)
+    }
+
+    /// Read a variable as logical raw bytes in HDF5 datatype byte order.
+    pub fn read_variable_raw_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_raw_bytes()?)
+    }
+
+    /// Read logical raw bytes into a caller-provided buffer.
+    pub fn read_variable_raw_bytes_into(&self, path: &str, dst: &mut [u8]) -> Result<()> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_raw_bytes_into(dst)?)
+    }
+
+    /// Read a variable as logical raw bytes with numeric fields in native endian.
+    pub fn read_variable_native_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_native_bytes()?)
+    }
+
+    /// Read native-endian logical raw bytes into a caller-provided buffer.
+    pub fn read_variable_native_bytes_into(&self, path: &str, dst: &mut [u8]) -> Result<()> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.read_native_bytes_into(dst)?)
+    }
+
+    /// Iterate decoded HDF5 chunks for a chunked variable.
+    pub fn iter_variable_chunks(&self, path: &str) -> Result<hdf5_reader::DatasetChunkIterator> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        Ok(dataset.iter_chunks()?)
+    }
+
+    /// Return current chunk-cache statistics.
+    pub fn chunk_cache_stats(&self) -> hdf5_reader::ChunkCacheStats {
+        self.hdf5.chunk_cache_stats()
     }
 
     /// Read a string variable as a single string.

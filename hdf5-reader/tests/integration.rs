@@ -103,6 +103,28 @@ fn test_simple_contiguous() {
 }
 
 #[test]
+fn test_read_into_and_raw_byte_variants() {
+    let path = skip_if_missing!("simple_contiguous.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/data").unwrap();
+
+    let data: ndarray::ArrayD<f64> = ds.read_array().unwrap();
+    let mut into = vec![0.0f64; data.len()];
+    ds.read_into(&mut into).unwrap();
+    assert_eq!(into, data.iter().copied().collect::<Vec<_>>());
+
+    let raw = ds.read_raw_bytes().unwrap();
+    let mut raw_into = vec![0u8; ds.raw_byte_len().unwrap()];
+    ds.read_raw_bytes_into(&mut raw_into).unwrap();
+    assert_eq!(raw_into, raw);
+
+    let native = ds.read_native_bytes().unwrap();
+    let mut native_into = vec![0u8; native.len()];
+    ds.read_native_bytes_into(&mut native_into).unwrap();
+    assert_eq!(native_into, native);
+}
+
+#[test]
 fn test_simple_contiguous_inner_window_slice() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
@@ -206,6 +228,12 @@ fn test_big_endian_numeric_datasets() {
     assert_eq!(i32_data.shape(), &[3, 5]);
     assert_eq!(i32_data[[0, 0]], 0);
     assert_eq!(i32_data[[2, 4]], 14);
+
+    let i32_ds = file.dataset("/int32_be").unwrap();
+    let native = i32_ds.read_native_bytes().unwrap();
+    let mut second = [0u8; 4];
+    second.copy_from_slice(&native[4..8]);
+    assert_eq!(i32::from_ne_bytes(second), 1);
 }
 
 #[test]
@@ -221,6 +249,28 @@ fn test_simple_chunked_deflate() {
     assert_eq!(data.shape(), &[10, 20]);
     assert!((data[[0, 0]] - 0.0).abs() < 1e-6);
     assert!((data[[1, 0]] - 20.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_chunk_iterator_and_cache_stats() {
+    let path = skip_if_missing!("simple_chunked_deflate.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.dataset("/temperature").unwrap();
+
+    let before = ds.chunk_cache_stats();
+    let chunks = ds
+        .iter_chunks()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!chunks.is_empty());
+    assert_eq!(chunks[0].shape(), &[5, 10]);
+    assert_eq!(chunks[0].offsets().len(), 2);
+    assert!(!chunks[0].bytes().is_empty());
+
+    let after = file.chunk_cache_stats();
+    assert!(after.misses >= before.misses + chunks.len() as u64);
+    assert!(after.inserts >= before.inserts + chunks.len() as u64);
 }
 
 #[cfg(feature = "rayon")]

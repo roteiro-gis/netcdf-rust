@@ -36,7 +36,12 @@ pub use error::{Error, Result};
 #[cfg(feature = "netcdf4")]
 pub use hdf5_reader::storage::DynStorage;
 #[cfg(feature = "netcdf4")]
-pub use hdf5_reader::{BytesStorage, FileStorage, MmapStorage, Storage, StorageBuffer};
+pub use hdf5_reader::{
+    BlockCacheStats, BlockCacheStorage, BytesStorage, ChunkCacheStats, DatasetChunk,
+    DatasetChunkIterator, ExternalFileResolver, ExternalLinkResolver, FileStorage,
+    FilesystemExternalFileResolver, FilesystemExternalLinkResolver, MmapStorage,
+    RangeRequestStorage, Storage, StorageBuffer,
+};
 pub use types::*;
 #[cfg(feature = "netcdf4")]
 pub use user_defined::{
@@ -46,6 +51,8 @@ pub use user_defined::{
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+#[cfg(feature = "netcdf4")]
+use std::sync::Arc;
 
 use memmap2::Mmap;
 use ndarray::ArrayD;
@@ -397,6 +404,98 @@ impl NcFile {
         }
     }
 
+    /// Read a variable into a caller-provided typed buffer.
+    pub fn read_variable_into<T: NcReadable>(&self, name: &str, dst: &mut [T]) -> Result<()> {
+        match &self.inner {
+            NcFileInner::Classic(c) => {
+                let data = c.read_variable::<T>(name)?;
+                let values = data.as_slice_memory_order().ok_or_else(|| {
+                    Error::InvalidData("decoded array is not contiguous in memory order".into())
+                })?;
+                if dst.len() != values.len() {
+                    return Err(Error::InvalidData(format!(
+                        "destination has {} elements, variable requires {}",
+                        dst.len(),
+                        values.len()
+                    )));
+                }
+                dst.clone_from_slice(values);
+                Ok(())
+            }
+            #[cfg(feature = "netcdf4")]
+            NcFileInner::Nc4(n) => Ok(n.read_variable_into::<T>(name, dst)?),
+        }
+    }
+
+    /// Read a NetCDF-4 variable as logical raw bytes in HDF5 datatype byte order.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_raw_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => Ok(n.read_variable_raw_bytes(name)?),
+        }
+    }
+
+    /// Read a NetCDF-4 variable as logical raw bytes into a caller-provided buffer.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_raw_bytes_into(&self, name: &str, dst: &mut [u8]) -> Result<()> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => Ok(n.read_variable_raw_bytes_into(name, dst)?),
+        }
+    }
+
+    /// Read a NetCDF-4 variable as logical raw bytes with numeric fields in native endian.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_native_bytes(&self, name: &str) -> Result<Vec<u8>> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => Ok(n.read_variable_native_bytes(name)?),
+        }
+    }
+
+    /// Read native-endian logical raw bytes for a NetCDF-4 variable into a buffer.
+    #[cfg(feature = "netcdf4")]
+    pub fn read_variable_native_bytes_into(&self, name: &str, dst: &mut [u8]) -> Result<()> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => Ok(n.read_variable_native_bytes_into(name, dst)?),
+        }
+    }
+
+    /// Iterate decoded HDF5 chunks for a NetCDF-4 variable.
+    #[cfg(feature = "netcdf4")]
+    pub fn iter_variable_chunks(&self, name: &str) -> Result<DatasetChunkIterator> {
+        match &self.inner {
+            NcFileInner::Classic(_) => Err(Error::TypeMismatch {
+                expected: "NetCDF-4 chunked variable".to_string(),
+                actual: "classic NetCDF variable".to_string(),
+            }),
+            NcFileInner::Nc4(n) => Ok(n.iter_variable_chunks(name)?),
+        }
+    }
+
+    /// Return chunk-cache statistics for NetCDF-4 files.
+    #[cfg(feature = "netcdf4")]
+    pub fn chunk_cache_stats(&self) -> Option<ChunkCacheStats> {
+        match &self.inner {
+            NcFileInner::Classic(_) => None,
+            NcFileInner::Nc4(n) => Some(n.chunk_cache_stats()),
+        }
+    }
+
     /// Read a variable using internal chunk-level parallelism when available.
     ///
     /// Classic formats fall back to `read_variable`.
@@ -692,6 +791,12 @@ pub struct NcOpenOptions {
     /// Custom filter registry (NC4 only).
     #[cfg(feature = "netcdf4")]
     pub filter_registry: Option<hdf5_reader::FilterRegistry>,
+    /// Resolver for HDF5 external raw data files (NC4 only).
+    #[cfg(feature = "netcdf4")]
+    pub external_file_resolver: Option<Arc<dyn hdf5_reader::ExternalFileResolver>>,
+    /// Resolver for HDF5 external links (NC4 only).
+    #[cfg(feature = "netcdf4")]
+    pub external_link_resolver: Option<Arc<dyn hdf5_reader::ExternalLinkResolver>>,
 }
 
 impl Default for NcOpenOptions {
@@ -702,6 +807,10 @@ impl Default for NcOpenOptions {
             metadata_mode: NcMetadataMode::Strict,
             #[cfg(feature = "netcdf4")]
             filter_registry: None,
+            #[cfg(feature = "netcdf4")]
+            external_file_resolver: None,
+            #[cfg(feature = "netcdf4")]
+            external_link_resolver: None,
         }
     }
 }
@@ -728,16 +837,18 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
+                    let metadata_mode = options.metadata_mode;
                     let hdf5 = hdf5_reader::Hdf5File::open_with_options(
                         path,
                         hdf5_reader::OpenOptions {
                             chunk_cache_bytes: options.chunk_cache_bytes,
                             chunk_cache_slots: options.chunk_cache_slots,
                             filter_registry: options.filter_registry,
-                            ..Default::default()
+                            external_file_resolver: options.external_file_resolver,
+                            external_link_resolver: options.external_link_resolver,
                         },
                     )?;
-                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, options.metadata_mode)?;
+                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, metadata_mode)?;
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {

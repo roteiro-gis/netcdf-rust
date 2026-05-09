@@ -53,8 +53,9 @@ use superblock::Superblock;
 
 // Re-exports
 pub use attribute_api::Attribute;
+pub use cache::ChunkCacheStats;
 use dataset::DatasetTemplate;
-pub use dataset::{Dataset, SliceInfo, SliceInfoElem};
+pub use dataset::{Dataset, DatasetChunk, DatasetChunkIterator, SliceInfo, SliceInfoElem};
 pub use datatype_api::{
     dtype_element_size, CompoundField, EnumMember, H5Type, ReferenceType, StringEncoding,
     StringPadding, StringSize, VarLenKind,
@@ -62,7 +63,10 @@ pub use datatype_api::{
 pub use error::ByteOrder;
 pub use filters::FilterRegistry;
 pub use messages::datatype::Datatype;
-pub use storage::{BytesStorage, FileStorage, MmapStorage, Storage, StorageBuffer};
+pub use storage::{
+    BlockCacheStats, BlockCacheStorage, BytesStorage, FileStorage, MmapStorage,
+    RangeRequestStorage, Storage, StorageBuffer,
+};
 
 /// Configuration options for opening an HDF5 file.
 pub struct OpenOptions {
@@ -422,6 +426,11 @@ impl Hdf5File {
     /// Access the underlying random-access storage backend.
     pub fn storage(&self) -> &dyn Storage {
         self.context.storage.as_ref()
+    }
+
+    /// Return current chunk-cache statistics for this file.
+    pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
+        self.context.chunk_cache.stats()
     }
 
     /// Look up or parse an object header at the given address.
