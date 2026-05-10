@@ -203,6 +203,7 @@ impl Group {
             self.context.storage.as_ref(),
             self.offset_size(),
             self.length_size(),
+            Some(self.context.filter_registry.as_ref()),
         )?
         .into_iter()
         .map(|attr| {
@@ -488,8 +489,13 @@ impl Group {
                 _ => continue,
             };
 
-            let managed_bytes =
-                heap.get_object(heap_id, file_data, self.offset_size(), self.length_size())?;
+            let managed_bytes = heap.get_object_with_registry(
+                heap_id,
+                file_data,
+                self.offset_size(),
+                self.length_size(),
+                Some(self.context.filter_registry.as_ref()),
+            )?;
 
             let mut link_cursor = Cursor::new(&managed_bytes);
             let link_msg = link::parse(
@@ -568,12 +574,13 @@ impl Group {
                 _ => continue,
             };
 
-            let managed_bytes = heap.get_object_storage_cached(
+            let managed_bytes = heap.get_object_storage_cached_with_registry(
                 heap_id,
                 self.context.storage.as_ref(),
                 self.offset_size(),
                 self.length_size(),
                 &mut direct_block_cache,
+                Some(self.context.filter_registry.as_ref()),
             )?;
 
             let mut link_cursor = Cursor::new(&managed_bytes);

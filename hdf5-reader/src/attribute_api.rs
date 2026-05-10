@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::filters::FilterRegistry;
 use crate::fractal_heap::FractalHeap;
 use crate::global_heap::GlobalHeapCollection;
 use crate::io::Cursor;
@@ -340,6 +341,7 @@ pub(crate) fn collect_attribute_messages_storage(
     storage: &dyn Storage,
     offset_size: u8,
     length_size: u8,
+    filter_registry: Option<&FilterRegistry>,
 ) -> Result<Vec<AttributeMessage>> {
     let mut attributes = Vec::new();
     let mut attribute_info = None;
@@ -358,6 +360,7 @@ pub(crate) fn collect_attribute_messages_storage(
             storage,
             offset_size,
             length_size,
+            filter_registry,
         )?);
     }
 
@@ -414,6 +417,7 @@ fn load_dense_attribute_messages_storage(
     storage: &dyn Storage,
     offset_size: u8,
     length_size: u8,
+    filter_registry: Option<&FilterRegistry>,
 ) -> Result<Vec<AttributeMessage>> {
     if Cursor::is_undefined_offset(info.fractal_heap_address, offset_size) {
         return Ok(Vec::new());
@@ -437,11 +441,16 @@ fn load_dense_attribute_messages_storage(
             _ => continue,
         };
 
-        let managed_bytes =
-            match heap.get_object_storage(&heap_id, storage, offset_size, length_size) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
+        let managed_bytes = match heap.get_object_storage_with_registry(
+            &heap_id,
+            storage,
+            offset_size,
+            length_size,
+            filter_registry,
+        ) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
 
         let mut attr_cursor = Cursor::new(&managed_bytes);
         if let Ok(attr) = messages::attribute::parse(

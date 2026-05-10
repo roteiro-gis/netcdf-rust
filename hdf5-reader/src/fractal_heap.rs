@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
+use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
+use crate::messages::filter_pipeline::FilterPipelineMessage;
 use crate::storage::Storage;
 
 /// Signature bytes for a fractal heap header: ASCII `FRHP`.
@@ -83,27 +85,49 @@ pub struct FractalHeap {
 /// Cache of verified direct blocks for repeated object lookups in one heap.
 #[derive(Debug, Default)]
 pub struct FractalHeapDirectBlockCache {
-    blocks: HashMap<(u64, u64), Arc<Vec<u8>>>,
+    blocks: HashMap<DirectBlockCacheKey, Arc<Vec<u8>>>,
+}
+
+type DirectBlockCacheKey = (u64, u64, Option<u64>, u32);
+
+#[derive(Debug, Clone, Copy)]
+struct DirectBlockLocation {
+    address: u64,
+    block_offset_in_heap: u64,
+    block_size: u64,
+    filtered_size: Option<u64>,
+    filter_mask: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HugeObjectLocation {
+    address: u64,
+    disk_length: u64,
+    filter_mask: u32,
+    memory_length: Option<u64>,
 }
 
 impl FractalHeapDirectBlockCache {
     fn get_verified_block_storage(
         &mut self,
         heap: &FractalHeap,
-        block_address: u64,
-        block_size: u64,
+        location: DirectBlockLocation,
         storage: &dyn Storage,
         offset_size: u8,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Arc<Vec<u8>>> {
-        let key = (block_address, block_size);
+        let key = (
+            location.address,
+            location.block_size,
+            location.filtered_size,
+            location.filter_mask,
+        );
         if let Some(block) = self.blocks.get(&key) {
             return Ok(block.clone());
         }
 
-        let size = usize::try_from(block_size).map_err(|_| {
-            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
-        })?;
-        let block = storage.read_range(block_address, size)?.to_vec();
+        let block =
+            heap.load_direct_block_storage(location, storage, offset_size, filter_registry)?;
         heap.verify_direct_block_bytes(&block, offset_size)?;
         let block = Arc::new(block);
         self.blocks.insert(key, block.clone());
@@ -259,9 +283,34 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Vec<u8>> {
+        self.get_object_with_registry(heap_id, file_data, offset_size, length_size, None)
+    }
+
+    /// Extract any fractal heap object using a caller-provided filter registry
+    /// for filtered managed and huge objects.
+    pub fn get_object_with_registry(
+        &self,
+        heap_id: &[u8],
+        file_data: &[u8],
+        offset_size: u8,
+        length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
         match self.heap_id_kind(heap_id)? {
-            HeapIdKind::Managed => self.get_managed_object_impl(heap_id, file_data, offset_size),
-            HeapIdKind::Huge => self.get_huge_object(heap_id, file_data, offset_size, length_size),
+            HeapIdKind::Managed => self.get_managed_object_impl(
+                heap_id,
+                file_data,
+                offset_size,
+                length_size,
+                filter_registry,
+            ),
+            HeapIdKind::Huge => self.get_huge_object(
+                heap_id,
+                file_data,
+                offset_size,
+                length_size,
+                filter_registry,
+            ),
             HeapIdKind::Tiny => self.decode_tiny_object(heap_id),
         }
     }
@@ -274,8 +323,28 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Vec<u8>> {
+        self.get_object_storage_with_registry(heap_id, storage, offset_size, length_size, None)
+    }
+
+    /// Extract any fractal heap object from random-access storage using a
+    /// caller-provided filter registry for filtered managed and huge objects.
+    pub fn get_object_storage_with_registry(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
         let mut cache = FractalHeapDirectBlockCache::default();
-        self.get_object_storage_cached(heap_id, storage, offset_size, length_size, &mut cache)
+        self.get_object_storage_cached_with_registry(
+            heap_id,
+            storage,
+            offset_size,
+            length_size,
+            &mut cache,
+            filter_registry,
+        )
     }
 
     /// Extract any fractal heap object from storage, reusing verified direct
@@ -288,16 +357,43 @@ impl FractalHeap {
         length_size: u8,
         direct_block_cache: &mut FractalHeapDirectBlockCache,
     ) -> Result<Vec<u8>> {
+        self.get_object_storage_cached_with_registry(
+            heap_id,
+            storage,
+            offset_size,
+            length_size,
+            direct_block_cache,
+            None,
+        )
+    }
+
+    /// Extract any fractal heap object from storage while reusing verified
+    /// direct blocks and a caller-provided filter registry.
+    pub fn get_object_storage_cached_with_registry(
+        &self,
+        heap_id: &[u8],
+        storage: &dyn Storage,
+        offset_size: u8,
+        length_size: u8,
+        direct_block_cache: &mut FractalHeapDirectBlockCache,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
         match self.heap_id_kind(heap_id)? {
             HeapIdKind::Managed => self.get_managed_object_storage_cached_impl(
                 heap_id,
                 storage,
                 offset_size,
+                length_size,
                 direct_block_cache,
+                filter_registry,
             ),
-            HeapIdKind::Huge => {
-                self.get_huge_object_storage(heap_id, storage, offset_size, length_size)
-            }
+            HeapIdKind::Huge => self.get_huge_object_storage(
+                heap_id,
+                storage,
+                offset_size,
+                length_size,
+                filter_registry,
+            ),
             HeapIdKind::Tiny => self.decode_tiny_object(heap_id),
         }
     }
@@ -311,7 +407,7 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Vec<u8>> {
-        self.get_object(heap_id, file_data, offset_size, length_size)
+        self.get_object_with_registry(heap_id, file_data, offset_size, length_size, None)
     }
 
     /// Extract a fractal heap object from random-access storage. Kept for
@@ -323,7 +419,7 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Vec<u8>> {
-        self.get_object_storage(heap_id, storage, offset_size, length_size)
+        self.get_object_storage_with_registry(heap_id, storage, offset_size, length_size, None)
     }
 
     fn get_managed_object_impl(
@@ -331,35 +427,44 @@ impl FractalHeap {
         heap_id: &[u8],
         file_data: &[u8],
         offset_size: u8,
+        length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Vec<u8>> {
-        if self.io_filters_len > 0 {
-            return Err(Error::Other(
-                "filtered fractal heap managed objects are not supported".to_string(),
-            ));
-        }
-
         let (heap_offset, obj_length) = self.decode_managed_heap_id(heap_id)?;
 
         if obj_length == 0 {
             return Ok(Vec::new());
         }
 
-        let (block_address, block_offset_in_heap, block_size) =
-            self.find_direct_block(heap_offset, file_data, offset_size)?;
-        self.verify_direct_block(block_address, block_size, file_data, offset_size)?;
-        let offset_in_block = heap_offset - block_offset_in_heap;
-        let data_start = block_address as usize + offset_in_block as usize;
-        let data_end = data_start + obj_length as usize;
+        let location = self.find_direct_block(heap_offset, file_data, offset_size, length_size)?;
+        let block = self.load_direct_block(file_data, location, filter_registry)?;
+        self.verify_direct_block_bytes(&block, offset_size)?;
+        let offset_in_block = heap_offset
+            .checked_sub(location.block_offset_in_heap)
+            .ok_or_else(|| {
+                Error::InvalidData("fractal heap object precedes direct block".into())
+            })?;
+        let data_start = usize::try_from(offset_in_block)
+            .map_err(|_| Error::InvalidData("fractal heap object offset exceeds usize".into()))?;
+        let len = usize::try_from(obj_length).map_err(|_| {
+            Error::InvalidData("fractal heap object exceeds platform usize capacity".into())
+        })?;
+        let data_end = data_start
+            .checked_add(len)
+            .ok_or(Error::OffsetOutOfBounds(location.address))?;
 
-        if data_end > file_data.len() {
+        if data_end > block.len() {
             return Err(Error::UnexpectedEof {
-                offset: data_start as u64,
+                offset: location
+                    .address
+                    .checked_add(offset_in_block)
+                    .ok_or(Error::OffsetOutOfBounds(location.address))?,
                 needed: obj_length,
-                available: file_data.len().saturating_sub(data_start) as u64,
+                available: block.len().saturating_sub(data_start) as u64,
             });
         }
 
-        Ok(file_data[data_start..data_end].to_vec())
+        Ok(block[data_start..data_end].to_vec())
     }
 
     fn get_managed_object_storage_cached_impl(
@@ -367,30 +472,26 @@ impl FractalHeap {
         heap_id: &[u8],
         storage: &dyn Storage,
         offset_size: u8,
+        length_size: u8,
         direct_block_cache: &mut FractalHeapDirectBlockCache,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Vec<u8>> {
-        if self.io_filters_len > 0 {
-            return Err(Error::Other(
-                "filtered fractal heap managed objects are not supported".to_string(),
-            ));
-        }
-
         let (heap_offset, obj_length) = self.decode_managed_heap_id(heap_id)?;
         if obj_length == 0 {
             return Ok(Vec::new());
         }
 
-        let (block_address, block_offset_in_heap, block_size) =
-            self.find_direct_block_storage(heap_offset, storage, offset_size)?;
+        let location =
+            self.find_direct_block_storage(heap_offset, storage, offset_size, length_size)?;
         let block = direct_block_cache.get_verified_block_storage(
             self,
-            block_address,
-            block_size,
+            location,
             storage,
             offset_size,
+            filter_registry,
         )?;
         let offset_in_block = heap_offset
-            .checked_sub(block_offset_in_heap)
+            .checked_sub(location.block_offset_in_heap)
             .ok_or_else(|| {
                 Error::InvalidData("fractal heap object precedes direct block".into())
             })?;
@@ -401,11 +502,12 @@ impl FractalHeap {
         })?;
         let end = start
             .checked_add(len)
-            .ok_or(Error::OffsetOutOfBounds(block_address))?;
+            .ok_or(Error::OffsetOutOfBounds(location.address))?;
         if end > block.len() {
-            let data_start = block_address
+            let data_start = location
+                .address
                 .checked_add(offset_in_block)
-                .ok_or(Error::OffsetOutOfBounds(block_address))?;
+                .ok_or(Error::OffsetOutOfBounds(location.address))?;
             return Err(Error::UnexpectedEof {
                 offset: data_start,
                 needed: obj_length,
@@ -421,29 +523,31 @@ impl FractalHeap {
         file_data: &[u8],
         offset_size: u8,
         length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Vec<u8>> {
-        let (address, length) = self.resolve_huge_object_location(
+        let location = self.resolve_huge_object_location(
             heap_id,
             Some(file_data),
             None,
             offset_size,
             length_size,
         )?;
-        let start = usize::try_from(address).map_err(|_| Error::OffsetOutOfBounds(address))?;
-        let len = usize::try_from(length).map_err(|_| {
+        let start = usize::try_from(location.address)
+            .map_err(|_| Error::OffsetOutOfBounds(location.address))?;
+        let len = usize::try_from(location.disk_length).map_err(|_| {
             Error::InvalidData("huge fractal heap object exceeds platform usize capacity".into())
         })?;
         let end = start
             .checked_add(len)
-            .ok_or(Error::OffsetOutOfBounds(address))?;
+            .ok_or(Error::OffsetOutOfBounds(location.address))?;
         if end > file_data.len() {
             return Err(Error::UnexpectedEof {
-                offset: address,
-                needed: length,
+                offset: location.address,
+                needed: location.disk_length,
                 available: file_data.len().saturating_sub(start) as u64,
             });
         }
-        Ok(file_data[start..end].to_vec())
+        self.decode_huge_object_bytes(&file_data[start..end], location, filter_registry)
     }
 
     fn get_huge_object_storage(
@@ -452,18 +556,155 @@ impl FractalHeap {
         storage: &dyn Storage,
         offset_size: u8,
         length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Vec<u8>> {
-        let (address, length) = self.resolve_huge_object_location(
+        let location = self.resolve_huge_object_location(
             heap_id,
             None,
             Some(storage),
             offset_size,
             length_size,
         )?;
-        let len = usize::try_from(length).map_err(|_| {
+        let len = usize::try_from(location.disk_length).map_err(|_| {
             Error::InvalidData("huge fractal heap object exceeds platform usize capacity".into())
         })?;
-        Ok(storage.read_range(address, len)?.to_vec())
+        let bytes = storage.read_range(location.address, len)?;
+        self.decode_huge_object_bytes(bytes.as_ref(), location, filter_registry)
+    }
+
+    fn decode_huge_object_bytes(
+        &self,
+        bytes: &[u8],
+        location: HugeObjectLocation,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
+        if let Some(memory_length) = location.memory_length {
+            self.apply_heap_filters(
+                bytes,
+                location.filter_mask,
+                memory_length,
+                "filtered fractal heap huge object",
+                filter_registry,
+            )
+        } else {
+            Ok(bytes.to_vec())
+        }
+    }
+
+    fn load_direct_block(
+        &self,
+        file_data: &[u8],
+        location: DirectBlockLocation,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
+        let read_len = location.filtered_size.unwrap_or(location.block_size);
+        let start = usize::try_from(location.address)
+            .map_err(|_| Error::OffsetOutOfBounds(location.address))?;
+        let len = usize::try_from(read_len).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        let end = start
+            .checked_add(len)
+            .ok_or(Error::OffsetOutOfBounds(location.address))?;
+        if end > file_data.len() {
+            return Err(Error::UnexpectedEof {
+                offset: location.address,
+                needed: read_len,
+                available: file_data.len().saturating_sub(start) as u64,
+            });
+        }
+        let block = if location.filtered_size.is_some() {
+            self.apply_heap_filters(
+                &file_data[start..end],
+                location.filter_mask,
+                location.block_size,
+                "filtered fractal heap direct block",
+                filter_registry,
+            )?
+        } else {
+            file_data[start..end].to_vec()
+        };
+        let expected = usize::try_from(location.block_size).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        if block.len() != expected {
+            return Err(Error::InvalidData(format!(
+                "fractal heap direct block has {} bytes, expected {} bytes",
+                block.len(),
+                expected
+            )));
+        }
+        Ok(block)
+    }
+
+    fn load_direct_block_storage(
+        &self,
+        location: DirectBlockLocation,
+        storage: &dyn Storage,
+        _offset_size: u8,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
+        let read_len = location.filtered_size.unwrap_or(location.block_size);
+        let len = usize::try_from(read_len).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        let bytes = storage.read_range(location.address, len)?;
+        let block = if location.filtered_size.is_some() {
+            self.apply_heap_filters(
+                bytes.as_ref(),
+                location.filter_mask,
+                location.block_size,
+                "filtered fractal heap direct block",
+                filter_registry,
+            )?
+        } else {
+            bytes.to_vec()
+        };
+        let expected = usize::try_from(location.block_size).map_err(|_| {
+            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
+        })?;
+        if block.len() != expected {
+            return Err(Error::InvalidData(format!(
+                "fractal heap direct block has {} bytes, expected {} bytes",
+                block.len(),
+                expected
+            )));
+        }
+        Ok(block)
+    }
+
+    fn apply_heap_filters(
+        &self,
+        bytes: &[u8],
+        filter_mask: u32,
+        expected_len: u64,
+        context: &str,
+        filter_registry: Option<&FilterRegistry>,
+    ) -> Result<Vec<u8>> {
+        let pipeline = self.filter_pipeline()?;
+        let decoded =
+            filters::apply_pipeline(bytes, &pipeline.filters, filter_mask, 1, filter_registry)?;
+        let expected = usize::try_from(expected_len).map_err(|_| {
+            Error::InvalidData(format!("{context} size exceeds platform usize capacity"))
+        })?;
+        if decoded.len() != expected {
+            return Err(Error::InvalidData(format!(
+                "{context} decoded to {} bytes, expected {} bytes",
+                decoded.len(),
+                expected
+            )));
+        }
+        Ok(decoded)
+    }
+
+    fn filter_pipeline(&self) -> Result<FilterPipelineMessage> {
+        if self.io_filters_len == 0 {
+            return Err(Error::InvalidData(
+                "fractal heap object is marked filtered but the heap has no filter pipeline".into(),
+            ));
+        }
+        let mut cursor = Cursor::new(&self.io_filter_info);
+        crate::messages::filter_pipeline::parse(&mut cursor, 0, 0, self.io_filter_info.len())
     }
 
     fn resolve_huge_object_location(
@@ -473,21 +714,34 @@ impl FractalHeap {
         storage: Option<&dyn Storage>,
         offset_size: u8,
         length_size: u8,
-    ) -> Result<(u64, u64)> {
+    ) -> Result<HugeObjectLocation> {
         let direct_unfiltered_len = 1 + usize::from(offset_size) + usize::from(length_size);
         let direct_filtered_len = direct_unfiltered_len + 4 + usize::from(length_size);
 
         if self.io_filters_len > 0 && heap_id.len() >= direct_filtered_len {
-            return Err(Error::Other(
-                "filtered fractal heap huge objects are not supported".to_string(),
-            ));
+            let mut cursor = Cursor::new(&heap_id[1..]);
+            let address = cursor.read_offset(offset_size)?;
+            let disk_length = cursor.read_length(length_size)?;
+            let filter_mask = cursor.read_u32_le()?;
+            let memory_length = cursor.read_length(length_size)?;
+            return Ok(HugeObjectLocation {
+                address,
+                disk_length,
+                filter_mask,
+                memory_length: Some(memory_length),
+            });
         }
 
         if self.io_filters_len == 0 && heap_id.len() >= direct_unfiltered_len {
             let mut cursor = Cursor::new(&heap_id[1..]);
             let address = cursor.read_offset(offset_size)?;
-            let length = cursor.read_length(length_size)?;
-            return Ok((address, length));
+            let disk_length = cursor.read_length(length_size)?;
+            return Ok(HugeObjectLocation {
+                address,
+                disk_length,
+                filter_mask: 0,
+                memory_length: None,
+            });
         }
 
         if heap_id.len() < 1 + usize::from(length_size) {
@@ -544,14 +798,27 @@ impl FractalHeap {
                     address,
                     length,
                     object_id: record_id,
-                } if record_id == object_id => return Ok((address, length)),
+                } if record_id == object_id => {
+                    return Ok(HugeObjectLocation {
+                        address,
+                        disk_length: length,
+                        filter_mask: 0,
+                        memory_length: None,
+                    })
+                }
                 crate::btree_v2::BTreeV2Record::HugeIndirectFiltered {
                     object_id: record_id,
-                    ..
+                    address,
+                    filtered_length,
+                    filter_mask,
+                    memory_length,
                 } if record_id == object_id => {
-                    return Err(Error::Other(
-                        "filtered fractal heap huge objects are not supported".to_string(),
-                    ));
+                    return Ok(HugeObjectLocation {
+                        address,
+                        disk_length: filtered_length,
+                        filter_mask,
+                        memory_length: Some(memory_length),
+                    });
                 }
                 _ => {}
             }
@@ -642,7 +909,8 @@ impl FractalHeap {
         heap_offset: u64,
         file_data: &[u8],
         offset_size: u8,
-    ) -> Result<(u64, u64, u64)> {
+        length_size: u8,
+    ) -> Result<DirectBlockLocation> {
         if Cursor::is_undefined_offset(self.root_block_address, offset_size) {
             return Err(Error::UndefinedAddress);
         }
@@ -650,7 +918,13 @@ impl FractalHeap {
         if self.current_rows_in_root_indirect == 0 {
             // Root block is a direct block.
             // The entire managed space is in this one block.
-            Ok((self.root_block_address, 0, self.starting_block_size))
+            Ok(DirectBlockLocation {
+                address: self.root_block_address,
+                block_offset_in_heap: 0,
+                block_size: self.starting_block_size,
+                filtered_size: self.io_filter_size,
+                filter_mask: self.io_filter_mask.unwrap_or(0),
+            })
         } else {
             // Root block is an indirect block — traverse the doubling table.
             self.find_direct_block_via_indirect(
@@ -658,6 +932,7 @@ impl FractalHeap {
                 heap_offset,
                 file_data,
                 offset_size,
+                length_size,
                 self.current_rows_in_root_indirect,
             )
         }
@@ -668,19 +943,27 @@ impl FractalHeap {
         heap_offset: u64,
         storage: &dyn Storage,
         offset_size: u8,
-    ) -> Result<(u64, u64, u64)> {
+        length_size: u8,
+    ) -> Result<DirectBlockLocation> {
         if Cursor::is_undefined_offset(self.root_block_address, offset_size) {
             return Err(Error::UndefinedAddress);
         }
 
         if self.current_rows_in_root_indirect == 0 {
-            Ok((self.root_block_address, 0, self.starting_block_size))
+            Ok(DirectBlockLocation {
+                address: self.root_block_address,
+                block_offset_in_heap: 0,
+                block_size: self.starting_block_size,
+                filtered_size: self.io_filter_size,
+                filter_mask: self.io_filter_mask.unwrap_or(0),
+            })
         } else {
             self.find_direct_block_via_indirect_storage(
                 self.root_block_address,
                 heap_offset,
                 storage,
                 offset_size,
+                length_size,
                 self.current_rows_in_root_indirect,
             )
         }
@@ -693,8 +976,9 @@ impl FractalHeap {
         heap_offset: u64,
         file_data: &[u8],
         offset_size: u8,
+        length_size: u8,
         nrows: u16,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<DirectBlockLocation> {
         // Validate FHIB signature
         let addr = indirect_address as usize;
         if addr + 4 > file_data.len() {
@@ -731,28 +1015,67 @@ impl FractalHeap {
 
                     // Indirect block layout: signature(4) + version(1) +
                     // heap_header_addr(offset_size) + block_offset(max_heap_size/8 rounded up)
-                    // Then entry_index * offset_size bytes to the address.
+                    // Then direct-block entries, optionally with filtered size
+                    // and mask, followed by child indirect-block addresses.
                     let iblock_header_size =
                         4 + 1 + offset_size as u64 + (self.max_heap_size as u64).div_ceil(8);
-                    let entry_addr_pos =
-                        indirect_address + iblock_header_size + entry_index * offset_size as u64;
-
-                    if entry_addr_pos as usize + offset_size as usize > file_data.len() {
-                        return Err(Error::OffsetOutOfBounds(entry_addr_pos));
-                    }
-
-                    let mut cursor = Cursor::new(file_data);
-                    cursor.set_position(entry_addr_pos);
-                    let block_address = cursor.read_offset(offset_size)?;
-
-                    if Cursor::is_undefined_offset(block_address, offset_size) {
-                        return Err(Error::UndefinedAddress);
-                    }
 
                     if is_direct {
-                        return Ok((block_address, running_offset, block_size));
+                        let entry_size = self.direct_block_entry_size(offset_size, length_size);
+                        let entry_pos =
+                            indirect_address + iblock_header_size + entry_index * entry_size;
+                        let entry_len = usize::try_from(entry_size).map_err(|_| {
+                            Error::InvalidData(
+                                "fractal heap direct entry size exceeds platform usize".into(),
+                            )
+                        })?;
+                        if entry_pos as usize + entry_len > file_data.len() {
+                            return Err(Error::OffsetOutOfBounds(entry_pos));
+                        }
+                        let mut cursor = Cursor::new(file_data);
+                        cursor.set_position(entry_pos);
+                        let block_address = cursor.read_offset(offset_size)?;
+                        if Cursor::is_undefined_offset(block_address, offset_size) {
+                            return Err(Error::UndefinedAddress);
+                        }
+                        let (filtered_size, filter_mask) = if self.io_filters_len > 0 {
+                            (
+                                Some(cursor.read_length(length_size)?),
+                                cursor.read_u32_le()?,
+                            )
+                        } else {
+                            (None, 0)
+                        };
+                        return Ok(DirectBlockLocation {
+                            address: block_address,
+                            block_offset_in_heap: running_offset,
+                            block_size,
+                            filtered_size,
+                            filter_mask,
+                        });
                     } else {
                         // Need to recurse into a sub-indirect block.
+                        let direct_count =
+                            self.max_direct_block_rows() * u64::from(self.table_width);
+                        let indirect_index =
+                            entry_index.checked_sub(direct_count).ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap indirect entry precedes direct entries".into(),
+                                )
+                            })?;
+                        let entry_pos = indirect_address
+                            + iblock_header_size
+                            + direct_count * self.direct_block_entry_size(offset_size, length_size)
+                            + indirect_index * u64::from(offset_size);
+                        if entry_pos as usize + offset_size as usize > file_data.len() {
+                            return Err(Error::OffsetOutOfBounds(entry_pos));
+                        }
+                        let mut cursor = Cursor::new(file_data);
+                        cursor.set_position(entry_pos);
+                        let block_address = cursor.read_offset(offset_size)?;
+                        if Cursor::is_undefined_offset(block_address, offset_size) {
+                            return Err(Error::UndefinedAddress);
+                        }
                         // Determine how many rows the sub-indirect has.
                         let sub_rows = self.rows_for_block_size(block_size);
                         return self.find_direct_block_via_indirect(
@@ -760,6 +1083,7 @@ impl FractalHeap {
                             heap_offset - running_offset,
                             file_data,
                             offset_size,
+                            length_size,
                             sub_rows,
                         );
                     }
@@ -780,8 +1104,9 @@ impl FractalHeap {
         heap_offset: u64,
         storage: &dyn Storage,
         offset_size: u8,
+        length_size: u8,
         nrows: u16,
-    ) -> Result<(u64, u64, u64)> {
+    ) -> Result<DirectBlockLocation> {
         let sig = storage.read_range(indirect_address, 4)?;
         if sig.as_ref() != FHIB_SIGNATURE {
             return Err(Error::InvalidData(format!(
@@ -806,19 +1131,55 @@ impl FractalHeap {
                         + 1
                         + u64::from(offset_size)
                         + (u64::from(self.max_heap_size)).div_ceil(8);
+
+                    if is_direct {
+                        let entry_size = self.direct_block_entry_size(offset_size, length_size);
+                        let entry_pos =
+                            indirect_address + iblock_header_size + entry_index * entry_size;
+                        let entry_len = usize::try_from(entry_size).map_err(|_| {
+                            Error::InvalidData(
+                                "fractal heap direct entry size exceeds platform usize".into(),
+                            )
+                        })?;
+                        let entry = storage.read_range(entry_pos, entry_len)?;
+                        let mut cursor = Cursor::new(entry.as_ref());
+                        let block_address = cursor.read_offset(offset_size)?;
+                        if Cursor::is_undefined_offset(block_address, offset_size) {
+                            return Err(Error::UndefinedAddress);
+                        }
+                        let (filtered_size, filter_mask) = if self.io_filters_len > 0 {
+                            (
+                                Some(cursor.read_length(length_size)?),
+                                cursor.read_u32_le()?,
+                            )
+                        } else {
+                            (None, 0)
+                        };
+                        return Ok(DirectBlockLocation {
+                            address: block_address,
+                            block_offset_in_heap: running_offset,
+                            block_size,
+                            filtered_size,
+                            filter_mask,
+                        });
+                    }
+
+                    let direct_count = self.max_direct_block_rows() * u64::from(self.table_width);
+                    let indirect_index =
+                        entry_index.checked_sub(direct_count).ok_or_else(|| {
+                            Error::InvalidData(
+                                "fractal heap indirect entry precedes direct entries".into(),
+                            )
+                        })?;
                     let entry_addr_pos = indirect_address
                         + iblock_header_size
-                        + entry_index * u64::from(offset_size);
+                        + direct_count * self.direct_block_entry_size(offset_size, length_size)
+                        + indirect_index * u64::from(offset_size);
                     let entry = storage.read_range(entry_addr_pos, usize::from(offset_size))?;
                     let mut cursor = Cursor::new(entry.as_ref());
                     let block_address = cursor.read_offset(offset_size)?;
-
                     if Cursor::is_undefined_offset(block_address, offset_size) {
                         return Err(Error::UndefinedAddress);
-                    }
-
-                    if is_direct {
-                        return Ok((block_address, running_offset, block_size));
                     }
 
                     let sub_rows = self.rows_for_block_size(block_size);
@@ -827,6 +1188,7 @@ impl FractalHeap {
                         heap_offset - running_offset,
                         storage,
                         offset_size,
+                        length_size,
                         sub_rows,
                     );
                 }
@@ -870,42 +1232,52 @@ impl FractalHeap {
         rows
     }
 
+    fn max_direct_block_rows(&self) -> u64 {
+        let mut rows = 0u64;
+        loop {
+            if self.block_size_for_row(rows) > self.max_direct_block_size {
+                break;
+            }
+            rows += 1;
+            if rows > 1000 {
+                break;
+            }
+        }
+        rows
+    }
+
+    fn direct_block_entry_size(&self, offset_size: u8, length_size: u8) -> u64 {
+        let mut size = u64::from(offset_size);
+        if self.io_filters_len > 0 {
+            size += u64::from(length_size) + 4;
+        }
+        size
+    }
+
     /// Size in bytes of an unfiltered direct block header.
     fn direct_block_header_size(&self, offset_size: u8) -> usize {
         // Signature(4) + Version(1) + Heap header address(offset_size) +
         // Block offset within heap (max_heap_size bits, rounded up to bytes) +
-        // Checksum(4). Managed filtered heaps are rejected before this is used.
+        // optional Checksum(4).
         let offset_bytes = (self.max_heap_size as usize).div_ceil(8);
-        4 + 1 + offset_size as usize + offset_bytes + 4
+        let checksum_bytes = if self.direct_blocks_are_checksummed() {
+            4
+        } else {
+            0
+        };
+        4 + 1 + offset_size as usize + offset_bytes + checksum_bytes
     }
 
-    fn direct_block_checksum_pos(&self, offset_size: u8) -> usize {
-        self.direct_block_header_size(offset_size) - 4
+    fn direct_blocks_are_checksummed(&self) -> bool {
+        self.flags & 0x02 != 0
     }
 
-    fn verify_direct_block(
-        &self,
-        block_address: u64,
-        block_size: u64,
-        file_data: &[u8],
-        offset_size: u8,
-    ) -> Result<()> {
-        let start =
-            usize::try_from(block_address).map_err(|_| Error::OffsetOutOfBounds(block_address))?;
-        let block_size = usize::try_from(block_size).map_err(|_| {
-            Error::InvalidData("fractal heap direct block size exceeds platform usize".into())
-        })?;
-        let end = start
-            .checked_add(block_size)
-            .ok_or(Error::OffsetOutOfBounds(block_address))?;
-        if end > file_data.len() {
-            return Err(Error::UnexpectedEof {
-                offset: block_address,
-                needed: block_size as u64,
-                available: file_data.len().saturating_sub(start) as u64,
-            });
+    fn direct_block_checksum_pos(&self, offset_size: u8) -> Option<usize> {
+        if self.direct_blocks_are_checksummed() {
+            Some(self.direct_block_header_size(offset_size) - 4)
+        } else {
+            None
         }
-        self.verify_direct_block_bytes(&file_data[start..end], offset_size)
     }
 
     fn verify_direct_block_bytes(&self, block: &[u8], offset_size: u8) -> Result<()> {
@@ -925,20 +1297,21 @@ impl FractalHeap {
         if version != 0 {
             return Err(Error::UnsupportedFractalHeapVersion(version));
         }
-        let checksum_pos = self.direct_block_checksum_pos(offset_size);
-        let stored_checksum = u32::from_le_bytes(
-            block[checksum_pos..checksum_pos + 4]
-                .try_into()
-                .expect("direct block checksum slice has four bytes"),
-        );
-        let mut checksum_data = block.to_vec();
-        checksum_data[checksum_pos..checksum_pos + 4].fill(0);
-        let computed = jenkins_lookup3(&checksum_data);
-        if computed != stored_checksum {
-            return Err(Error::ChecksumMismatch {
-                expected: stored_checksum,
-                actual: computed,
-            });
+        if let Some(checksum_pos) = self.direct_block_checksum_pos(offset_size) {
+            let stored_checksum = u32::from_le_bytes(
+                block[checksum_pos..checksum_pos + 4]
+                    .try_into()
+                    .expect("direct block checksum slice has four bytes"),
+            );
+            let mut checksum_data = block.to_vec();
+            checksum_data[checksum_pos..checksum_pos + 4].fill(0);
+            let computed = jenkins_lookup3(&checksum_data);
+            if computed != stored_checksum {
+                return Err(Error::ChecksumMismatch {
+                    expected: stored_checksum,
+                    actual: computed,
+                });
+            }
         }
         Ok(())
     }
@@ -975,6 +1348,9 @@ fn bytes_needed_to_encode(value: u64) -> usize {
 mod tests {
     use super::*;
     use crate::storage::{Storage, StorageBuffer};
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
 
     fn base_heap() -> FractalHeap {
@@ -1005,6 +1381,44 @@ mod tests {
             io_filter_mask: None,
             io_filter_info: Vec::new(),
         }
+    }
+
+    fn deflate_filter_info() -> Vec<u8> {
+        let mut data = vec![0x02, 0x01];
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&6u32.to_le_bytes());
+        data
+    }
+
+    fn zlib_compress(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn filtered_heap_with_info(filter_info: Vec<u8>) -> FractalHeap {
+        let mut heap = base_heap();
+        heap.io_filters_len = filter_info.len() as u16;
+        heap.io_filter_info = filter_info;
+        heap
+    }
+
+    fn direct_block_with_object(heap: &FractalHeap, block_size: usize, obj: &[u8]) -> Vec<u8> {
+        let offset_size = 8;
+        let mut block = vec![0u8; block_size];
+        block[0..4].copy_from_slice(b"FHDB");
+        block[4] = 0;
+        let obj_offset = heap.direct_block_header_size(offset_size);
+        block[obj_offset..obj_offset + obj.len()].copy_from_slice(obj);
+        if let Some(checksum_pos) = heap.direct_block_checksum_pos(offset_size) {
+            let mut checksum_data = block.clone();
+            checksum_data[checksum_pos..checksum_pos + 4].fill(0);
+            let checksum = jenkins_lookup3(&checksum_data);
+            block[checksum_pos..checksum_pos + 4].copy_from_slice(&checksum.to_le_bytes());
+        }
+        block
     }
 
     struct CountingStorage {
@@ -1091,6 +1505,90 @@ mod tests {
 
         let result = heap.get_object(&heap_id, &file_data, 8, 8).unwrap();
         assert_eq!(result, b"huge");
+    }
+
+    #[test]
+    fn test_get_filtered_huge_direct_object() {
+        let heap = filtered_heap_with_info(deflate_filter_info());
+        let payload = b"filtered huge payload";
+        let compressed = zlib_compress(payload);
+        let address = 64u64;
+        let mut file_data = vec![0u8; address as usize + compressed.len()];
+        file_data[address as usize..].copy_from_slice(&compressed);
+
+        let mut heap_id = Vec::new();
+        heap_id.push(0x10);
+        heap_id.extend_from_slice(&address.to_le_bytes());
+        heap_id.extend_from_slice(&(compressed.len() as u64).to_le_bytes());
+        heap_id.extend_from_slice(&0u32.to_le_bytes());
+        heap_id.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+
+        let result = heap.get_object(&heap_id, &file_data, 8, 8).unwrap();
+        assert_eq!(result, payload);
+    }
+
+    #[test]
+    fn test_get_filtered_managed_object_direct_root() {
+        let mut heap = filtered_heap_with_info(deflate_filter_info());
+        let block_address = 1000u64;
+        let obj_data = b"filtered managed";
+        let block = direct_block_with_object(&heap, heap.starting_block_size as usize, obj_data);
+        let compressed = zlib_compress(&block);
+        heap.root_block_address = block_address;
+        heap.io_filter_size = Some(compressed.len() as u64);
+        heap.io_filter_mask = Some(0);
+
+        let file_size = block_address as usize + compressed.len();
+        let mut file_data = vec![0u8; file_size];
+        file_data[block_address as usize..].copy_from_slice(&compressed);
+
+        let obj_offset = heap.direct_block_header_size(8) as u16;
+        let mut heap_id = vec![0x00];
+        heap_id.extend_from_slice(&obj_offset.to_le_bytes());
+        heap_id.push(obj_data.len() as u8);
+
+        let result = heap.get_object(&heap_id, &file_data, 8, 8).unwrap();
+        assert_eq!(result, obj_data);
+    }
+
+    #[test]
+    fn test_get_filtered_managed_object_from_indirect_block() {
+        let mut heap = filtered_heap_with_info(deflate_filter_info());
+        let indirect_address = 512u64;
+        let block_address = 1000u64;
+        let obj_data = b"filtered child";
+        let block = direct_block_with_object(&heap, heap.starting_block_size as usize, obj_data);
+        let compressed = zlib_compress(&block);
+
+        heap.root_block_address = indirect_address;
+        heap.current_rows_in_root_indirect = 1;
+
+        let offset_bytes = usize::from(heap.max_heap_size).div_ceil(8);
+        let iblock_header_size = 4 + 1 + 8 + offset_bytes;
+        let direct_entry_size = 8 + 8 + 4;
+        let mut indirect = vec![0u8; iblock_header_size + direct_entry_size * 4];
+        indirect[0..4].copy_from_slice(b"FHIB");
+        indirect[4] = 0;
+        let entry_pos = iblock_header_size;
+        indirect[entry_pos..entry_pos + 8].copy_from_slice(&block_address.to_le_bytes());
+        indirect[entry_pos + 8..entry_pos + 16]
+            .copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+        indirect[entry_pos + 16..entry_pos + 20].copy_from_slice(&0u32.to_le_bytes());
+
+        let file_size = block_address as usize + compressed.len();
+        let mut file_data = vec![0u8; file_size];
+        file_data[indirect_address as usize..indirect_address as usize + indirect.len()]
+            .copy_from_slice(&indirect);
+        file_data[block_address as usize..].copy_from_slice(&compressed);
+        let storage = crate::storage::BytesStorage::new(file_data);
+
+        let obj_offset = heap.direct_block_header_size(8) as u16;
+        let mut heap_id = vec![0x00];
+        heap_id.extend_from_slice(&obj_offset.to_le_bytes());
+        heap_id.push(obj_data.len() as u8);
+
+        let result = heap.get_object_storage(&heap_id, &storage, 8, 8).unwrap();
+        assert_eq!(result, obj_data);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::btree_v2::{self, BTreeV2Record};
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
+use crate::filters::FilterRegistry;
 use crate::fractal_heap::FractalHeap;
 use crate::io::Cursor;
 use crate::messages::{parse_message, HdfMessage};
@@ -133,6 +134,7 @@ impl SharedMessageTable {
         storage: &dyn Storage,
         offset_size: u8,
         length_size: u8,
+        filter_registry: Option<&FilterRegistry>,
     ) -> Result<Option<HdfMessage>> {
         let preferred_indexes: Vec<&SharedMessageIndex> = self
             .indexes
@@ -184,8 +186,13 @@ impl SharedMessageTable {
                     offset_size,
                     length_size,
                 )?;
-                let payload =
-                    heap.get_object_storage(heap_id, storage, offset_size, length_size)?;
+                let payload = heap.get_object_storage_with_registry(
+                    heap_id,
+                    storage,
+                    offset_size,
+                    length_size,
+                    filter_registry,
+                )?;
                 let mut cursor = Cursor::new(&payload);
                 let message = parse_message(
                     message_type,
