@@ -268,6 +268,7 @@ impl FileContext {
             self.storage.as_ref(),
             self.superblock.offset_size,
             self.superblock.length_size,
+            Some(self.filter_registry.as_ref()),
         )
     }
 

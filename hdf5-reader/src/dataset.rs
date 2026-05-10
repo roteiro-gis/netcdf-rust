@@ -750,6 +750,7 @@ impl Dataset {
             context.context.storage.as_ref(),
             context.context.superblock.offset_size,
             context.context.superblock.length_size,
+            Some(context.context.filter_registry.as_ref()),
         )?;
 
         for msg in &header.messages {
@@ -1219,6 +1220,7 @@ impl Dataset {
     }
 
     fn read_compact<T: H5Type>(&self, data: &[u8]) -> Result<ArrayD<T>> {
+        self.validate_allocated_raw_data_len("compact", data.len())?;
         self.decode_raw_data::<T>(data)
     }
 
@@ -1299,7 +1301,8 @@ impl Dataset {
     fn read_raw_bytes_into_inner(&self, dst: &mut [u8]) -> Result<()> {
         match &self.layout {
             DataLayout::Compact { data } => {
-                self.copy_normalized_bytes_into(data, dst);
+                self.validate_allocated_raw_data_len("compact", data.len())?;
+                dst.copy_from_slice(data);
                 Ok(())
             }
             DataLayout::Contiguous { address, size } => {
@@ -1383,7 +1386,7 @@ impl Dataset {
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
         if self.external_files.is_some() {
-            let elem_size = dtype_element_size(&self.datatype);
+            let elem_size = self.raw_element_size();
             let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
             let total_bytes =
                 checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
@@ -1397,6 +1400,7 @@ impl Dataset {
         }
 
         let sz = checked_usize(size, "contiguous dataset size")?;
+        self.validate_allocated_raw_data_len("contiguous", sz)?;
         let raw = self.context.read_range(address, sz)?;
         self.decode_raw_data::<T>(raw.as_ref())
     }
@@ -1412,13 +1416,12 @@ impl Dataset {
         }
 
         let sz = checked_usize(size, "contiguous dataset size")?;
-        let read_len = sz.min(dst.len());
-        self.fill_output_buffer(dst);
-        if read_len == 0 {
+        self.validate_allocated_raw_data_len("contiguous", sz)?;
+        if dst.is_empty() {
             return Ok(());
         }
-        let raw = self.context.read_range(address, read_len)?;
-        dst[..read_len].copy_from_slice(raw.as_ref());
+        let raw = self.context.read_range(address, sz)?;
+        dst.copy_from_slice(raw.as_ref());
         Ok(())
     }
 
@@ -2671,13 +2674,19 @@ impl Dataset {
             return self
                 .make_fill_array_from_shape::<T>(resolved.result_elements, &resolved.result_shape);
         }
+        if self.external_files.is_none() {
+            self.validate_allocated_raw_data_len(
+                "contiguous",
+                checked_usize(size, "contiguous dataset size")?,
+            )?;
+        }
 
         let shape = &self.dataspace.dims;
         if selection_covers_full_dataset(resolved, shape) {
             return self.read_contiguous::<T>(address, size);
         }
 
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
         let result_total_bytes = checked_mul_usize(
             resolved.result_elements,
             elem_size,
@@ -2871,7 +2880,15 @@ impl Dataset {
         n: usize,
         shape: &[usize],
     ) -> Result<ArrayD<T>> {
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = self.raw_element_size();
+        let expected_bytes = checked_mul_usize(n, elem_size, "decoded buffer byte length")?;
+        if raw.len() != expected_bytes {
+            return Err(Error::InvalidData(format!(
+                "decoded buffer has {} bytes, expected {} bytes",
+                raw.len(),
+                expected_bytes
+            )));
+        }
 
         if let Some(elements) = T::decode_vec(raw, &self.datatype, n) {
             let elements = elements?;
@@ -2883,22 +2900,7 @@ impl Dataset {
         for i in 0..n {
             let start = checked_mul_usize(i, elem_size, "decoded element byte offset")?;
             let end = checked_mul_usize(i + 1, elem_size, "decoded element end offset")?;
-            if end > raw.len() {
-                // Pad with fill value or zeros if data is short.
-                let padded = if end <= raw.len().saturating_add(elem_size) {
-                    let mut buf = vec![0u8; elem_size];
-                    let available = raw.len().saturating_sub(start);
-                    if available > 0 {
-                        buf[..available].copy_from_slice(&raw[start..start + available]);
-                    }
-                    T::from_bytes(&buf, &self.datatype)?
-                } else {
-                    T::from_bytes(&vec![0u8; elem_size], &self.datatype)?
-                };
-                elements.push(padded);
-            } else {
-                elements.push(T::from_bytes(&raw[start..end], &self.datatype)?);
-            }
+            elements.push(T::from_bytes(&raw[start..end], &self.datatype)?);
         }
 
         ArrayD::from_shape_vec(IxDyn(shape), elements)
@@ -2953,10 +2955,14 @@ impl Dataset {
         }
     }
 
-    fn copy_normalized_bytes_into(&self, raw: &[u8], dst: &mut [u8]) {
-        self.fill_output_buffer(dst);
-        let copy_len = raw.len().min(dst.len());
-        dst[..copy_len].copy_from_slice(&raw[..copy_len]);
+    fn validate_allocated_raw_data_len(&self, storage_kind: &str, actual_len: usize) -> Result<()> {
+        let expected_len = self.raw_byte_len()?;
+        if actual_len != expected_len {
+            return Err(Error::InvalidData(format!(
+                "{storage_kind} raw data has {actual_len} bytes, expected {expected_len} bytes"
+            )));
+        }
+        Ok(())
     }
 
     fn convert_to_native_endian(&self, bytes: &mut [u8]) -> Result<()> {
@@ -3796,6 +3802,72 @@ fn slice_array<T: H5Type + Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::BytesStorage;
+    use crate::superblock::Superblock;
+    use std::collections::HashMap;
+
+    fn test_context(bytes: Vec<u8>) -> Arc<FileContext> {
+        let storage: DynStorage = Arc::new(BytesStorage::new(bytes));
+        Arc::new(FileContext {
+            storage,
+            superblock: Superblock {
+                version: 2,
+                offset_size: 8,
+                length_size: 8,
+                group_leaf_node_k: 0,
+                group_internal_node_k: 0,
+                indexed_storage_k: 0,
+                consistency_flags: 0,
+                base_address: 0,
+                free_space_address: u64::MAX,
+                eof_address: 0,
+                driver_info_address: u64::MAX,
+                root_symbol_table_entry: None,
+                root_object_header_address: Some(0),
+                extension_address: None,
+            },
+            chunk_cache: Arc::new(ChunkCache::new(1024, 8)),
+            header_cache: Arc::new(Mutex::new(HashMap::new())),
+            dataset_path_cache: Arc::new(Mutex::new(HashMap::new())),
+            filter_registry: Arc::new(FilterRegistry::default()),
+            external_file_resolver: None,
+            external_link_resolver: None,
+            external_file_cache: Mutex::new(HashMap::new()),
+            sohm_table: OnceLock::new(),
+            full_file_cache: OnceLock::new(),
+        })
+    }
+
+    fn fixed_u16_dataset(layout: DataLayout, storage_bytes: Vec<u8>) -> Dataset {
+        let context = test_context(storage_bytes);
+        Dataset {
+            context: context.clone(),
+            name: "short".to_string(),
+            data_address: 0,
+            dataspace: DataspaceMessage {
+                rank: 1,
+                dims: vec![3],
+                max_dims: None,
+                dataspace_type: DataspaceType::Simple,
+            },
+            datatype: Datatype::FixedPoint {
+                size: 2,
+                signed: false,
+                byte_order: ByteOrder::LittleEndian,
+            },
+            layout,
+            fill_value: None,
+            filters: None,
+            external_files: None,
+            attributes: Vec::new(),
+            chunk_cache: context.chunk_cache.clone(),
+            chunk_entry_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap()))),
+            full_chunk_entries: Arc::new(OnceLock::new()),
+            full_dataset_bytes: Arc::new(OnceLock::new()),
+            external_slots: Arc::new(OnceLock::new()),
+            filter_registry: context.filter_registry.clone(),
+        }
+    }
 
     #[test]
     fn test_slice_info_all() {
@@ -3826,6 +3898,45 @@ mod tests {
                 12,
             ),
             72
+        );
+    }
+
+    #[test]
+    fn test_compact_raw_data_requires_exact_logical_length() {
+        let dataset = fixed_u16_dataset(
+            DataLayout::Compact {
+                data: vec![1, 0, 2, 0, 3],
+            },
+            Vec::new(),
+        );
+
+        let err = dataset.read_array::<u16>().unwrap_err();
+        assert!(
+            matches!(err, Error::Context { .. })
+                && err
+                    .to_string()
+                    .contains("compact raw data has 5 bytes, expected 6 bytes"),
+            "expected compact raw length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_contiguous_raw_data_requires_exact_logical_length() {
+        let dataset = fixed_u16_dataset(
+            DataLayout::Contiguous {
+                address: 0,
+                size: 5,
+            },
+            vec![1, 0, 2, 0, 3],
+        );
+
+        let err = dataset.read_raw_bytes().unwrap_err();
+        assert!(
+            matches!(err, Error::Context { .. })
+                && err
+                    .to_string()
+                    .contains("contiguous raw data has 5 bytes, expected 6 bytes"),
+            "expected contiguous raw length error, got: {err}"
         );
     }
 
