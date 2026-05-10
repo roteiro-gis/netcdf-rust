@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-05-10
+
+- Added generic range-request storage helpers and block-cache storage wrappers for HTTP, S3, object-store, and other range-capable backends.
+- Added streaming and performance APIs for HDF5 and NetCDF-4 reads, including `read_into`, raw/native-endian byte reads, decoded chunk iteration, and cache stats.
+- Exposed HDF5 external raw-file and external-link resolvers through `netcdf_reader::NcOpenOptions`.
 - Added NetCDF-4 user-defined type read APIs for enum, opaque, compound,
   fixed-size array, and non-string vlen variables, with both dynamic `NcValue`
   decoding and custom borrowed `NcValueView` decoders.
