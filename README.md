@@ -105,7 +105,7 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Custom filters via `FilterRegistry`
 - Fixed-length strings, HDF5 variable-length strings, and byte-vlen string datasets
 - Dense-link resolution, soft-link resolution, optional external-link resolution, committed datatypes, global heap strings, and object references
-- SOHM shared-message lookup, fractal heap managed/tiny/unfiltered-huge objects, and external raw data files
+- SOHM shared-message lookup, fractal heap managed/tiny/huge objects, and external raw data files
 - Parallel chunk decoding, chunk caching, and object-header caching
 - Range-backed opens via `Storage` backends (`BytesStorage`, `FileStorage`, `MmapStorage`)
 
@@ -181,7 +181,6 @@ publish order for `hdf5-reader` and `netcdf-reader`.
 
 - SZIP is not built in (register via `FilterRegistry` if needed)
 - ScaleOffset floating-point E-scale mode is not supported by the HDF5 decoder path
-- Filtered fractal heap managed/huge objects are not yet supported
 
 ## License
 
