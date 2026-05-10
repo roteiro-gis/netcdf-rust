@@ -85,8 +85,10 @@ pub struct FractalHeap {
 /// Cache of verified direct blocks for repeated object lookups in one heap.
 #[derive(Debug, Default)]
 pub struct FractalHeapDirectBlockCache {
-    blocks: HashMap<(u64, u64, Option<u64>, u32), Arc<Vec<u8>>>,
+    blocks: HashMap<DirectBlockCacheKey, Arc<Vec<u8>>>,
 }
+
+type DirectBlockCacheKey = (u64, u64, Option<u64>, u32);
 
 #[derive(Debug, Clone, Copy)]
 struct DirectBlockLocation {
