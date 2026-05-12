@@ -292,6 +292,10 @@ fn test_cdf1_simple() {
     let data: ndarray::ArrayD<f32> = classic.read_variable("temp").unwrap();
     assert_eq!(data.shape(), &[5, 10]);
     assert!((data[[0, 0]] - 0.0).abs() < 1e-6);
+
+    let mut into = vec![0.0f32; 50];
+    file.read_variable_into("temp", &mut into).unwrap();
+    assert_eq!(into.as_slice(), data.as_slice().unwrap());
 }
 
 #[test]
@@ -329,6 +333,10 @@ fn test_record_vars() {
     let data: ndarray::ArrayD<f64> = classic.read_variable("series").unwrap();
     assert_eq!(data[[0, 0]], 1.0);
     assert_eq!(data[[2, 4]], 15.0);
+
+    let mut into = vec![0.0f64; 15];
+    file.read_variable_into("series", &mut into).unwrap();
+    assert_eq!(into.as_slice(), data.as_slice().unwrap());
 }
 
 // ---- NetCDF-4 tests ----

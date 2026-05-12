@@ -327,10 +327,6 @@ impl NcVariable {
         }
         self.dimensions.iter().map(|d| d.size).product()
     }
-
-    pub(crate) fn checked_num_elements(&self) -> crate::Result<u64> {
-        checked_shape_elements(&self.shape(), "variable element count")
-    }
 }
 
 /// A NetCDF group (NetCDF-4 only; classic files have one implicit root group).
