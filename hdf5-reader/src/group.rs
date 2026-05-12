@@ -124,7 +124,7 @@ impl Group {
         let mut datasets = Vec::new();
         for child in &children {
             match self.child_object_kind(child)? {
-                ChildObjectKind::Group | ChildObjectKind::Other => {
+                ChildObjectKind::Group => {
                     groups.push(Group::new(
                         child.location.context.clone(),
                         child.location.address,
@@ -137,6 +137,7 @@ impl Group {
                         datasets.push(dataset);
                     }
                 }
+                ChildObjectKind::Other => {}
             }
         }
         Ok((groups, datasets))
@@ -158,12 +159,9 @@ impl Group {
                         "'{}' is a dataset, not a group",
                         name
                     ))),
-                    ChildObjectKind::Other => Ok(Group::new(
-                        child.location.context.clone(),
-                        child.location.address,
-                        child.name.clone(),
-                        child.location.root_address,
-                    )),
+                    ChildObjectKind::Other => {
+                        Err(Error::GroupNotFound(format!("'{}' is not a group", name)))
+                    }
                 };
             }
         }

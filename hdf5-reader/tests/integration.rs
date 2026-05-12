@@ -441,6 +441,27 @@ fn test_dense_groups() {
 }
 
 #[test]
+fn test_committed_datatype_is_not_exposed_as_group() {
+    let path = skip_if_missing!("committed_dtype.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let root = file.root_group().unwrap();
+    assert!(root.groups().unwrap().is_empty());
+    assert!(matches!(
+        root.group("my_type"),
+        Err(hdf5_reader::error::Error::GroupNotFound(_))
+    ));
+    assert!(matches!(
+        file.group("/my_type"),
+        Err(hdf5_reader::error::Error::GroupNotFound(_))
+    ));
+
+    let datasets = root.datasets().unwrap();
+    assert_eq!(datasets.len(), 1);
+    assert_eq!(datasets[0].name(), "data");
+}
+
+#[test]
 fn test_from_vec() {
     let path = skip_if_missing!("scalar_dataset.h5");
     let bytes = std::fs::read(&path).unwrap();
