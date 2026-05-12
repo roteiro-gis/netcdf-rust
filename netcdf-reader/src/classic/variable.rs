@@ -95,6 +95,28 @@ impl ClassicFile {
         }
     }
 
+    /// Read a variable's data into a caller-provided typed buffer.
+    pub fn read_variable_into<T: NcReadType>(&self, name: &str, dst: &mut [T]) -> Result<()> {
+        let var = self.find_variable(name)?;
+
+        let expected = T::nc_type();
+        if var.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", expected),
+                actual: format!("{:?}", var.dtype),
+            });
+        }
+
+        let file_data = self.data.as_slice();
+
+        if var.is_record_var {
+            let record_stride = compute_record_stride(&self.root_group.variables);
+            data::read_record_variable_into(file_data, var, self.numrecs, record_stride, dst)
+        } else {
+            data::read_non_record_variable_into(file_data, var, dst)
+        }
+    }
+
     /// Read a variable's data with automatic type promotion to f64.
     ///
     /// This reads any numeric variable and converts all values to f64,

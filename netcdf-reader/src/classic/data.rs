@@ -31,7 +31,9 @@ pub trait NcReadType: Clone + Default + Send + 'static {
     /// (on BE hosts).
     fn decode_bulk_be(raw: &[u8], count: usize) -> Result<Vec<Self>> {
         let elem_size = Self::element_size();
-        let needed = count * elem_size;
+        let needed = count.checked_mul(elem_size).ok_or_else(|| {
+            Error::InvalidData("classic decode byte count exceeds platform usize".to_string())
+        })?;
         if raw.len() < needed {
             return Err(Error::InvalidData(format!(
                 "need {} bytes for {} elements, got {}",
@@ -46,6 +48,27 @@ pub trait NcReadType: Clone + Default + Send + 'static {
             values.push(Self::from_be_bytes(&raw[start..start + elem_size])?);
         }
         Ok(values)
+    }
+
+    /// Bulk decode elements from a contiguous big-endian byte slice into a
+    /// caller-provided destination buffer.
+    fn decode_bulk_be_into(raw: &[u8], dst: &mut [Self]) -> Result<()> {
+        let elem_size = Self::element_size();
+        let needed = dst.len().checked_mul(elem_size).ok_or_else(|| {
+            Error::InvalidData("classic decode byte count exceeds platform usize".to_string())
+        })?;
+        if raw.len() < needed {
+            return Err(Error::InvalidData(format!(
+                "need {} bytes for {} elements, got {}",
+                needed,
+                dst.len(),
+                raw.len()
+            )));
+        }
+        for (out, chunk) in dst.iter_mut().zip(raw[..needed].chunks_exact(elem_size)) {
+            *out = Self::from_be_bytes(chunk)?;
+        }
+        Ok(())
     }
 }
 
@@ -75,7 +98,11 @@ macro_rules! impl_nc_read_type {
             }
 
             fn decode_bulk_be(raw: &[u8], count: usize) -> Result<Vec<Self>> {
-                let total_bytes = count * $size;
+                let total_bytes = count.checked_mul($size).ok_or_else(|| {
+                    Error::InvalidData(
+                        "classic decode byte count exceeds platform usize".to_string(),
+                    )
+                })?;
                 if raw.len() < total_bytes {
                     return Err(Error::InvalidData(format!(
                         "need {} bytes for {} elements of {}, got {}",
@@ -113,6 +140,44 @@ macro_rules! impl_nc_read_type {
                         .collect())
                 }
             }
+
+            fn decode_bulk_be_into(raw: &[u8], dst: &mut [Self]) -> Result<()> {
+                let total_bytes = dst.len().checked_mul($size).ok_or_else(|| {
+                    Error::InvalidData(
+                        "classic decode byte count exceeds platform usize".to_string(),
+                    )
+                })?;
+                if raw.len() < total_bytes {
+                    return Err(Error::InvalidData(format!(
+                        "need {} bytes for {} elements of {}, got {}",
+                        total_bytes,
+                        dst.len(),
+                        stringify!($ty),
+                        raw.len()
+                    )));
+                }
+                let bytes = &raw[..total_bytes];
+                #[cfg(target_endian = "big")]
+                {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            dst.as_mut_ptr() as *mut u8,
+                            total_bytes,
+                        );
+                    }
+                    Ok(())
+                }
+                #[cfg(target_endian = "little")]
+                {
+                    for (out, chunk) in dst.iter_mut().zip(bytes.chunks_exact($size)) {
+                        let mut arr = [0u8; $size];
+                        arr.copy_from_slice(chunk);
+                        *out = <$ty>::from_be_bytes(arr);
+                    }
+                    Ok(())
+                }
+            }
         }
     };
 }
@@ -143,10 +208,7 @@ pub fn read_non_record_variable<T: NcReadType>(
     }
 
     let offset = crate::types::checked_usize_from_u64(var.data_offset, "variable data offset")?;
-    let total_elements = crate::types::checked_usize_from_u64(
-        var.checked_num_elements()?,
-        "variable element count",
-    )?;
+    let total_elements = checked_non_record_element_count(var)?;
     let elem_size = T::element_size();
     let total_bytes = total_elements.checked_mul(elem_size).ok_or_else(|| {
         Error::InvalidData(format!(
@@ -186,6 +248,56 @@ pub fn read_non_record_variable<T: NcReadType>(
         ArrayD::from_shape_vec(IxDyn(&shape), values)
     }
     .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
+/// Read the entire data for a non-record variable into a caller-provided buffer.
+pub fn read_non_record_variable_into<T: NcReadType>(
+    file_data: &[u8],
+    var: &NcVariable,
+    dst: &mut [T],
+) -> Result<()> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_into for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    let offset = crate::types::checked_usize_from_u64(var.data_offset, "variable data offset")?;
+    let elem_size = T::element_size();
+    let total_bytes = total_elements.checked_mul(elem_size).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "variable '{}' size in bytes exceeds platform usize",
+            var.name
+        ))
+    })?;
+
+    let end = offset.checked_add(total_bytes).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "variable '{}' byte range exceeds platform usize",
+            var.name
+        ))
+    })?;
+    if end > file_data.len() {
+        return Err(Error::InvalidData(format!(
+            "variable '{}' data extends beyond file: offset={}, size={}, file_len={}",
+            var.name,
+            offset,
+            total_bytes,
+            file_data.len()
+        )));
+    }
+
+    T::decode_bulk_be_into(&file_data[offset..end], dst)
 }
 
 /// Read the entire data for a record variable into an ndarray.
@@ -284,6 +396,104 @@ pub fn read_record_variable<T: NcReadType>(
         .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
 }
 
+/// Read the entire data for a record variable into a caller-provided buffer.
+pub fn read_record_variable_into<T: NcReadType>(
+    file_data: &[u8],
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+    dst: &mut [T],
+) -> Result<()> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_into for non-record variables".to_string(),
+        ));
+    }
+
+    let elem_size = T::element_size();
+    let base_offset =
+        crate::types::checked_usize_from_u64(var.data_offset, "record variable data offset")?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let record_stride_usize = crate::types::checked_usize_from_u64(record_stride, "record stride")?;
+
+    if var.dimensions.is_empty() {
+        return Err(Error::InvalidData(
+            "record variable must have at least one dimension".to_string(),
+        ));
+    }
+
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = elements_per_record.checked_mul(elem_size).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "record variable '{}' bytes per record exceed platform usize",
+            var.name
+        ))
+    })?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    for rec in 0..numrecs_usize {
+        let rec_offset = base_offset
+            .checked_add(rec.checked_mul(record_stride_usize).ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' byte offset exceeds platform usize",
+                    var.name
+                ))
+            })?)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' byte offset exceeds platform usize",
+                    var.name
+                ))
+            })?;
+        let rec_end = rec_offset.checked_add(bytes_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' record range exceeds platform usize",
+                var.name
+            ))
+        })?;
+        if rec_end > file_data.len() {
+            return Err(Error::InvalidData(format!(
+                "record {} for variable '{}' extends beyond file",
+                rec, var.name
+            )));
+        }
+
+        let dst_start = rec.checked_mul(elements_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' destination offset exceeds platform usize",
+                var.name
+            ))
+        })?;
+        let dst_end = dst_start.checked_add(elements_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' destination range exceeds platform usize",
+                var.name
+            ))
+        })?;
+        T::decode_bulk_be_into(
+            &file_data[rec_offset..rec_end],
+            &mut dst[dst_start..dst_end],
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Compute the record stride: total bytes per record across all record variables.
 ///
 /// Each record variable's per-record contribution is its `record_size` (already stored
@@ -303,6 +513,30 @@ pub fn compute_record_stride(variables: &[NcVariable]) -> u64 {
             }
         })
         .sum()
+}
+
+fn checked_non_record_element_count(var: &NcVariable) -> Result<usize> {
+    let mut total = 1u64;
+    for dim in &var.dimensions {
+        total = total.checked_mul(dim.size).ok_or_else(|| {
+            Error::InvalidData("variable element count overflows u64".to_string())
+        })?;
+    }
+    crate::types::checked_usize_from_u64(total, "variable element count")
+}
+
+fn checked_record_elements_per_record(var: &NcVariable) -> Result<usize> {
+    let mut elements = 1usize;
+    for dim in var.dimensions.iter().skip(1) {
+        let size = crate::types::checked_usize_from_u64(dim.size, "record variable dimension")?;
+        elements = elements.checked_mul(size).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' elements per record exceed platform usize",
+                var.name
+            ))
+        })?;
+    }
+    Ok(elements)
 }
 
 #[cfg(test)]
@@ -343,6 +577,34 @@ mod tests {
     }
 
     #[test]
+    fn test_read_non_record_variable_into() {
+        let mut file_data = vec![0u8; 200];
+        let values = [1.0f32, 2.0f32, 3.0f32];
+        for (i, &v) in values.iter().enumerate() {
+            file_data[100 + i * 4..100 + i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+        }
+
+        let var = NcVariable {
+            name: "temp".to_string(),
+            dimensions: vec![NcDimension {
+                name: "x".to_string(),
+                size: 3,
+                is_unlimited: false,
+            }],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 100,
+            _data_size: 12,
+            is_record_var: false,
+            record_size: 0,
+        };
+
+        let mut dst = [0.0f32; 3];
+        read_non_record_variable_into(&file_data, &var, &mut dst).unwrap();
+        assert_eq!(dst, values);
+    }
+
+    #[test]
     fn test_read_non_record_2d_int() {
         // 2x3 array of i32 at offset 0
         let values: Vec<i32> = vec![10, 20, 30, 40, 50, 60];
@@ -379,6 +641,28 @@ mod tests {
         assert_eq!(arr[[0, 2]], 30);
         assert_eq!(arr[[1, 0]], 40);
         assert_eq!(arr[[1, 2]], 60);
+    }
+
+    #[test]
+    fn test_read_non_record_variable_into_rejects_wrong_destination_len() {
+        let var = NcVariable {
+            name: "grid".to_string(),
+            dimensions: vec![NcDimension {
+                name: "x".to_string(),
+                size: 3,
+                is_unlimited: false,
+            }],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 12,
+            is_record_var: false,
+            record_size: 0,
+        };
+
+        let mut dst = [0.0f32; 2];
+        let err = read_non_record_variable_into(&[0; 12], &var, &mut dst).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]
@@ -462,6 +746,74 @@ mod tests {
         assert_eq!(arr[[0, 1]], 2.0);
         assert_eq!(arr[[1, 0]], 3.0);
         assert_eq!(arr[[2, 1]], 6.0);
+    }
+
+    #[test]
+    fn test_read_record_variable_into() {
+        let mut file_data = vec![0u8; 200];
+        let base = 100usize;
+        let record_values: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
+        for (rec, vals) in record_values.iter().enumerate() {
+            for (i, &v) in vals.iter().enumerate() {
+                let offset = base + rec * 8 + i * 4;
+                file_data[offset..offset + 4].copy_from_slice(&v.to_be_bytes());
+            }
+        }
+
+        let var = NcVariable {
+            name: "temp".to_string(),
+            dimensions: vec![
+                NcDimension {
+                    name: "time".to_string(),
+                    size: 0,
+                    is_unlimited: true,
+                },
+                NcDimension {
+                    name: "x".to_string(),
+                    size: 2,
+                    is_unlimited: false,
+                },
+            ],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 100,
+            _data_size: 0,
+            is_record_var: true,
+            record_size: 8,
+        };
+
+        let mut dst = [0.0f32; 6];
+        read_record_variable_into(&file_data, &var, 3, 8, &mut dst).unwrap();
+        assert_eq!(dst, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_read_record_variable_into_rejects_wrong_destination_len() {
+        let var = NcVariable {
+            name: "temp".to_string(),
+            dimensions: vec![
+                NcDimension {
+                    name: "time".to_string(),
+                    size: 0,
+                    is_unlimited: true,
+                },
+                NcDimension {
+                    name: "x".to_string(),
+                    size: 2,
+                    is_unlimited: false,
+                },
+            ],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: true,
+            record_size: 8,
+        };
+
+        let mut dst = [0.0f32; 5];
+        let err = read_record_variable_into(&[0; 24], &var, 3, 8, &mut dst).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]

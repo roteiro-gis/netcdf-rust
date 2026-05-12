@@ -407,21 +407,7 @@ impl NcFile {
     /// Read a variable into a caller-provided typed buffer.
     pub fn read_variable_into<T: NcReadable>(&self, name: &str, dst: &mut [T]) -> Result<()> {
         match &self.inner {
-            NcFileInner::Classic(c) => {
-                let data = c.read_variable::<T>(name)?;
-                let values = data.as_slice_memory_order().ok_or_else(|| {
-                    Error::InvalidData("decoded array is not contiguous in memory order".into())
-                })?;
-                if dst.len() != values.len() {
-                    return Err(Error::InvalidData(format!(
-                        "destination has {} elements, variable requires {}",
-                        dst.len(),
-                        values.len()
-                    )));
-                }
-                dst.clone_from_slice(values);
-                Ok(())
-            }
+            NcFileInner::Classic(c) => c.read_variable_into::<T>(name, dst),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_into::<T>(name, dst)?),
         }
