@@ -37,6 +37,17 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.77
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
   no-default-features:
     name: Test without default features
     runs-on: ubuntu-latest
