@@ -355,8 +355,7 @@ fn load_dense_attribute_messages_storage(
         length_size,
     )?;
 
-    let records = load_dense_attribute_records_storage(info, storage, offset_size, length_size)
-        .unwrap_or_default();
+    let records = load_dense_attribute_records_storage(info, storage, offset_size, length_size)?;
 
     let mut attributes = Vec::new();
     for record in records {
@@ -366,26 +365,22 @@ fn load_dense_attribute_messages_storage(
             _ => continue,
         };
 
-        let managed_bytes = match heap.get_object_storage_with_registry(
+        let managed_bytes = heap.get_object_storage_with_registry(
             &heap_id,
             storage,
             offset_size,
             length_size,
             filter_registry,
-        ) {
-            Ok(bytes) => bytes,
-            Err(_) => continue,
-        };
+        )?;
 
         let mut attr_cursor = Cursor::new(&managed_bytes);
-        if let Ok(attr) = messages::attribute::parse(
+        let attr = messages::attribute::parse(
             &mut attr_cursor,
             offset_size,
             length_size,
             managed_bytes.len(),
-        ) {
-            attributes.push(attr);
-        }
+        )?;
+        attributes.push(attr);
     }
 
     Ok(attributes)
@@ -397,12 +392,13 @@ fn load_dense_attribute_records_storage(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<btree_v2::BTreeV2Record>> {
-    let mut addrs = vec![info.btree_name_index_address];
+    let mut addrs = vec![("name", info.btree_name_index_address)];
     if let Some(creation_order_addr) = info.btree_creation_order_address {
-        addrs.push(creation_order_addr);
+        addrs.push(("creation-order", creation_order_addr));
     }
 
-    for addr in addrs {
+    let mut last_error = None;
+    for (index_name, addr) in addrs {
         if Cursor::is_undefined_offset(addr, offset_size) {
             continue;
         }
@@ -414,10 +410,15 @@ fn load_dense_attribute_records_storage(
             length_size,
         ) {
             Ok(header) => header,
-            Err(_) => continue,
+            Err(err) => {
+                last_error = Some(format!(
+                    "failed to parse dense attribute {index_name} B-tree at {addr:#x}: {err}"
+                ));
+                continue;
+            }
         };
 
-        if let Ok(records) = btree_v2::collect_btree_v2_records_storage(
+        match btree_v2::collect_btree_v2_records_storage(
             storage,
             &header,
             offset_size,
@@ -426,11 +427,22 @@ fn load_dense_attribute_records_storage(
             &[],
             None,
         ) {
-            return Ok(records);
+            Ok(records) => return Ok(records),
+            Err(err) => {
+                last_error = Some(format!(
+                    "failed to read dense attribute {index_name} B-tree at {addr:#x}: {err}"
+                ));
+            }
         }
     }
 
-    Ok(Vec::new())
+    if let Some(err) = last_error {
+        Err(Error::InvalidData(format!(
+            "failed to load dense attribute records: {err}"
+        )))
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 /// Read one variable-length string from a vlen reference in raw_data.
@@ -581,6 +593,7 @@ pub(crate) fn resolve_vlen_bytes_storage(
 mod tests {
     use super::*;
     use crate::error::ByteOrder;
+    use crate::storage::BytesStorage;
     use std::f64::consts::PI;
 
     #[test]
@@ -671,5 +684,22 @@ mod tests {
         };
         let val = attr.read_as_f64().unwrap();
         assert!((val - 42.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dense_attribute_btree_errors_surface() {
+        let info = AttributeInfoMessage {
+            creation_order_tracked: false,
+            creation_order_indexed: false,
+            max_creation_index: None,
+            fractal_heap_address: 0,
+            btree_name_index_address: 0,
+            btree_creation_order_address: None,
+        };
+        let storage = BytesStorage::new(Vec::new());
+
+        let err = load_dense_attribute_records_storage(&info, &storage, 8, 8).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+        assert!(err.to_string().contains("dense attribute"));
     }
 }

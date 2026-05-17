@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Changed the minimum supported Rust version from 1.77 to 1.81 to match the
+  current default/all-features dependency graph.
+- Fixed dense HDF5 attribute loading so B-tree, fractal-heap object, and
+  attribute-message parse failures are reported instead of silently omitting
+  attributes.
+
 ## 0.5.0 - 2026-05-10
 
 - Added generic range-request storage helpers and block-cache storage wrappers for HTTP, S3, object-store, and other range-capable backends.

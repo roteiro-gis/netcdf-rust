@@ -125,6 +125,8 @@ let labels = file.dataset("/labels")?.read_strings()?;
 
 ## Feature flags
 
+Minimum supported Rust version: 1.81.
+
 ```toml
 [dependencies]
 netcdf-reader = "0.5"           # CDF-1/2/5 + NetCDF-4 (default)
