@@ -2,13 +2,7 @@
 
 ## Unreleased
 
-- Changed the minimum supported Rust version from 1.77 to 1.81 to match the
-  current default/all-features dependency graph.
-- Fixed dense HDF5 attribute loading so B-tree, fractal-heap object, and
-  attribute-message parse failures are reported instead of silently omitting
-  attributes.
-
-## 0.5.0 - 2026-05-10
+## 0.5.0 - 2026-05-17
 
 - Added generic range-request storage helpers and block-cache storage wrappers for HTTP, S3, object-store, and other range-capable backends.
 - Added streaming and performance APIs for HDF5 and NetCDF-4 reads, including `read_into`, raw/native-endian byte reads, decoded chunk iteration, and cache stats.
@@ -16,8 +10,23 @@
 - Added NetCDF-4 user-defined type read APIs for enum, opaque, compound,
   fixed-size array, and non-string vlen variables, with both dynamic `NcValue`
   decoding and custom borrowed `NcValueView` decoders.
+- Added support for filtered HDF5 fractal-heap managed and huge objects used by
+  dense links and dense attributes.
+- Added an MSRV CI job and changed the minimum supported Rust version from 1.77
+  to 1.81 to match the current default/all-features dependency graph.
+- Optimized classic NetCDF `read_variable_into` to decode non-record and record
+  variables directly into caller-provided buffers.
 - Fixed dense-group fractal heap handling for generated NetCDF-4 files that
   store committed user-defined types alongside variables.
+- Fixed HDF5 compact and contiguous raw-data reads so corrupt or truncated
+  allocated storage errors instead of returning zero-padded values.
+- Fixed group APIs so unknown or unsupported HDF5 object classes are not exposed
+  as groups.
+- Fixed dense HDF5 attribute loading so B-tree, fractal-heap object, and
+  attribute-message parse failures are reported instead of silently omitting
+  attributes.
+- Removed legacy internal in-memory HDF5 metadata paths now superseded by the
+  storage-backed implementation.
 
 ## 0.4.0 - 2026-04-28
 
