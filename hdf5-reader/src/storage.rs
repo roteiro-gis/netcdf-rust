@@ -456,6 +456,19 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::R
     Ok(())
 }
 
+/// Fallback for targets without a positional file-read syscall (in
+/// practice `wasm32-unknown-unknown` and similar no-OS targets).
+/// `FileStorage` is never instantiated there because there is no
+/// `std::fs::File`-backed flow; this stub keeps the crate linkable
+/// when only `BytesStorage` / `MmapStorage` are used.
+#[cfg(not(any(unix, windows)))]
+fn read_exact_at(_file: &File, _buf: &mut [u8], _offset: u64) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "FileStorage is unavailable on this target; use BytesStorage or Hdf5File::from_bytes",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
