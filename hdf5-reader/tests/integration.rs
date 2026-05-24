@@ -86,7 +86,7 @@ impl hdf5_reader::Storage for CountingStorage {
 }
 
 #[test]
-fn test_simple_contiguous() {
+fn simple_contiguous() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -103,7 +103,7 @@ fn test_simple_contiguous() {
 }
 
 #[test]
-fn test_read_into_and_raw_byte_variants() {
+fn read_into_and_raw_byte_variants() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/data").unwrap();
@@ -125,7 +125,7 @@ fn test_read_into_and_raw_byte_variants() {
 }
 
 #[test]
-fn test_simple_contiguous_inner_window_slice() {
+fn simple_contiguous_inner_window_slice() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/data").unwrap();
@@ -152,7 +152,7 @@ fn test_simple_contiguous_inner_window_slice() {
 }
 
 #[test]
-fn test_contiguous_slice_reads_selected_ranges_directly() {
+fn contiguous_slice_reads_selected_ranges_directly() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let storage = Arc::new(CountingStorage::new(std::fs::read(path).unwrap()));
     let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
@@ -182,7 +182,7 @@ fn test_contiguous_slice_reads_selected_ranges_directly() {
 }
 
 #[test]
-fn test_simple_contiguous_strided_slice() {
+fn simple_contiguous_strided_slice() {
     let path = skip_if_missing!("simple_contiguous.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/data").unwrap();
@@ -210,7 +210,7 @@ fn test_simple_contiguous_strided_slice() {
 }
 
 #[test]
-fn test_big_endian_numeric_datasets() {
+fn big_endian_numeric_datasets() {
     let path = skip_if_missing!("big_endian.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -237,7 +237,7 @@ fn test_big_endian_numeric_datasets() {
 }
 
 #[test]
-fn test_simple_chunked_deflate() {
+fn simple_chunked_deflate() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -252,7 +252,7 @@ fn test_simple_chunked_deflate() {
 }
 
 #[test]
-fn test_chunk_iterator_and_cache_stats() {
+fn chunk_iterator_and_cache_stats() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/temperature").unwrap();
@@ -275,7 +275,7 @@ fn test_chunk_iterator_and_cache_stats() {
 
 #[cfg(feature = "rayon")]
 #[test]
-fn test_simple_chunked_deflate_parallel_matches_serial() {
+fn simple_chunked_deflate_parallel_matches_serial() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/temperature").unwrap();
@@ -291,7 +291,7 @@ fn test_simple_chunked_deflate_parallel_matches_serial() {
 }
 
 #[test]
-fn test_nested_groups() {
+fn nested_groups() {
     let path = skip_if_missing!("nested_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -309,7 +309,7 @@ fn test_nested_groups() {
 }
 
 #[test]
-fn test_string_attributes() {
+fn string_attributes() {
     let path = skip_if_missing!("string_attrs.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -325,7 +325,7 @@ fn test_string_attributes() {
 }
 
 #[test]
-fn test_scalar_dataset() {
+fn scalar_dataset() {
     let path = skip_if_missing!("scalar_dataset.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -338,7 +338,7 @@ fn test_scalar_dataset() {
 }
 
 #[test]
-fn test_old_format_v1() {
+fn old_format_v1() {
     let path = skip_if_missing!("old_format_v1.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -350,7 +350,7 @@ fn test_old_format_v1() {
 }
 
 #[test]
-fn test_fill_value() {
+fn fill_value() {
     let path = skip_if_missing!("fill_value.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -368,7 +368,7 @@ fn test_fill_value() {
 }
 
 #[test]
-fn test_external_raw_data_file() {
+fn external_raw_data_file() {
     let path = skip_if_missing!("external_raw.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -388,7 +388,7 @@ fn test_external_raw_data_file() {
 }
 
 #[test]
-fn test_external_link_resolver() {
+fn external_link_resolver() {
     let path = skip_if_missing!("external_links.h5");
     let base_dir = path.parent().unwrap();
     let file = hdf5_reader::Hdf5File::open_with_options(
@@ -408,7 +408,7 @@ fn test_external_link_resolver() {
 }
 
 #[test]
-fn test_fletcher32() {
+fn fletcher32() {
     let path = skip_if_missing!("fletcher32.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -422,7 +422,7 @@ fn test_fletcher32() {
 }
 
 #[test]
-fn test_dense_groups() {
+fn dense_groups() {
     let path = skip_if_missing!("dense_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -441,7 +441,7 @@ fn test_dense_groups() {
 }
 
 #[test]
-fn test_committed_datatype_is_not_exposed_as_group() {
+fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -462,7 +462,7 @@ fn test_committed_datatype_is_not_exposed_as_group() {
 }
 
 #[test]
-fn test_from_vec() {
+fn from_vec() {
     let path = skip_if_missing!("scalar_dataset.h5");
     let bytes = std::fs::read(&path).unwrap();
     let file = hdf5_reader::Hdf5File::from_vec(bytes).unwrap();
@@ -472,7 +472,7 @@ fn test_from_vec() {
 }
 
 #[test]
-fn test_from_bytes_with_options() {
+fn from_bytes_with_options() {
     let path = skip_if_missing!("scalar_dataset.h5");
     let bytes = std::fs::read(&path).unwrap();
     let file = hdf5_reader::Hdf5File::from_bytes_with_options(
@@ -491,7 +491,7 @@ fn test_from_bytes_with_options() {
 }
 
 #[test]
-fn test_from_storage() {
+fn from_storage() {
     let path = skip_if_missing!("scalar_dataset.h5");
     let bytes = std::fs::read(&path).unwrap();
     let file = hdf5_reader::Hdf5File::from_storage(std::sync::Arc::new(
@@ -504,7 +504,7 @@ fn test_from_storage() {
 }
 
 #[test]
-fn test_header_cache_reuse() {
+fn header_cache_reuse() {
     let path = skip_if_missing!("nested_groups.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -515,7 +515,7 @@ fn test_header_cache_reuse() {
 }
 
 #[test]
-fn test_fixed_array_chunked() {
+fn fixed_array_chunked() {
     let path = skip_if_missing!("fixed_array_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -541,7 +541,7 @@ fn test_fixed_array_chunked() {
 }
 
 #[test]
-fn test_extensible_array_chunked() {
+fn extensible_array_chunked() {
     let path = skip_if_missing!("extensible_array_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -567,7 +567,7 @@ fn test_extensible_array_chunked() {
 }
 
 #[test]
-fn test_vlen_string_dataset() {
+fn vlen_string_dataset() {
     let path = skip_if_missing!("vlen_strings.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
     let ds = file.dataset("/labels").unwrap();
@@ -580,7 +580,7 @@ fn test_vlen_string_dataset() {
 }
 
 #[test]
-fn test_chunked_slice_single_index() {
+fn chunked_slice_single_index() {
     let path = skip_if_missing!("fixed_array_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -612,7 +612,7 @@ fn test_chunked_slice_single_index() {
 }
 
 #[test]
-fn test_chunked_slice_range_with_step() {
+fn chunked_slice_range_with_step() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -645,7 +645,7 @@ fn test_chunked_slice_range_with_step() {
 }
 
 #[test]
-fn test_chunked_slice_empty_range_is_empty() {
+fn chunked_slice_empty_range_is_empty() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -671,7 +671,7 @@ fn test_chunked_slice_empty_range_is_empty() {
 }
 
 #[test]
-fn test_chunked_slice_start_out_of_bounds_errors() {
+fn chunked_slice_start_out_of_bounds_errors() {
     let path = skip_if_missing!("simple_chunked_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -703,7 +703,7 @@ fn test_chunked_slice_start_out_of_bounds_errors() {
 }
 
 #[test]
-fn test_chunked_shuffle_deflate() {
+fn chunked_shuffle_deflate() {
     let path = skip_if_missing!("chunked_shuffle_deflate.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -719,7 +719,7 @@ fn test_chunked_shuffle_deflate() {
 
 #[cfg(feature = "lz4")]
 #[test]
-fn test_chunked_lz4() {
+fn chunked_lz4() {
     let path = skip_if_missing!("chunked_lz4.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
 
@@ -737,7 +737,7 @@ fn test_chunked_lz4() {
 
 #[cfg(feature = "lz4")]
 #[test]
-fn test_chunked_lz4_compressed() {
+fn chunked_lz4_compressed() {
     // This fixture has all-zero data that actually compresses with LZ4
     let path = skip_if_missing!("chunked_lz4_zeros.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

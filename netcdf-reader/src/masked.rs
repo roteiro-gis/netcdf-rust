@@ -105,13 +105,13 @@ mod tests {
     }
 
     #[test]
-    fn test_no_mask_attrs() {
+    fn no_mask_attrs() {
         let var = make_var(vec![]);
         assert!(MaskParams::from_variable(&var).is_none());
     }
 
     #[test]
-    fn test_fill_value() {
+    fn fill_value() {
         let var = make_var(vec![NcAttribute {
             name: "_FillValue".into(),
             value: NcAttrValue::Floats(vec![-9999.0]),
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_value() {
+    fn missing_value() {
         let var = make_var(vec![NcAttribute {
             name: "missing_value".into(),
             value: NcAttrValue::Doubles(vec![-999.0]),
@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_range() {
+    fn valid_range() {
         let var = make_var(vec![NcAttribute {
             name: "valid_range".into(),
             value: NcAttrValue::Doubles(vec![0.0, 100.0]),
@@ -152,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_min_max() {
+    fn valid_min_max() {
         let var = make_var(vec![
             NcAttribute {
                 name: "valid_min".into(),

@@ -66,7 +66,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_roundtrip_4byte() {
+    fn roundtrip_4byte() {
         let original: Vec<u8> = vec![
             0x01, 0x02, 0x03, 0x04, // element 0
             0x05, 0x06, 0x07, 0x08, // element 1
@@ -84,14 +84,14 @@ mod tests {
     }
 
     #[test]
-    fn test_single_element() {
+    fn single_element() {
         let data = vec![0x01, 0x02, 0x03, 0x04];
         let result = unshuffle(&data, 4);
         assert_eq!(result, data);
     }
 
     #[test]
-    fn test_element_size_1() {
+    fn element_size_1() {
         let data = vec![0x01, 0x02, 0x03];
         let result = unshuffle(&data, 1);
         assert_eq!(result, data);

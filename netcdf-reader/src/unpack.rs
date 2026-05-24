@@ -64,13 +64,13 @@ mod tests {
     }
 
     #[test]
-    fn test_no_unpack_attrs() {
+    fn no_unpack_attrs() {
         let var = make_var(vec![]);
         assert!(UnpackParams::from_variable(&var).is_none());
     }
 
     #[test]
-    fn test_scale_only() {
+    fn scale_only() {
         let var = make_var(vec![NcAttribute {
             name: "scale_factor".into(),
             value: NcAttrValue::Doubles(vec![0.01]),
@@ -81,7 +81,7 @@ mod tests {
     }
 
     #[test]
-    fn test_offset_only() {
+    fn offset_only() {
         let var = make_var(vec![NcAttribute {
             name: "add_offset".into(),
             value: NcAttrValue::Doubles(vec![273.15]),
@@ -92,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn test_both() {
+    fn both() {
         let var = make_var(vec![
             NcAttribute {
                 name: "scale_factor".into(),

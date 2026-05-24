@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_group_leaf_node() {
+    fn parse_group_leaf_node() {
         let undef8 = 0xFFFF_FFFF_FFFF_FFFFu64;
         let data = build_group_node(
             0,                 // leaf
@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rawdata_leaf_node() {
+    fn parse_rawdata_leaf_node() {
         let undef8 = 0xFFFF_FFFF_FFFF_FFFFu64;
         // 2D dataset, ndims=2, so keys have 3 offsets each (ndims+1)
         let data = build_rawdata_node(
@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rawdata_leaf_4byte() {
+    fn parse_rawdata_leaf_4byte() {
         let undef4 = 0xFFFF_FFFFu64;
         let data = build_rawdata_node(
             0,
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_signature() {
+    fn bad_signature() {
         let mut data = build_group_node(0, 0, u64::MAX, u64::MAX, &[0], &[], 8, 8);
         data[0] = b'X'; // corrupt
         let mut cursor = Cursor::new(&data);
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_leaves_single_leaf() {
+    fn collect_leaves_single_leaf() {
         let undef8 = u64::MAX;
         // Put the leaf node at offset 0 in our fake file data.
         let node_data = build_group_node(0, 2, undef8, undef8, &[0, 5, 10], &[0x100, 0x200], 8, 8);
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_leaves_two_level_tree() {
+    fn collect_leaves_two_level_tree() {
         let undef8 = u64::MAX;
 
         // Build a two-level tree:
@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_undefined_root() {
+    fn collect_undefined_root() {
         // Undefined root address should produce empty results.
         let data = vec![0u8; 100];
         let results = collect_btree_v1_leaves(&data, u64::MAX, 8, 8, None, &[], None).unwrap();

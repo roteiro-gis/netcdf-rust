@@ -270,7 +270,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunk_entry_debug_clone() {
+    fn chunk_entry_debug_clone() {
         let entry = ChunkEntry {
             address: 0x1000,
             size: 4096,
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_implicit_chunk_entries() {
+    fn implicit_chunk_entries() {
         let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None);
         // 2 chunks along dim 0, 2 chunks along dim 1 = 4 total
         assert_eq!(entries.len(), 4);
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_single_chunk_entry() {
+    fn single_chunk_entry_uses_origin_offsets() {
         let entry = single_chunk_entry(0x2000, 8192, 0, 3);
         assert_eq!(entry.address, 0x2000);
         assert_eq!(entry.size, 8192);

@@ -904,32 +904,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_detect_cdf1() {
+    fn detect_cdf1() {
         let data = b"CDF\x01rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Classic);
     }
 
     #[test]
-    fn test_detect_cdf2() {
+    fn detect_cdf2() {
         let data = b"CDF\x02rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Offset64);
     }
 
     #[test]
-    fn test_detect_cdf5() {
+    fn detect_cdf5() {
         let data = b"CDF\x05rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Cdf5);
     }
 
     #[test]
-    fn test_detect_hdf5() {
+    fn detect_hdf5() {
         let mut data = vec![0x89, b'H', b'D', b'F', 0x0D, 0x0A, 0x1A, 0x0A];
         data.extend_from_slice(b"rest_of_file");
         assert_eq!(detect_format(&data).unwrap(), NcFormat::Nc4);
     }
 
     #[test]
-    fn test_detect_invalid_magic() {
+    fn detect_invalid_magic() {
         let data = b"XXXX";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_unsupported_version() {
+    fn detect_unsupported_version() {
         let data = b"CDF\x03";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_too_short() {
+    fn detect_too_short() {
         let data = b"CD";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -956,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes_minimal_cdf1() {
+    fn from_bytes_minimal_cdf1() {
         // Minimal valid CDF-1 file: magic + numrecs + absent dim/att/var lists.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -980,7 +980,7 @@ mod tests {
 
     #[cfg(feature = "netcdf4")]
     #[test]
-    fn test_from_storage_minimal_cdf1() {
+    fn from_storage_minimal_cdf1() {
         // Minimal valid CDF-1 file: magic + numrecs + absent dim/att/var lists.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[cfg(feature = "netcdf4")]
     #[test]
-    fn test_from_storage_short_input_reports_invalid_magic() {
+    fn from_storage_short_input_reports_invalid_magic() {
         let err = NcFile::from_storage(Arc::new(BytesStorage::new(vec![b'C', b'D'])))
             .err()
             .expect("short storage should not parse as NetCDF");
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes_cdf1_with_data() {
+    fn from_bytes_cdf1_with_data() {
         // Build a CDF-1 file with one dimension, one global attribute, and one variable.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_not_found() {
+    fn variable_not_found() {
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
         data.extend_from_slice(&0u32.to_be_bytes());
@@ -1118,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_not_found() {
+    fn group_not_found() {
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
         data.extend_from_slice(&0u32.to_be_bytes());

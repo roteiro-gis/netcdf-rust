@@ -328,7 +328,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_read_u8() {
+    fn cursor_reads_u8_and_advances() {
         let data = [0x42];
         let mut c = Cursor::new(&data);
         assert_eq!(c.read_u8().unwrap(), 0x42);
@@ -336,28 +336,28 @@ mod tests {
     }
 
     #[test]
-    fn test_read_u16_le() {
+    fn cursor_reads_little_endian_u16() {
         let data = [0x01, 0x02];
         let mut c = Cursor::new(&data);
         assert_eq!(c.read_u16_le().unwrap(), 0x0201);
     }
 
     #[test]
-    fn test_read_u32_le() {
+    fn cursor_reads_little_endian_u32() {
         let data = [0x01, 0x02, 0x03, 0x04];
         let mut c = Cursor::new(&data);
         assert_eq!(c.read_u32_le().unwrap(), 0x04030201);
     }
 
     #[test]
-    fn test_read_u64_le() {
+    fn cursor_reads_little_endian_u64() {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let mut c = Cursor::new(&data);
         assert_eq!(c.read_u64_le().unwrap(), 0x0807060504030201);
     }
 
     #[test]
-    fn test_read_offset() {
+    fn cursor_reads_offsets_by_width() {
         // 4-byte offset
         let data = [0x00, 0x01, 0x00, 0x00];
         let mut c = Cursor::new(&data);
@@ -370,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_null_terminated_string() {
+    fn null_terminated_string() {
         let data = b"hello\0world";
         let mut c = Cursor::new(data);
         assert_eq!(c.read_null_terminated_string().unwrap(), "hello");
@@ -378,14 +378,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fixed_string() {
+    fn fixed_string() {
         let data = b"hi\0\0\0";
         let mut c = Cursor::new(data);
         assert_eq!(c.read_fixed_string(5).unwrap(), "hi");
     }
 
     #[test]
-    fn test_align() {
+    fn cursor_aligns_to_requested_boundary() {
         let data = [0u8; 16];
         let mut c = Cursor::new(&data);
         c.skip(3).unwrap();
@@ -398,14 +398,14 @@ mod tests {
     }
 
     #[test]
-    fn test_eof_error() {
+    fn eof_error() {
         let data = [0u8; 2];
         let mut c = Cursor::new(&data);
         assert!(c.read_u32_le().is_err());
     }
 
     #[test]
-    fn test_is_undefined_offset() {
+    fn undefined_offsets_match_offset_width() {
         assert!(Cursor::is_undefined_offset(0xFFFFFFFF, 4));
         assert!(Cursor::is_undefined_offset(0xFFFFFFFFFFFFFFFF, 8));
         assert!(!Cursor::is_undefined_offset(0, 4));

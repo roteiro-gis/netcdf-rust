@@ -394,13 +394,13 @@ mod tests {
     use super::compute_storage_sizes;
 
     #[test]
-    fn test_compute_storage_sizes_detects_overflow() {
+    fn compute_storage_sizes_detects_overflow() {
         let err = compute_storage_sizes(&[u64::MAX, 2], 8, false).unwrap_err();
         assert!(matches!(err, crate::Error::InvalidData(_)));
     }
 
     #[test]
-    fn test_compute_storage_sizes_record_dims() {
+    fn compute_storage_sizes_record_dims() {
         let (data_size, record_size) = compute_storage_sizes(&[10, 3, 4], 4, true).unwrap();
         assert_eq!(data_size, 480);
         assert_eq!(record_size, 48);

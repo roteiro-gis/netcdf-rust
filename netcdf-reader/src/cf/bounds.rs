@@ -29,7 +29,7 @@ mod tests {
     use crate::types::{NcAttrValue, NcAttribute, NcDimension, NcType};
 
     #[test]
-    fn test_find_bounds_variable() {
+    fn find_bounds_variable() {
         let bounds_var = NcVariable {
             name: "lat_bnds".into(),
             dimensions: vec![
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_bounds_attribute() {
+    fn no_bounds_attribute() {
         let var = NcVariable {
             name: "lat".into(),
             dimensions: vec![],

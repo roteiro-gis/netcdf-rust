@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_attr_info_simple() {
+    fn parse_attr_info_simple() {
         let mut data = vec![
             0x00, // version
             0x00, // flags

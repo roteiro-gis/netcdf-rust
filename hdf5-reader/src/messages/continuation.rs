@@ -33,7 +33,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_continuation() {
+    fn parse_continuation() {
         let mut data = Vec::new();
         data.extend_from_slice(&0x4000u64.to_le_bytes());
         data.extend_from_slice(&256u64.to_le_bytes());

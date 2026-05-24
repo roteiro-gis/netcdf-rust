@@ -680,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_header() {
+    fn empty_header() {
         let data = build_cdf1_header(&[], &[], &[], 0);
         let header = parse_header(&data, NcFormat::Classic).unwrap();
         assert!(header.dimensions.is_empty());
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dimensions() {
+    fn dimensions() {
         let data = build_cdf1_header(
             &[("x", 10), ("y", 20), ("time", 0)], // time is unlimited
             &[],
@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_attributes() {
+    fn global_attributes() {
         // One NC_INT attribute with value 42.
         let value_bytes = 42i32.to_be_bytes();
         let data = build_cdf1_header(
@@ -736,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_char_attribute() {
+    fn char_attribute() {
         let text = b"hello";
         let data = build_cdf1_header(
             &[],
@@ -755,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn test_variables() {
+    fn variables() {
         let data = build_cdf1_header(
             &[("x", 10), ("y", 20)],
             &[],
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_variable() {
+    fn record_variable() {
         let data = build_cdf1_header(
             &[("time", 0), ("x", 5)], // time is unlimited
             &[],
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cdf2_offset64() {
+    fn cdf2_offset64() {
         // Build a CDF-2 header manually.
         // CDF-2 is mostly the same as CDF-1 but the data offset (begin) field is 8 bytes.
         let mut buf = Vec::new();
@@ -848,7 +848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cdf5_uses_64_bit_counts_for_var_metadata() {
+    fn cdf5_uses_64_bit_counts_for_var_metadata() {
         let data = build_cdf5_header(
             &[("n", 4)],
             &[
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unlimited_dimension_size_tracks_numrecs() {
+    fn unlimited_dimension_size_tracks_numrecs() {
         let data = build_cdf1_header(
             &[("time", 0), ("x", 5)],
             &[],
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn test_double_attribute() {
+    fn double_attribute() {
         let pi = std::f64::consts::PI;
         let value_bytes = pi.to_be_bytes();
         let data = build_cdf1_header(
@@ -903,7 +903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_short_attribute_with_padding() {
+    fn short_attribute_with_padding() {
         // NC_SHORT (2 bytes) with 3 values = 6 bytes, padded to 8.
         let mut value_bytes = Vec::new();
         value_bytes.extend_from_slice(&1i16.to_be_bytes());
@@ -939,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_name_padding() {
+    fn name_padding() {
         // Names with lengths 1, 2, 3, 4, 5 to test all padding cases.
         let data = build_cdf1_header(
             &[("a", 1), ("ab", 2), ("abc", 3), ("abcd", 4), ("abcde", 5)],
@@ -957,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_dimension_reference() {
+    fn invalid_dimension_reference() {
         // Variable referencing a non-existent dimension.
         let data = build_cdf1_header(
             &[("x", 10)], // only dim 0 exists
@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_byte_attribute() {
+    fn byte_attribute() {
         let value_bytes: &[u8] = &[0xFF]; // -1 as i8
         let data = build_cdf1_header(
             &[],
@@ -987,7 +987,7 @@ mod tests {
     }
 
     #[test]
-    fn test_float_attribute() {
+    fn float_attribute() {
         let val = std::f32::consts::PI;
         let value_bytes = val.to_be_bytes();
         let data = build_cdf1_header(
@@ -1006,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_global_attributes() {
+    fn multiple_global_attributes() {
         let int_val = 100i32.to_be_bytes();
         let float_val = 2.5f32.to_be_bytes();
         let data = build_cdf1_header(

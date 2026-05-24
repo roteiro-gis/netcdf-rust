@@ -80,7 +80,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_link_info_no_order() {
+    fn parse_link_info_no_order() {
         let mut data = vec![
             0x00, // version
             0x00, // flags: no creation order
@@ -101,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_link_info_with_order() {
+    fn parse_link_info_with_order() {
         let mut data = vec![
             0x00, // version
             0x03, // flags: creation order tracked + indexed

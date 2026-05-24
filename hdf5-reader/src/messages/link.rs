@@ -121,7 +121,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_hard_link() {
+    fn parse_hard_link() {
         let mut data = vec![
             0x01, // version 1
             0x00, // flags: name_len_size=1 byte, no extras
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_soft_link() {
+    fn parse_soft_link() {
         let mut data = vec![
             0x01, // version 1
             0x08, // flags: bit 3 = link type present, name_len_size=1
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_hard_link_with_creation_order() {
+    fn parse_hard_link_with_creation_order() {
         let mut data = vec![
             0x01, // version 1
             0x04, // flags: bit 2 = creation order present

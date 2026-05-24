@@ -106,7 +106,7 @@ Notes:
 ## Limits
 
 - This report reflects one local system.
-- GitHub Actions is useful for benchmark smoke tests, but not for authoritative
+- GitHub Actions is useful for benchmark regression checks, but not for authoritative
   performance claims on bandwidth-sensitive workloads like these.
 - The large warm cached single-read results should be interpreted as
   machine-specific latency behavior, not as a general statement about internal

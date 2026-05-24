@@ -515,14 +515,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_open_options_default() {
+    fn open_options_default() {
         let opts = OpenOptions::default();
         assert_eq!(opts.chunk_cache_bytes, 64 * 1024 * 1024);
         assert_eq!(opts.chunk_cache_slots, 521);
     }
 
     #[test]
-    fn test_invalid_file() {
+    fn invalid_file() {
         let data = b"this is not an HDF5 file";
         let result = Hdf5File::from_bytes(data);
         assert!(result.is_err());

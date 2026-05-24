@@ -190,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cache_insert_and_get() {
+    fn cache_insert_and_get() {
         let cache = ChunkCache::new(1024, 10);
         let key = ChunkKey {
             dataset_addr: 100,
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_eviction() {
+    fn cache_eviction() {
         let cache = ChunkCache::new(10, 10); // 10 bytes max
         for i in 0..5 {
             let key = ChunkKey {
@@ -221,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_disabled_bypasses_storage() {
+    fn cache_disabled_bypasses_storage() {
         let cache = ChunkCache::new(0, 10);
         let key = ChunkKey {
             dataset_addr: 100,
@@ -232,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_promotes_on_get() {
+    fn cache_promotes_on_get() {
         // Verify that get() promotes entries in LRU order (the bug fix).
         let cache = ChunkCache::new(12, 10); // room for 3 entries of 4 bytes
         let key_a = ChunkKey {
@@ -267,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_replacement_updates_accounting() {
+    fn cache_replacement_updates_accounting() {
         let cache = ChunkCache::new(8, 10);
         let key = ChunkKey {
             dataset_addr: 100,
@@ -288,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_get_or_insert_with_deduplicates_concurrent_loads() {
+    fn cache_get_or_insert_with_deduplicates_concurrent_loads() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let cache = Arc::new(ChunkCache::new(1024, 10));
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_stats_track_hits_misses_and_evictions() {
+    fn cache_stats_track_hits_misses_and_evictions() {
         let cache = ChunkCache::new(8, 2);
         let key_a = ChunkKey {
             dataset_addr: 1,

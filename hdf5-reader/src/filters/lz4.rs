@@ -66,7 +66,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lz4_round_trip() {
+    fn lz4_round_trip() {
         let original = b"hello world hello world hello world!";
         let raw_compressed = lz4_flex::compress(original);
 
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lz4_uncompressed_block() {
+    fn lz4_uncompressed_block() {
         let original = b"short";
         let mut hdf5_data = Vec::new();
         hdf5_data.extend_from_slice(&(original.len() as u64).to_be_bytes());
@@ -96,13 +96,13 @@ mod tests {
     }
 
     #[test]
-    fn test_lz4_too_short() {
+    fn lz4_too_short() {
         let data = &[0; 7];
         assert!(decompress(data).is_err());
     }
 
     #[test]
-    fn test_lz4_truncated_block() {
+    fn lz4_truncated_block() {
         let mut data = vec![0, 0, 0, 0, 0, 0, 0, 10]; // orig_size = 10
         data.extend_from_slice(&10u32.to_be_bytes()); // orig_block_size = 10
         data.extend_from_slice(&100u32.to_be_bytes()); // compressed_size = 100

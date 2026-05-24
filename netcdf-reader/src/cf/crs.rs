@@ -170,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn test_geographic_wgs84() {
+    fn geographic_wgs84() {
         let var = mapping_var(vec![
             NcAttribute {
                 name: "grid_mapping_name".into(),
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transverse_mercator() {
+    fn transverse_mercator() {
         let var = mapping_var(vec![
             NcAttribute {
                 name: "grid_mapping_name".into(),
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_crs() {
+    fn extract_crs_finds_grid_mapping_variable() {
         let mapping = NcVariable {
             name: "crs".into(),
             dimensions: vec![],

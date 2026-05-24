@@ -276,7 +276,7 @@ fn create_nc4_user_defined_fixture(path: &Path) {
 // ---- NetCDF-3 tests ----
 
 #[test]
-fn test_cdf1_simple() {
+fn cdf1_simple() {
     let path = skip_if_missing!("netcdf3", "cdf1_simple.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -299,7 +299,7 @@ fn test_cdf1_simple() {
 }
 
 #[test]
-fn test_cdf5_new_types() {
+fn cdf5_new_types() {
     let path = skip_if_missing!("netcdf3", "cdf5_new_types.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -314,7 +314,7 @@ fn test_cdf5_new_types() {
 }
 
 #[test]
-fn test_record_vars() {
+fn record_vars() {
     let path = skip_if_missing!("netcdf3", "record_vars.nc");
     let file = netcdf_reader::NcFile::open_with_options(
         &path,
@@ -343,7 +343,7 @@ fn test_record_vars() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_basic() {
+fn nc4_basic() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let file = netcdf_reader::NcFile::open_with_options(
         &path,
@@ -368,7 +368,7 @@ fn test_nc4_basic() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_from_bytes_with_options() {
+fn nc4_from_bytes_with_options() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let bytes = std::fs::read(&path).unwrap();
     let file = netcdf_reader::NcFile::from_bytes_with_options(
@@ -393,7 +393,7 @@ fn test_nc4_from_bytes_with_options() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_from_storage_with_options() {
+fn nc4_from_storage_with_options() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let bytes = std::fs::read(&path).unwrap();
     let file = netcdf_reader::NcFile::from_storage_with_options(
@@ -418,7 +418,7 @@ fn test_nc4_from_storage_with_options() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_compressed() {
+fn nc4_compressed() {
     let path = skip_if_missing!("netcdf4", "nc4_compressed.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -430,7 +430,7 @@ fn test_nc4_compressed() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_groups_nested_lookup_and_read() {
+fn nc4_groups_nested_lookup_and_read() {
     let path = skip_if_missing!("netcdf4", "nc4_groups.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -453,7 +453,7 @@ fn test_nc4_groups_nested_lookup_and_read() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_classic_model() {
+fn nc4_classic_model() {
     let path = skip_if_missing!("netcdf4", "nc4_classic_model.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -463,7 +463,7 @@ fn test_nc4_classic_model() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_same_size_dims() {
+fn nc4_same_size_dims() {
     let path = skip_if_missing!("netcdf4", "same_size_dims.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -479,7 +479,7 @@ fn test_nc4_same_size_dims() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_coordinate_dimension_scale_is_variable_metadata() {
+fn nc4_coordinate_dimension_scale_is_variable_metadata() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("coordinate_variable.nc");
     create_nc4_coordinate_variable_fixture(&path);
@@ -502,7 +502,7 @@ fn test_nc4_coordinate_dimension_scale_is_variable_metadata() {
 
 #[cfg(all(feature = "netcdf4", feature = "cf"))]
 #[test]
-fn test_nc4_coordinate_variables_drive_cf_axis_and_time_discovery() {
+fn nc4_coordinate_variables_drive_cf_axis_and_time_discovery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("cf_coordinate_variable.nc");
     create_nc4_cf_coordinate_variable_fixture(&path);
@@ -558,7 +558,7 @@ fn test_nc4_coordinate_variables_drive_cf_axis_and_time_discovery() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_climate_4d_coordinate_variables_and_slice() {
+fn nc4_climate_4d_coordinate_variables_and_slice() {
     let path = skip_if_missing!("netcdf4", "nc4_climate_4d.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -617,7 +617,7 @@ fn test_nc4_climate_4d_coordinate_variables_and_slice() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_packed_cf_unpacks_and_masks_fill_values() {
+fn nc4_packed_cf_unpacks_and_masks_fill_values() {
     let path = skip_if_missing!("netcdf4", "nc4_packed_cf.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -658,7 +658,7 @@ fn test_nc4_packed_cf_unpacks_and_masks_fill_values() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_shared_dims_coordinate_variables_and_shared_shapes() {
+fn nc4_shared_dims_coordinate_variables_and_shared_shapes() {
     let path = skip_if_missing!("netcdf4", "nc4_shared_dims.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -701,7 +701,7 @@ fn test_nc4_shared_dims_coordinate_variables_and_shared_shapes() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_zero_record_unlimited_dimension_reads_empty_array() {
+fn nc4_zero_record_unlimited_dimension_reads_empty_array() {
     let path = skip_if_missing!("netcdf4", "nc4_zero_record.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -736,7 +736,7 @@ fn test_nc4_zero_record_unlimited_dimension_reads_empty_array() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_dimension_only_scale_is_not_variable_metadata() {
+fn nc4_dimension_only_scale_is_not_variable_metadata() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("dimension_only.nc");
     create_nc4_dimension_only_fixture(&path);
@@ -752,7 +752,7 @@ fn test_nc4_dimension_only_scale_is_not_variable_metadata() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_string_variable_reads() {
+fn nc4_string_variable_reads() {
     let path = skip_if_missing!("netcdf4", "nc4_string_var.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -765,7 +765,7 @@ fn test_nc4_string_variable_reads() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_user_defined_variable_reads() {
+fn nc4_user_defined_variable_reads() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("user_defined.nc");
     create_nc4_user_defined_fixture(&path);
@@ -877,7 +877,7 @@ fn test_nc4_user_defined_variable_reads() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_user_defined_custom_decoder() {
+fn nc4_user_defined_custom_decoder() {
     #[derive(Debug, PartialEq)]
     struct DecodedObservation {
         temp: f32,
@@ -946,7 +946,7 @@ fn test_nc4_user_defined_custom_decoder() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_read_variable_unified() {
+fn nc4_read_variable_unified() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -961,7 +961,7 @@ fn test_nc4_read_variable_unified() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn test_nc4_sparse_huge_logical_slice_reads_fill_value() {
+fn nc4_sparse_huge_logical_slice_reads_fill_value() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("sparse_huge.nc");
     create_sparse_huge_nc4_fixture(&path);
@@ -1007,7 +1007,7 @@ fn test_nc4_sparse_huge_logical_slice_reads_fill_value() {
 }
 
 #[test]
-fn test_classic_read_variable_unified() {
+fn classic_read_variable_unified() {
     let path = skip_if_missing!("netcdf3", "cdf1_simple.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 

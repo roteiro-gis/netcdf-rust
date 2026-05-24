@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_entry_no_cache() {
+    fn parse_entry_no_cache() {
         let scratch = [0u8; 16];
         let data = build_entry_bytes(42, 0x1000, 0, &scratch, 8);
 
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_entry_group_cache_8byte() {
+    fn parse_entry_group_cache_8byte() {
         // Build scratch with btree=0x2000 and heap=0x3000 (8-byte offsets)
         let mut scratch = [0u8; 16];
         scratch[..8].copy_from_slice(&0x2000u64.to_le_bytes());
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_entry_group_cache_4byte() {
+    fn parse_entry_group_cache_4byte() {
         // Build scratch with btree=0x400 and heap=0x800 (4-byte offsets)
         let mut scratch = [0u8; 16];
         scratch[..4].copy_from_slice(&0x400u32.to_le_bytes());
@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_snod_basic() {
+    fn parse_snod_basic() {
         let mut data = Vec::new();
         // Signature
         data.extend_from_slice(b"SNOD");
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snod_bad_signature() {
+    fn snod_bad_signature() {
         let data = b"XNOD\x01\x00\x00\x00";
         let mut cursor = Cursor::new(data);
         assert!(matches!(
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snod_bad_version() {
+    fn snod_bad_version() {
         let data = b"SNOD\x02\x00\x00\x00";
         let mut cursor = Cursor::new(data);
         assert!(matches!(

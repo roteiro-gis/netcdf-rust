@@ -597,7 +597,7 @@ mod tests {
     use std::f64::consts::PI;
 
     #[test]
-    fn test_scalar_f64_attribute() {
+    fn scalar_f64_attribute() {
         let value: f64 = PI;
         let raw_data = value.to_le_bytes().to_vec();
         let attr = Attribute {
@@ -614,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn test_1d_i32_attribute() {
+    fn one_dimensional_i32_attribute() {
         let values = [1i32, 2, 3, 4];
         let mut raw_data = Vec::new();
         for v in &values {
@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn test_string_attribute() {
+    fn string_attribute() {
         let attr = Attribute {
             name: "units".to_string(),
             datatype: Datatype::String {
@@ -650,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn test_varlen_byte_string_attribute() {
+    fn varlen_byte_string_attribute() {
         let attr = Attribute {
             name: "name".to_string(),
             datatype: Datatype::VarLen {
@@ -670,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_as_f64_from_int() {
+    fn read_as_f64_from_int() {
         let raw_data = 42i32.to_le_bytes().to_vec();
         let attr = Attribute {
             name: "count".to_string(),
@@ -687,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_attribute_btree_errors_surface() {
+    fn dense_attribute_btree_errors_surface() {
         let info = AttributeInfoMessage {
             creation_order_tracked: false,
             creation_order_indexed: false,

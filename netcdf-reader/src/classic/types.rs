@@ -60,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_nc_type_from_code() {
+    fn nc_type_codes_map_supported_values() {
         assert_eq!(nc_type_from_code(1).unwrap(), NcType::Byte);
         assert_eq!(nc_type_from_code(2).unwrap(), NcType::Char);
         assert_eq!(nc_type_from_code(3).unwrap(), NcType::Short);
@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn test_padding() {
+    fn padding() {
         assert_eq!(padding_to_4(0), 0);
         assert_eq!(padding_to_4(1), 3);
         assert_eq!(padding_to_4(2), 2);

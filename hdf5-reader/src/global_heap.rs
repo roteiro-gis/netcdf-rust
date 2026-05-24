@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_empty_collection() {
+    fn parse_empty_collection() {
         let data = build_gcol(&[], 8);
         let mut cursor = Cursor::new(&data);
         let col = GlobalHeapCollection::parse(&mut cursor, 8, 8).unwrap();
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_single_object() {
+    fn parse_single_object() {
         let obj_data = b"hello world";
         let data = build_gcol(&[(1, 1, obj_data)], 8);
         let mut cursor = Cursor::new(&data);
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_multiple_objects() {
+    fn parse_multiple_objects() {
         let data = build_gcol(
             &[
                 (1, 1, b"alpha"),
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_4byte_lengths() {
+    fn parse_4byte_lengths() {
         let data = build_gcol(&[(1, 2, b"test")], 4);
         let mut cursor = Cursor::new(&data);
         let col = GlobalHeapCollection::parse(&mut cursor, 4, 4).unwrap();
@@ -261,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_signature() {
+    fn bad_signature() {
         let mut data = build_gcol(&[], 8);
         data[0] = b'X';
         let mut cursor = Cursor::new(&data);
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_version() {
+    fn bad_version() {
         let mut data = build_gcol(&[], 8);
         data[4] = 2; // version 2
         let mut cursor = Cursor::new(&data);

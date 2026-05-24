@@ -243,7 +243,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_visible_dimensions_include_inherited_without_duplicates() {
+    fn visible_dimensions_include_inherited_without_duplicates() {
         let local = vec![NcDimension {
             name: "y".to_string(),
             size: 4,
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn test_visible_dim_addr_map_prefers_local_dimensions() {
+    fn visible_dim_addr_map_prefers_local_dimensions() {
         let mut inherited = HashMap::new();
         inherited.insert(
             10,

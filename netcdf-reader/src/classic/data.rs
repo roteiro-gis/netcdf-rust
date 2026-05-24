@@ -545,7 +545,7 @@ mod tests {
     use crate::types::NcDimension;
 
     #[test]
-    fn test_read_non_record_1d_float() {
+    fn read_non_record_1d_float() {
         // Create a fake file with 3 floats starting at offset 100.
         let mut file_data = vec![0u8; 200];
         let values = [1.0f32, 2.0f32, 3.0f32];
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_into() {
+    fn non_record_variable_into_copies_values() {
         let mut file_data = vec![0u8; 200];
         let values = [1.0f32, 2.0f32, 3.0f32];
         for (i, &v) in values.iter().enumerate() {
@@ -605,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_2d_int() {
+    fn read_non_record_2d_int() {
         // 2x3 array of i32 at offset 0
         let values: Vec<i32> = vec![10, 20, 30, 40, 50, 60];
         let mut file_data = Vec::new();
@@ -644,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_into_rejects_wrong_destination_len() {
+    fn read_non_record_variable_into_rejects_wrong_destination_len() {
         let var = NcVariable {
             name: "grid".to_string(),
             dimensions: vec![NcDimension {
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_record_stride() {
+    fn record_stride_sums_padded_record_variables() {
         let vars = vec![
             NcVariable {
                 name: "a".to_string(),
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable() {
+    fn record_variable_reads_all_records() {
         // Single record variable "temp" with shape [time, x] where x=2.
         // 3 records, each with 2 floats = 8 bytes per record.
         // Record stride = 8 (only one record var, already 4-aligned).
@@ -749,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_into() {
+    fn record_variable_into_copies_values() {
         let mut file_data = vec![0u8; 200];
         let base = 100usize;
         let record_values: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_into_rejects_wrong_destination_len() {
+    fn read_record_variable_into_rejects_wrong_destination_len() {
         let var = NcVariable {
             name: "temp".to_string(),
             dimensions: vec![
@@ -817,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_rejects_element_count_overflow() {
+    fn read_non_record_variable_rejects_element_count_overflow() {
         let var = NcVariable {
             name: "huge".to_string(),
             dimensions: vec![
@@ -845,7 +845,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_rejects_record_offset_overflow() {
+    fn read_record_variable_rejects_record_offset_overflow() {
         let var = NcVariable {
             name: "huge_record".to_string(),
             dimensions: vec![

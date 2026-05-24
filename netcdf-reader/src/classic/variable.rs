@@ -768,14 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_char_variable_strings_1d() {
+    fn decode_char_variable_strings_1d() {
         let var = char_variable(&[5]);
         let strings = decode_char_variable_strings(&var, b"alpha").unwrap();
         assert_eq!(strings, vec!["alpha"]);
     }
 
     #[test]
-    fn test_decode_char_variable_strings_2d() {
+    fn decode_char_variable_strings_2d() {
         let var = char_variable(&[2, 5]);
         let strings = decode_char_variable_strings(&var, b"alphabeta\0").unwrap();
         assert_eq!(strings, vec!["alpha", "beta"]);

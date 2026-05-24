@@ -1519,7 +1519,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eahd_bad_signature() {
+    fn eahd_bad_signature() {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         let err = parse_header(&data, 0, 8, 8).unwrap_err();
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_super_block_layout() {
+    fn super_block_layout_matches_spec_rows() {
         let header = EaHeader {
             client_id: 0,
             element_size: 8,

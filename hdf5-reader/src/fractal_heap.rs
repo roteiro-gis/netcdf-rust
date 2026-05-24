@@ -1449,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_block_size_for_row() {
+    fn block_size_for_row_scales_by_table_width() {
         let heap = FractalHeap {
             heap_id_len: 8,
             io_filters_len: 0,
@@ -1485,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_tiny_object() {
+    fn get_tiny_object() {
         let heap = base_heap();
         let heap_id = [0x20 | 3, b't', b'i', b'n', b'y'];
         let result = heap.get_object(&heap_id, &[], 8, 8).unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_huge_direct_object() {
+    fn get_huge_direct_object() {
         let heap = base_heap();
         let mut file_data = vec![0u8; 128];
         file_data[64..68].copy_from_slice(b"huge");
@@ -1508,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_filtered_huge_direct_object() {
+    fn get_filtered_huge_direct_object() {
         let heap = filtered_heap_with_info(deflate_filter_info());
         let payload = b"filtered huge payload";
         let compressed = zlib_compress(payload);
@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_filtered_managed_object_direct_root() {
+    fn get_filtered_managed_object_direct_root() {
         let mut heap = filtered_heap_with_info(deflate_filter_info());
         let block_address = 1000u64;
         let obj_data = b"filtered managed";
@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_filtered_managed_object_from_indirect_block() {
+    fn get_filtered_managed_object_from_indirect_block() {
         let mut heap = filtered_heap_with_info(deflate_filter_info());
         let indirect_address = 512u64;
         let block_address = 1000u64;
@@ -1592,7 +1592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_block_header_size() {
+    fn direct_block_header_size_includes_optional_fields() {
         let heap = FractalHeap {
             heap_id_len: 8,
             io_filters_len: 0,
@@ -1629,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_managed_object_direct_root() {
+    fn get_managed_object_direct_root() {
         // Set up a fractal heap where the root is a direct block.
         let offset_size: u8 = 8;
         let max_heap_size: u16 = 16;
@@ -1702,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_object_storage_cached_reads_direct_block_once() {
+    fn get_object_storage_cached_reads_direct_block_once() {
         let offset_size: u8 = 8;
         let max_heap_size: u16 = 16;
         let starting_block_size: u64 = 256;

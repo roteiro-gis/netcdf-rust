@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_u32_le() {
+    fn parse_u32_le() {
         let mut data = Vec::new();
         // class=0 (fixed-point), version=1, flags: bit0=0 (LE), bit3=0 (unsigned)
         data.extend_from_slice(&class_word(0, 1, 0x00).to_le_bytes());
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_i64_be() {
+    fn parse_i64_be() {
         let mut data = Vec::new();
         // class=0 (fixed-point), version=1, flags: bit0=1 (BE), bit3=1 (signed)
         data.extend_from_slice(&class_word(0, 1, 0x09).to_le_bytes());
@@ -590,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_f32_le() {
+    fn parse_f32_le() {
         let mut data = Vec::new();
         // class=1 (float), version=1, flags: bit0=0 (LE), bit6=0
         data.extend_from_slice(&class_word(1, 1, 0x20).to_le_bytes());
@@ -621,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_f64_be() {
+    fn parse_f64_be() {
         let mut data = Vec::new();
         // class=1 (float), version=1, flags: bit0=1 (BE), bit6=0
         data.extend_from_slice(&class_word(1, 1, 0x01).to_le_bytes());
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_string_fixed_ascii() {
+    fn parse_string_fixed_ascii() {
         let mut data = Vec::new();
         // class=3 (string), version=1, flags: padding=0 (null-term), charset=0 (ascii)
         data.extend_from_slice(&class_word(3, 1, 0x00).to_le_bytes());
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_string_utf8_space_pad() {
+    fn parse_string_utf8_space_pad() {
         let mut data = Vec::new();
         // class=3, version=1, flags: padding=2 (space-pad), charset=1 (utf8)
         // padding bits 0-3 = 2, charset bits 4-7 = 1
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_varlen_string_preserves_flags() {
+    fn parse_varlen_string_preserves_flags() {
         let mut data = Vec::new();
         // class=9, version=1, flags: kind=string, padding=space-pad, charset=utf8
         let flags: u32 = 0x01 | (0x02 << 4) | (0x01 << 8);
@@ -737,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_varlen_sequence_preserves_kind() {
+    fn parse_varlen_sequence_preserves_kind() {
         let mut data = Vec::new();
         data.extend_from_slice(&class_word(9, 1, 0x00).to_le_bytes());
         data.extend_from_slice(&16u32.to_le_bytes());
@@ -765,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reference_object() {
+    fn parse_reference_object() {
         let mut data = Vec::new();
         // class=7, version=1, flags: ref_type=0 (object)
         data.extend_from_slice(&class_word(7, 1, 0x00).to_le_bytes());
@@ -783,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reference_region() {
+    fn parse_reference_region() {
         let mut data = Vec::new();
         // class=7, version=1, flags: ref_type=1 (dataset region)
         data.extend_from_slice(&class_word(7, 1, 0x01).to_le_bytes());
@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_compound_v3_variable_member_offsets() {
+    fn parse_compound_v3_variable_member_offsets() {
         let mut data = Vec::new();
         data.extend_from_slice(&class_word(6, 3, 2).to_le_bytes());
         data.extend_from_slice(&16u32.to_le_bytes());
@@ -834,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_enum_u8() {
+    fn parse_enum_u8() {
         let mut data = Vec::new();
         // class=8 (enum), version=3, flags: n_members=2
         data.extend_from_slice(&class_word(8, 3, 2).to_le_bytes());
@@ -878,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_bitfield() {
+    fn bitfield_datatype_parses_size_and_byte_order() {
         let mut data = Vec::new();
         // class=4 (bitfield), version=1, flags: bit0=0 (LE)
         data.extend_from_slice(&class_word(4, 1, 0x00).to_le_bytes());
@@ -899,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_class() {
+    fn unsupported_class() {
         let mut data = Vec::new();
         // class=15 (invalid), version=1, flags=0
         data.extend_from_slice(&class_word(15, 1, 0).to_le_bytes());

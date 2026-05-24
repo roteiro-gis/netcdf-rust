@@ -74,7 +74,7 @@ fn record_strided_slice() -> NcSliceInfo {
 }
 
 #[test]
-fn test_classic_non_record_slice_matches_georust_for_strided_inner_selection() {
+fn classic_non_record_slice_matches_georust_for_strided_inner_selection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_parity.nc");
     create_classic_slice_fixture(&path);
@@ -103,7 +103,7 @@ fn test_classic_non_record_slice_matches_georust_for_strided_inner_selection() {
 }
 
 #[test]
-fn test_classic_non_record_slice_allows_empty_results() {
+fn classic_non_record_slice_allows_empty_results() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_empty.nc");
     create_classic_slice_fixture(&path);
@@ -130,7 +130,7 @@ fn test_classic_non_record_slice_allows_empty_results() {
 }
 
 #[test]
-fn test_classic_non_record_slice_rejects_start_past_dimension_end() {
+fn classic_non_record_slice_rejects_start_past_dimension_end() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_oob.nc");
     create_classic_slice_fixture(&path);
@@ -158,7 +158,7 @@ fn test_classic_non_record_slice_rejects_start_past_dimension_end() {
 }
 
 #[test]
-fn test_classic_record_slice_matches_georust_for_strided_selection() {
+fn classic_record_slice_matches_georust_for_strided_selection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("record_slice_parity.nc");
     create_record_slice_fixture(&path);
@@ -188,7 +188,7 @@ fn test_classic_record_slice_matches_georust_for_strided_selection() {
 }
 
 #[test]
-fn test_classic_record_slice_index_collapses_record_axis() {
+fn classic_record_slice_index_collapses_record_axis() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("record_slice_index.nc");
     create_record_slice_fixture(&path);
