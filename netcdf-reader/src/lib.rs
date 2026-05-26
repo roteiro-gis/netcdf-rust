@@ -183,8 +183,7 @@ impl NcFile {
 
     /// Open a NetCDF file from a custom random-access storage backend.
     ///
-    /// NetCDF-4 files stay fully range-backed. Classic formats are read from
-    /// the provided storage into an owned buffer.
+    /// Both NetCDF-4 and classic CDF-1/2/5 files stay range-backed.
     #[cfg(feature = "netcdf4")]
     pub fn from_storage(storage: DynStorage) -> Result<Self> {
         Self::from_storage_with_options(storage, NcOpenOptions::default())
@@ -199,13 +198,7 @@ impl NcFile {
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
-                let len = usize::try_from(storage.len()).map_err(|_| {
-                    Error::InvalidData(
-                        "classic storage length exceeds platform usize capacity".into(),
-                    )
-                })?;
-                let bytes = storage.read_range(0, len)?;
-                let classic = classic::ClassicFile::from_bytes(bytes.as_ref(), format)?;
+                let classic = classic::ClassicFile::from_storage(storage, format)?;
                 Ok(NcFile {
                     format,
                     inner: NcFileInner::Classic(classic),
@@ -908,6 +901,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "netcdf4")]
     use std::sync::Arc;
+    #[cfg(feature = "netcdf4")]
+    use std::sync::Mutex;
 
     #[test]
     fn detect_cdf1() {
@@ -982,6 +977,137 @@ mod tests {
         assert!(file.dimensions().unwrap().is_empty());
         assert!(file.variables().unwrap().is_empty());
         assert!(file.global_attributes().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "netcdf4")]
+    struct CountingStorage {
+        data: Arc<[u8]>,
+        reads: Mutex<Vec<(u64, usize)>>,
+    }
+
+    #[cfg(feature = "netcdf4")]
+    impl CountingStorage {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: Arc::<[u8]>::from(data),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<(u64, usize)> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(feature = "netcdf4")]
+    impl hdf5_reader::Storage for CountingStorage {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(
+            &self,
+            offset: u64,
+            len: usize,
+        ) -> hdf5_reader::error::Result<hdf5_reader::StorageBuffer> {
+            self.reads.lock().unwrap().push((offset, len));
+            let start = usize::try_from(offset)
+                .map_err(|_| hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+            let end = start
+                .checked_add(len)
+                .ok_or(hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+            if end > self.data.len() {
+                return Err(hdf5_reader::error::Error::UnexpectedEof {
+                    offset,
+                    needed: len as u64,
+                    available: self.len().saturating_sub(offset),
+                });
+            }
+            Ok(hdf5_reader::StorageBuffer::from_vec(
+                self.data[start..end].to_vec(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn classic_large_offset_fixture() -> Vec<u8> {
+        fn write_name(buf: &mut Vec<u8>, name: &str) {
+            buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+        }
+
+        const DATA_OFFSET: usize = 70 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_name(&mut buf, "x");
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_name(&mut buf, "data");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(&(DATA_OFFSET as u32).to_be_bytes());
+
+        buf.resize(DATA_OFFSET, 0);
+        for value in [10i32, 20, 30, 40] {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+        buf
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn classic_from_storage_keeps_open_range_backed() {
+        let data = classic_large_offset_fixture();
+        let full_len = data.len();
+        let storage = Arc::new(CountingStorage::new(data));
+
+        let file = NcFile::from_storage(storage.clone()).unwrap();
+        assert_eq!(file.format(), NcFormat::Classic);
+        assert!(!storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| offset == 0 && len == full_len));
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("data").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20, 30, 40]);
+        assert!(storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| { offset == (70 * 1024) as u64 && len == 16 }));
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn classic_from_storage_slice_reads_planned_range() {
+        let storage = Arc::new(CountingStorage::new(classic_large_offset_fixture()));
+        let file = NcFile::from_storage(storage.clone()).unwrap();
+        let selection = NcSliceInfo {
+            selections: vec![NcSliceInfoElem::Slice {
+                start: 1,
+                end: 3,
+                step: 1,
+            }],
+        };
+
+        let values: ndarray::ArrayD<i32> = file.read_variable_slice("data", &selection).unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[20, 30]);
+        assert!(storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| { offset == (70 * 1024 + 4) as u64 && len == 8 }));
     }
 
     #[cfg(feature = "netcdf4")]

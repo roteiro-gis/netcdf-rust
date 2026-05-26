@@ -12,6 +12,8 @@ use ndarray::{ArrayD, IxDyn};
 use crate::error::{Error, Result};
 use crate::types::{NcType, NcVariable};
 
+use super::storage::ClassicStorage;
+
 /// Trait for types that can be read from classic NetCDF data.
 pub trait NcReadType: Clone + Default + Send + 'static {
     /// The NetCDF type this Rust type corresponds to.
@@ -250,6 +252,27 @@ pub fn read_non_record_variable<T: NcReadType>(
     .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
 }
 
+/// Read the entire data for a non-record variable from range-backed storage.
+pub(crate) fn read_non_record_variable_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+) -> Result<ArrayD<T>> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_from_storage for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
+    let data = storage.read_range(var.data_offset, total_bytes)?;
+    let values = T::decode_bulk_be(data.as_ref(), total_elements)?;
+    let shape = checked_variable_shape(var)?;
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
 /// Read the entire data for a non-record variable into a caller-provided buffer.
 pub fn read_non_record_variable_into<T: NcReadType>(
     file_data: &[u8],
@@ -298,6 +321,33 @@ pub fn read_non_record_variable_into<T: NcReadType>(
     }
 
     T::decode_bulk_be_into(&file_data[offset..end], dst)
+}
+
+/// Read a non-record variable from range-backed storage into a caller-provided buffer.
+pub(crate) fn read_non_record_variable_into_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    dst: &mut [T],
+) -> Result<()> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_into_from_storage for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
+    let data = storage.read_range(var.data_offset, total_bytes)?;
+    T::decode_bulk_be_into(data.as_ref(), dst)
 }
 
 /// Read the entire data for a record variable into an ndarray.
@@ -389,6 +439,44 @@ pub fn read_record_variable<T: NcReadType>(
         }
         let rec_slice = &file_data[rec_offset..rec_end];
         let rec_values = T::decode_bulk_be(rec_slice, elements_per_record)?;
+        values.extend(rec_values);
+    }
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
+/// Read the entire data for a record variable from range-backed storage.
+pub(crate) fn read_record_variable_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+) -> Result<ArrayD<T>> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_from_storage for non-record variables".to_string(),
+        ));
+    }
+
+    let shape = checked_record_shape(var, numrecs)?;
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    let mut values = Vec::with_capacity(total_elements);
+
+    for rec in 0..numrecs {
+        let rec_offset = record_byte_offset(var, rec, record_stride)?;
+        let rec_slice = storage.read_range(rec_offset, bytes_per_record)?;
+        let rec_values = T::decode_bulk_be(rec_slice.as_ref(), elements_per_record)?;
         values.extend(rec_values);
     }
 
@@ -494,6 +582,69 @@ pub fn read_record_variable_into<T: NcReadType>(
     Ok(())
 }
 
+/// Read a record variable from range-backed storage into a caller-provided buffer.
+pub(crate) fn read_record_variable_into_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+    dst: &mut [T],
+) -> Result<()> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_into_from_storage for non-record variables".to_string(),
+        ));
+    }
+
+    if var.dimensions.is_empty() {
+        return Err(Error::InvalidData(
+            "record variable must have at least one dimension".to_string(),
+        ));
+    }
+
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    for rec in 0..numrecs {
+        let rec_offset = record_byte_offset(var, rec, record_stride)?;
+        let rec_slice = storage.read_range(rec_offset, bytes_per_record)?;
+        let dst_start = crate::types::checked_usize_from_u64(rec, "record index")?
+            .checked_mul(elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' destination offset exceeds platform usize",
+                    var.name
+                ))
+            })?;
+        let dst_end = dst_start.checked_add(elements_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' destination range exceeds platform usize",
+                var.name
+            ))
+        })?;
+        T::decode_bulk_be_into(rec_slice.as_ref(), &mut dst[dst_start..dst_end])?;
+    }
+
+    Ok(())
+}
+
 /// Compute the record stride: total bytes per record across all record variables.
 ///
 /// Each record variable's per-record contribution is its `record_size` (already stored
@@ -525,6 +676,28 @@ fn checked_non_record_element_count(var: &NcVariable) -> Result<usize> {
     crate::types::checked_usize_from_u64(total, "variable element count")
 }
 
+pub(crate) fn checked_variable_shape(var: &NcVariable) -> Result<Vec<usize>> {
+    var.shape()
+        .iter()
+        .map(|&s| crate::types::checked_usize_from_u64(s, "variable dimension"))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn checked_record_shape(var: &NcVariable, numrecs: u64) -> Result<Vec<usize>> {
+    let mut shape: Vec<usize> = var
+        .shape()
+        .iter()
+        .map(|&s| crate::types::checked_usize_from_u64(s, "record variable dimension"))
+        .collect::<Result<Vec<_>>>()?;
+    if shape.is_empty() {
+        return Err(Error::InvalidData(
+            "record variable must have at least one dimension".to_string(),
+        ));
+    }
+    shape[0] = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    Ok(shape)
+}
+
 fn checked_record_elements_per_record(var: &NcVariable) -> Result<usize> {
     let mut elements = 1usize;
     for dim in var.dimensions.iter().skip(1) {
@@ -537,6 +710,33 @@ fn checked_record_elements_per_record(var: &NcVariable) -> Result<usize> {
         })?;
     }
     Ok(elements)
+}
+
+pub(crate) fn variable_data_bytes<T: NcReadType>(
+    var_name: &str,
+    element_count: usize,
+) -> Result<usize> {
+    element_count.checked_mul(T::element_size()).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "variable '{var_name}' size in bytes exceeds platform usize"
+        ))
+    })
+}
+
+pub(crate) fn record_byte_offset(var: &NcVariable, record: u64, record_stride: u64) -> Result<u64> {
+    var.data_offset
+        .checked_add(record.checked_mul(record_stride).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' byte offset exceeds u64",
+                var.name
+            ))
+        })?)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' byte offset exceeds u64",
+                var.name
+            ))
+        })
 }
 
 #[cfg(test)]

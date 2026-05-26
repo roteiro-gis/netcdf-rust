@@ -11,6 +11,7 @@ use crate::types::{
 };
 
 use super::data::{self, compute_record_stride, NcReadType};
+use super::storage::ClassicStorage;
 use super::ClassicFile;
 
 #[derive(Clone, Debug)]
@@ -44,9 +45,7 @@ struct ResolvedClassicSelection {
 }
 
 struct BlockReadContext<'a> {
-    file_data: &'a [u8],
-    var_name: &'a str,
-    base_offset: usize,
+    base_offset: u64,
     plan: &'a ContiguousSelectionPlan,
 }
 
@@ -59,11 +58,17 @@ struct ContiguousSelectionPlan {
     elem_size: u64,
 }
 
+#[derive(Clone, Debug)]
+struct PlannedReadSpan {
+    offset: u64,
+    elements: usize,
+    bytes: usize,
+}
+
 struct RecordSliceContext<'a> {
-    file_data: &'a [u8],
-    var_name: &'a str,
-    base_offset: usize,
-    record_stride: usize,
+    storage: &'a ClassicStorage,
+    base_offset: u64,
+    record_stride: u64,
     inner_resolved: &'a ResolvedClassicSelection,
     inner_plan: &'a ContiguousSelectionPlan,
 }
@@ -85,13 +90,11 @@ impl ClassicFile {
             });
         }
 
-        let file_data = self.data.as_slice();
-
         if var.is_record_var {
             let record_stride = compute_record_stride(&self.root_group.variables);
-            data::read_record_variable(file_data, var, self.numrecs, record_stride)
+            data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
         } else {
-            data::read_non_record_variable(file_data, var)
+            data::read_non_record_variable_from_storage(&self.storage, var)
         }
     }
 
@@ -107,13 +110,17 @@ impl ClassicFile {
             });
         }
 
-        let file_data = self.data.as_slice();
-
         if var.is_record_var {
             let record_stride = compute_record_stride(&self.root_group.variables);
-            data::read_record_variable_into(file_data, var, self.numrecs, record_stride, dst)
+            data::read_record_variable_into_from_storage(
+                &self.storage,
+                var,
+                self.numrecs,
+                record_stride,
+                dst,
+            )
         } else {
-            data::read_non_record_variable_into(file_data, var, dst)
+            data::read_non_record_variable_into_from_storage(&self.storage, var, dst)
         }
     }
 
@@ -123,44 +130,43 @@ impl ClassicFile {
     /// which is convenient for analysis but may lose precision for i64/u64.
     pub fn read_variable_as_f64(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.find_variable(name)?;
-        let file_data = self.data.as_slice();
 
         match var.dtype {
             NcType::Byte => {
-                let arr = self.read_typed_variable::<i8>(var, file_data)?;
+                let arr = self.read_typed_variable::<i8>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::Short => {
-                let arr = self.read_typed_variable::<i16>(var, file_data)?;
+                let arr = self.read_typed_variable::<i16>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::Int => {
-                let arr = self.read_typed_variable::<i32>(var, file_data)?;
+                let arr = self.read_typed_variable::<i32>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::Float => {
-                let arr = self.read_typed_variable::<f32>(var, file_data)?;
+                let arr = self.read_typed_variable::<f32>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
-            NcType::Double => self.read_typed_variable::<f64>(var, file_data),
+            NcType::Double => self.read_typed_variable::<f64>(var),
             NcType::UByte => {
-                let arr = self.read_typed_variable::<u8>(var, file_data)?;
+                let arr = self.read_typed_variable::<u8>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::UShort => {
-                let arr = self.read_typed_variable::<u16>(var, file_data)?;
+                let arr = self.read_typed_variable::<u16>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::UInt => {
-                let arr = self.read_typed_variable::<u32>(var, file_data)?;
+                let arr = self.read_typed_variable::<u32>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::Int64 => {
-                let arr = self.read_typed_variable::<i64>(var, file_data)?;
+                let arr = self.read_typed_variable::<i64>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::UInt64 => {
-                let arr = self.read_typed_variable::<u64>(var, file_data)?;
+                let arr = self.read_typed_variable::<u64>(var)?;
                 Ok(arr.mapv(|v| v as f64))
             }
             NcType::Char => Err(Error::TypeMismatch {
@@ -207,8 +213,7 @@ impl ClassicFile {
             });
         }
 
-        let file_data = self.data.as_slice();
-        let arr = self.read_typed_variable::<u8>(var, file_data)?;
+        let arr = self.read_typed_variable::<u8>(var)?;
         let bytes: Vec<u8> = arr.iter().copied().collect();
         decode_char_variable_strings(var, &bytes)
     }
@@ -230,7 +235,6 @@ impl ClassicFile {
                 actual: format!("{:?}", var.dtype),
             });
         }
-        let file_data = self.data.as_slice();
         let resolved = resolve_classic_selection(
             var,
             selection,
@@ -238,11 +242,17 @@ impl ClassicFile {
         )?;
 
         if !var.is_record_var {
-            return read_non_record_variable_slice_direct(file_data, var, &resolved);
+            return read_non_record_variable_slice_direct(&self.storage, var, &resolved);
         }
 
         let record_stride = compute_record_stride(&self.root_group.variables);
-        read_record_variable_slice_direct(file_data, var, self.numrecs, record_stride, &resolved)
+        read_record_variable_slice_direct(
+            &self.storage,
+            var,
+            self.numrecs,
+            record_stride,
+            &resolved,
+        )
     }
 
     /// Read a slice with automatic type promotion to f64.
@@ -292,16 +302,12 @@ impl ClassicFile {
     }
 
     /// Internal: read a variable with the correct record handling.
-    fn read_typed_variable<T: NcReadType>(
-        &self,
-        var: &NcVariable,
-        file_data: &[u8],
-    ) -> Result<ArrayD<T>> {
+    fn read_typed_variable<T: NcReadType>(&self, var: &NcVariable) -> Result<ArrayD<T>> {
         if var.is_record_var {
             let record_stride = compute_record_stride(&self.root_group.variables);
-            data::read_record_variable(file_data, var, self.numrecs, record_stride)
+            data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
         } else {
-            data::read_non_record_variable(file_data, var)
+            data::read_non_record_variable_from_storage(&self.storage, var)
         }
     }
 }
@@ -449,17 +455,16 @@ fn resolve_classic_selection(
 }
 
 fn read_non_record_variable_slice_direct<T: NcReadType>(
-    file_data: &[u8],
+    storage: &ClassicStorage,
     var: &NcVariable,
     resolved: &ResolvedClassicSelection,
 ) -> Result<ArrayD<T>> {
     let shape = variable_shape_for_selection(var, 0);
-    let base_offset = checked_usize_from_u64(var.data_offset, "classic slice data offset")?;
-    build_array_from_contiguous_selection::<T>(file_data, &var.name, base_offset, &shape, resolved)
+    build_array_from_contiguous_selection::<T>(storage, var.data_offset, &shape, resolved)
 }
 
 fn read_record_variable_slice_direct<T: NcReadType>(
-    file_data: &[u8],
+    storage: &ClassicStorage,
     var: &NcVariable,
     numrecs: u64,
     record_stride: u64,
@@ -481,13 +486,10 @@ fn read_record_variable_slice_direct<T: NcReadType>(
         dims: inner_dims,
     };
     let inner_plan = build_contiguous_selection_plan::<T>(inner_shape, &inner_resolved.dims)?;
-    let base_offset = checked_usize_from_u64(var.data_offset, "classic slice data offset")?;
-    let record_stride = checked_usize_from_u64(record_stride, "classic record stride")?;
     let mut values = Vec::with_capacity(resolved.result_elements);
     let context = RecordSliceContext {
-        file_data,
-        var_name: &var.name,
-        base_offset,
+        storage,
+        base_offset: var.data_offset,
         record_stride,
         inner_resolved: &inner_resolved,
         inner_plan: &inner_plan,
@@ -546,9 +548,8 @@ fn selection_result_elements(dims: &[ResolvedClassicSelectionDim]) -> Result<usi
 }
 
 fn build_array_from_contiguous_selection<T: NcReadType>(
-    file_data: &[u8],
-    var_name: &str,
-    base_offset: usize,
+    storage: &ClassicStorage,
+    base_offset: u64,
     shape: &[u64],
     resolved: &ResolvedClassicSelection,
 ) -> Result<ArrayD<T>> {
@@ -556,8 +557,7 @@ fn build_array_from_contiguous_selection<T: NcReadType>(
 
     let plan = build_contiguous_selection_plan::<T>(shape, &resolved.dims)?;
     let values = read_contiguous_selection_values_with_plan::<T>(
-        file_data,
-        var_name,
+        storage,
         base_offset,
         &plan,
         resolved.result_elements,
@@ -603,9 +603,8 @@ fn build_contiguous_selection_plan<T: NcReadType>(
 }
 
 fn read_contiguous_selection_values_with_plan<T: NcReadType>(
-    file_data: &[u8],
-    var_name: &str,
-    base_offset: usize,
+    storage: &ClassicStorage,
+    base_offset: u64,
     plan: &ContiguousSelectionPlan,
     result_elements: usize,
 ) -> Result<Vec<T>> {
@@ -613,14 +612,37 @@ fn read_contiguous_selection_values_with_plan<T: NcReadType>(
         return Ok(Vec::new());
     }
 
+    let spans = plan_contiguous_selection_spans(base_offset, plan, result_elements)?;
+    read_planned_spans_serial::<T>(storage, &spans, result_elements)
+}
+
+fn plan_contiguous_selection_spans(
+    base_offset: u64,
+    plan: &ContiguousSelectionPlan,
+    result_elements: usize,
+) -> Result<Vec<PlannedReadSpan>> {
+    if result_elements == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut spans = Vec::new();
+    let context = BlockReadContext { base_offset, plan };
+    plan_selected_blocks_recursive(0, 0, &context, &mut spans)?;
+    Ok(spans)
+}
+
+fn read_planned_spans_serial<T: NcReadType>(
+    storage: &ClassicStorage,
+    spans: &[PlannedReadSpan],
+    result_elements: usize,
+) -> Result<Vec<T>> {
     let mut values = Vec::with_capacity(result_elements);
-    let context = BlockReadContext {
-        file_data,
-        var_name,
-        base_offset,
-        plan,
-    };
-    read_selected_blocks_recursive::<T>(0, 0, &context, &mut values)?;
+    for span in spans {
+        let data = storage.read_range(span.offset, span.bytes)?;
+        let mut decoded = T::decode_bulk_be(data.as_ref(), span.elements)?;
+        values.append(&mut decoded);
+    }
+    debug_assert_eq!(values.len(), result_elements);
     Ok(values)
 }
 
@@ -629,18 +651,14 @@ fn append_one_record_slice<T: NcReadType>(
     record: u64,
     values: &mut Vec<T>,
 ) -> Result<()> {
-    let record = checked_usize_from_u64(record, "classic record index")?;
     let record_offset = context
         .base_offset
         .checked_add(record.checked_mul(context.record_stride).ok_or_else(|| {
-            Error::InvalidData("classic record byte offset exceeds platform usize".to_string())
+            Error::InvalidData("classic record byte offset exceeds u64".to_string())
         })?)
-        .ok_or_else(|| {
-            Error::InvalidData("classic record byte offset exceeds platform usize".to_string())
-        })?;
+        .ok_or_else(|| Error::InvalidData("classic record byte offset exceeds u64".to_string()))?;
     let mut decoded = read_contiguous_selection_values_with_plan::<T>(
-        context.file_data,
-        context.var_name,
+        context.storage,
         record_offset,
         context.inner_plan,
         context.inner_resolved.result_elements,
@@ -649,45 +667,38 @@ fn append_one_record_slice<T: NcReadType>(
     Ok(())
 }
 
-fn read_selected_blocks_recursive<T: NcReadType>(
+fn plan_selected_blocks_recursive(
     level: usize,
     current_offset: u64,
     context: &BlockReadContext<'_>,
-    values: &mut Vec<T>,
+    spans: &mut Vec<PlannedReadSpan>,
 ) -> Result<()> {
     if level == context.plan.tail_start {
-        let byte_offset = checked_usize_from_u64(
-            checked_mul_u64(
-                current_offset,
-                context.plan.elem_size,
-                "classic slice element byte offset",
-            )?,
+        let byte_offset = checked_mul_u64(
+            current_offset,
+            context.plan.elem_size,
             "classic slice element byte offset",
         )?;
         let start = context
             .base_offset
             .checked_add(byte_offset)
             .ok_or_else(|| {
-                Error::InvalidData("classic slice byte offset exceeds platform usize".to_string())
+                Error::InvalidData("classic slice byte offset exceeds u64".to_string())
             })?;
-        let end = start.checked_add(context.plan.block_bytes).ok_or_else(|| {
-            Error::InvalidData("classic slice byte range exceeds platform usize".to_string())
-        })?;
-        if end > context.file_data.len() {
-            return Err(Error::InvalidData(format!(
-                "variable '{}' slice data extends beyond file",
-                context.var_name
-            )));
-        }
 
-        let mut decoded =
-            T::decode_bulk_be(&context.file_data[start..end], context.plan.block_elements)?;
-        values.append(&mut decoded);
+        push_planned_span(
+            spans,
+            PlannedReadSpan {
+                offset: start,
+                elements: context.plan.block_elements,
+                bytes: context.plan.block_bytes,
+            },
+        )?;
         return Ok(());
     }
 
     match &context.plan.dims[level] {
-        ResolvedClassicSelectionDim::Index(idx) => read_selected_blocks_recursive::<T>(
+        ResolvedClassicSelectionDim::Index(idx) => plan_selected_blocks_recursive(
             level + 1,
             current_offset
                 .checked_add(checked_mul_u64(
@@ -701,7 +712,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                     )
                 })?,
             context,
-            values,
+            spans,
         ),
         ResolvedClassicSelectionDim::Slice {
             start, step, count, ..
@@ -719,7 +730,7 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                     .ok_or_else(|| {
                         Error::InvalidData("classic slice coordinate exceeds u64".to_string())
                     })?;
-                read_selected_blocks_recursive::<T>(
+                plan_selected_blocks_recursive(
                     level + 1,
                     current_offset
                         .checked_add(checked_mul_u64(
@@ -733,12 +744,38 @@ fn read_selected_blocks_recursive<T: NcReadType>(
                             )
                         })?,
                     context,
-                    values,
+                    spans,
                 )?;
             }
             Ok(())
         }
     }
+}
+
+fn push_planned_span(spans: &mut Vec<PlannedReadSpan>, span: PlannedReadSpan) -> Result<()> {
+    if span.bytes == 0 {
+        return Ok(());
+    }
+
+    if let Some(last) = spans.last_mut() {
+        let last_end = last.offset.checked_add(last.bytes as u64).ok_or_else(|| {
+            Error::InvalidData("classic planned byte span exceeds u64".to_string())
+        })?;
+        if last_end == span.offset {
+            last.bytes = last.bytes.checked_add(span.bytes).ok_or_else(|| {
+                Error::InvalidData("classic planned byte span exceeds platform usize".to_string())
+            })?;
+            last.elements = last.elements.checked_add(span.elements).ok_or_else(|| {
+                Error::InvalidData(
+                    "classic planned element span exceeds platform usize".to_string(),
+                )
+            })?;
+            return Ok(());
+        }
+    }
+
+    spans.push(span);
+    Ok(())
 }
 
 #[cfg(test)]

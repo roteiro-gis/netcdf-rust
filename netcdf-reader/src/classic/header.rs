@@ -6,10 +6,15 @@
 //! where CDF-1/2 use 4-byte values.
 
 use crate::error::{Error, Result};
-use crate::types::{NcAttrValue, NcAttribute, NcDimension, NcType, NcVariable};
+use crate::types::{
+    checked_mul_u64, checked_usize_from_u64, NcAttrValue, NcAttribute, NcDimension, NcType,
+    NcVariable,
+};
 use crate::NcFormat;
 
-use super::types::{nc_type_from_code, pad_to_4};
+#[cfg(test)]
+use super::types::pad_to_4;
+use super::types::{nc_type_from_code, padding_to_4};
 
 // Header tag constants.
 const ABSENT: u32 = 0x0000_0000;
@@ -45,12 +50,11 @@ impl<'a> Cursor<'a> {
 
     fn ensure(&self, n: usize) -> Result<()> {
         if self.remaining() < n {
-            Err(Error::InvalidData(format!(
-                "unexpected end of header at offset {}: need {} bytes, have {}",
-                self.pos,
-                n,
-                self.remaining()
-            )))
+            Err(Error::UnexpectedEof {
+                offset: self.pos as u64,
+                needed: n as u64,
+                available: self.remaining() as u64,
+            })
         } else {
             Ok(())
         }
@@ -179,9 +183,9 @@ impl<'a> Cursor<'a> {
     /// Read a padded name: 4-byte length, then chars, then padding to 4-byte boundary.
     /// The name length prefix is always 4 bytes for CDF-1/2 and 8 bytes for CDF-5.
     fn read_name(&mut self, format: NcFormat) -> Result<String> {
-        let len = self.read_count(format)? as usize;
+        let len = checked_usize_from_u64(self.read_count(format)?, "classic name length")?;
         let bytes = self.read_bytes(len)?;
-        let padded_len = pad_to_4(len);
+        let padded_len = checked_pad_to_4(len, "classic name length")?;
         let pad = padded_len - len;
         if pad > 0 {
             self.skip(pad)?;
@@ -189,6 +193,31 @@ impl<'a> Cursor<'a> {
         String::from_utf8(bytes.to_vec())
             .map_err(|e| Error::InvalidData(format!("invalid UTF-8 name: {}", e)))
     }
+}
+
+fn checked_pad_to_4(len: usize, context: &str) -> Result<usize> {
+    len.checked_add(padding_to_4(len)).ok_or_else(|| {
+        Error::InvalidData(format!("{context} padded length exceeds platform usize"))
+    })
+}
+
+fn read_list_count(
+    cur: &mut Cursor<'_>,
+    format: NcFormat,
+    min_bytes_per_entry: u64,
+    context: &str,
+) -> Result<usize> {
+    let raw = cur.read_count(format)?;
+    let count = checked_usize_from_u64(raw, context)?;
+    let min_needed = checked_mul_u64(raw, min_bytes_per_entry, context)?;
+    if min_needed > cur.remaining() as u64 {
+        return Err(Error::UnexpectedEof {
+            offset: cur.pos as u64,
+            needed: min_needed,
+            available: cur.remaining() as u64,
+        });
+    }
+    Ok(count)
 }
 
 /// Parse a complete classic NetCDF header from raw file bytes.
@@ -246,7 +275,7 @@ fn parse_dim_list(cur: &mut Cursor<'_>, format: NcFormat) -> Result<Vec<NcDimens
         )));
     }
 
-    let nelems = cur.read_count(format)? as usize;
+    let nelems = read_list_count(cur, format, 16, "dimension count")?;
     let mut dims = Vec::with_capacity(nelems);
 
     for _ in 0..nelems {
@@ -280,13 +309,13 @@ fn parse_att_list(cur: &mut Cursor<'_>, format: NcFormat) -> Result<Vec<NcAttrib
         )));
     }
 
-    let nelems = cur.read_count(format)? as usize;
+    let nelems = read_list_count(cur, format, 12, "attribute count")?;
     let mut attrs = Vec::with_capacity(nelems);
 
     for _ in 0..nelems {
         let name = cur.read_name(format)?;
         let nc_type = cur.read_u32_be()?;
-        let nvalues = cur.read_count(format)? as usize;
+        let nvalues = checked_usize_from_u64(cur.read_count(format)?, "attribute value count")?;
         let value = read_attr_values(cur, nc_type, nvalues, format)?;
 
         attrs.push(NcAttribute { name, value });
@@ -305,8 +334,10 @@ fn read_attr_values(
 ) -> Result<NcAttrValue> {
     let typ = nc_type_from_code(nc_type)?;
     let elem_size = typ.size();
-    let raw_bytes = nvalues * elem_size;
-    let padded = pad_to_4(raw_bytes);
+    let raw_bytes = nvalues.checked_mul(elem_size).ok_or_else(|| {
+        Error::InvalidData("classic attribute byte count exceeds platform usize".to_string())
+    })?;
+    let padded = checked_pad_to_4(raw_bytes, "classic attribute byte count")?;
 
     match typ {
         NcType::Byte => {
@@ -420,20 +451,20 @@ fn parse_var_list(
         )));
     }
 
-    let nelems = cur.read_count(format)? as usize;
+    let nelems = read_list_count(cur, format, 28, "variable count")?;
     let mut vars = Vec::with_capacity(nelems);
 
     for _ in 0..nelems {
         let name = cur.read_name(format)?;
 
         // Number of dimensions for this variable.
-        let ndims = cur.read_count(format)? as usize;
+        let ndims = checked_usize_from_u64(cur.read_count(format)?, "variable dimension count")?;
 
         // Dimension IDs are NON_NEG values and widen to 64 bits in CDF-5.
         let mut var_dims = Vec::with_capacity(ndims);
         let mut is_record_var = false;
         for _ in 0..ndims {
-            let dimid = cur.read_count(format)? as usize;
+            let dimid = checked_usize_from_u64(cur.read_count(format)?, "dimension id")?;
             if dimid >= dims.len() {
                 return Err(Error::InvalidData(format!(
                     "variable '{}' references dimension index {} but only {} dimensions exist",
