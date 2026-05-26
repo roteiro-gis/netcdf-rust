@@ -1067,6 +1067,102 @@ mod tests {
         buf
     }
 
+    fn write_cdf1_name(buf: &mut Vec<u8>, name: &str) {
+        buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn write_cdf5_count(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_cdf5_name(buf: &mut Vec<u8>, name: &str) {
+        write_cdf5_count(buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn cdf5_huge_dimension_fixture() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x05");
+        write_cdf5_count(&mut buf, 0);
+
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_name(&mut buf, "n");
+        write_cdf5_count(&mut buf, u64::MAX);
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 0);
+
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_name(&mut buf, "big");
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_count(&mut buf, 0);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 0);
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 4);
+        let offset_pos = buf.len();
+        buf.extend_from_slice(&0u64.to_be_bytes());
+
+        let data_offset = buf.len() as u64;
+        buf[offset_pos..offset_pos + 8].copy_from_slice(&data_offset.to_be_bytes());
+        buf.extend_from_slice(&123i32.to_be_bytes());
+        buf
+    }
+
+    fn subfiling_marker_fixture() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Cu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "_PnetCDF_SubFiling_enabled");
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1i32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn cdf5_huge_dimension_can_slice_but_full_read_errors_cleanly() {
+        let file = NcFile::from_bytes(&cdf5_huge_dimension_fixture()).unwrap();
+        let selection = NcSliceInfo {
+            selections: vec![NcSliceInfoElem::Index(0)],
+        };
+
+        let sliced: ndarray::ArrayD<i32> = file.read_variable_slice("big", &selection).unwrap();
+        assert_eq!(sliced.as_slice().unwrap(), &[123]);
+
+        let err = file.read_variable::<i32>("big").unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn classic_subfiling_marker_returns_unsupported_feature() {
+        let err = match NcFile::from_bytes(&subfiling_marker_fixture()) {
+            Ok(_) => panic!("subfiling marker should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::UnsupportedFeature(message) if message.contains("PnetCDF subfiling")
+        ));
+    }
+
     #[cfg(feature = "netcdf4")]
     #[test]
     fn classic_from_storage_keeps_open_range_backed() {

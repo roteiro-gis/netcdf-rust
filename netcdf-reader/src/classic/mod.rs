@@ -35,6 +35,7 @@ impl ClassicFile {
         // SAFETY: read-only mapping; caller must not modify the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
         let header = header::parse_header(&mmap, format)?;
+        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_mmap(mmap);
 
         let root_group = NcGroup {
@@ -56,6 +57,7 @@ impl ClassicFile {
     /// Open a classic NetCDF file from in-memory bytes.
     pub fn from_bytes(bytes: &[u8], format: NcFormat) -> Result<Self> {
         let header = header::parse_header(bytes, format)?;
+        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_bytes(bytes.to_vec());
 
         let root_group = NcGroup {
@@ -77,6 +79,7 @@ impl ClassicFile {
     /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
     pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
         let header = header::parse_header(&mmap, format)?;
+        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_mmap(mmap);
 
         let root_group = NcGroup {
@@ -103,6 +106,7 @@ impl ClassicFile {
     ) -> Result<Self> {
         let storage = ClassicStorage::from_range(storage);
         let header = parse_header_from_storage(&storage, format)?;
+        reject_unsupported_classic_features(&header)?;
 
         let root_group = NcGroup {
             name: "/".to_string(),
@@ -134,6 +138,26 @@ impl ClassicFile {
     pub fn numrecs(&self) -> u64 {
         self.numrecs
     }
+}
+
+fn reject_unsupported_classic_features(header: &header::ClassicHeader) -> Result<()> {
+    let has_subfiling_marker = header
+        .global_attributes
+        .iter()
+        .any(|attr| attr.name.starts_with("_PnetCDF_SubFiling"))
+        || header.variables.iter().any(|var| {
+            var.attributes
+                .iter()
+                .any(|attr| attr.name.starts_with("_PnetCDF_SubFiling"))
+        });
+
+    if has_subfiling_marker {
+        return Err(crate::Error::UnsupportedFeature(
+            "PnetCDF subfiling datasets require a virtual multi-file storage adapter".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "netcdf4")]
