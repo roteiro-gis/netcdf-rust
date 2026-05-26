@@ -487,7 +487,7 @@ impl NcFile {
     #[cfg(feature = "rayon")]
     pub fn read_variable_parallel<T: NcReadable>(&self, name: &str) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            NcFileInner::Classic(c) => c.read_variable_parallel::<T>(name),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_parallel::<T>(name)?),
         }
@@ -503,7 +503,7 @@ impl NcFile {
         pool: &ThreadPool,
     ) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            NcFileInner::Classic(c) => pool.install(|| c.read_variable_parallel::<T>(name)),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_in_pool::<T>(name, pool)?),
         }
@@ -664,7 +664,7 @@ impl NcFile {
         selection: &NcSliceInfo,
     ) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable_slice::<T>(name, selection),
+            NcFileInner::Classic(c) => c.read_variable_slice_parallel::<T>(name, selection),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_slice_parallel::<T>(name, selection)?),
         }

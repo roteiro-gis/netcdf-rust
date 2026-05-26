@@ -4,6 +4,8 @@
 //! with type-checked access and support for both record and non-record variables.
 
 use ndarray::ArrayD;
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::types::{
@@ -11,6 +13,8 @@ use crate::types::{
 };
 
 use super::data::{self, compute_record_stride, NcReadType};
+#[cfg(feature = "rayon")]
+use super::data::{CLASSIC_PARALLEL_MIN_BYTES, CLASSIC_PARALLEL_TARGET_CHUNK_BYTES};
 use super::storage::ClassicStorage;
 use super::ClassicFile;
 
@@ -95,6 +99,32 @@ impl ClassicFile {
             data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
         } else {
             data::read_non_record_variable_from_storage(&self.storage, var)
+        }
+    }
+
+    /// Read a variable's data using Rayon for large classic byte ranges.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_parallel<T: NcReadType>(&self, name: &str) -> Result<ArrayD<T>> {
+        let var = self.find_variable(name)?;
+
+        let expected = T::nc_type();
+        if var.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", expected),
+                actual: format!("{:?}", var.dtype),
+            });
+        }
+
+        if var.is_record_var {
+            let record_stride = compute_record_stride(&self.root_group.variables);
+            data::read_record_variable_parallel_from_storage(
+                &self.storage,
+                var,
+                self.numrecs,
+                record_stride,
+            )
+        } else {
+            data::read_non_record_variable_parallel_from_storage(&self.storage, var)
         }
     }
 
@@ -247,6 +277,41 @@ impl ClassicFile {
 
         let record_stride = compute_record_stride(&self.root_group.variables);
         read_record_variable_slice_direct(
+            &self.storage,
+            var,
+            self.numrecs,
+            record_stride,
+            &resolved,
+        )
+    }
+
+    /// Read a variable slice using Rayon for large planned byte ranges.
+    #[cfg(feature = "rayon")]
+    pub fn read_variable_slice_parallel<T: NcReadType>(
+        &self,
+        name: &str,
+        selection: &crate::types::NcSliceInfo,
+    ) -> Result<ArrayD<T>> {
+        let var = self.find_variable(name)?;
+        let expected = T::nc_type();
+        if var.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", expected),
+                actual: format!("{:?}", var.dtype),
+            });
+        }
+        let resolved = resolve_classic_selection(
+            var,
+            selection,
+            if var.is_record_var { self.numrecs } else { 0 },
+        )?;
+
+        if !var.is_record_var {
+            return read_non_record_variable_slice_parallel(&self.storage, var, &resolved);
+        }
+
+        let record_stride = compute_record_stride(&self.root_group.variables);
+        read_record_variable_slice_parallel(
             &self.storage,
             var,
             self.numrecs,
@@ -463,6 +528,23 @@ fn read_non_record_variable_slice_direct<T: NcReadType>(
     build_array_from_contiguous_selection::<T>(storage, var.data_offset, &shape, resolved)
 }
 
+#[cfg(feature = "rayon")]
+fn read_non_record_variable_slice_parallel<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    resolved: &ResolvedClassicSelection,
+) -> Result<ArrayD<T>> {
+    use ndarray::IxDyn;
+
+    let shape = variable_shape_for_selection(var, 0);
+    let plan = build_contiguous_selection_plan::<T>(&shape, &resolved.dims)?;
+    let spans = plan_contiguous_selection_spans(var.data_offset, &plan, resolved.result_elements)?;
+    let values = read_planned_spans_maybe_parallel::<T>(storage, &spans, resolved.result_elements)?;
+
+    ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {e}")))
+}
+
 fn read_record_variable_slice_direct<T: NcReadType>(
     storage: &ClassicStorage,
     var: &NcVariable,
@@ -520,6 +602,71 @@ fn read_record_variable_slice_direct<T: NcReadType>(
     }
 
     debug_assert_eq!(values.len(), resolved.result_elements);
+    ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {e}")))
+}
+
+#[cfg(feature = "rayon")]
+fn read_record_variable_slice_parallel<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+    resolved: &ResolvedClassicSelection,
+) -> Result<ArrayD<T>> {
+    use ndarray::IxDyn;
+
+    if resolved.result_elements == 0 {
+        return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), Vec::new())
+            .map_err(|e| Error::InvalidData(format!("failed to create array: {e}")));
+    }
+
+    let shape = variable_shape_for_selection(var, numrecs);
+    let inner_shape = &shape[1..];
+    let inner_dims = resolved.dims[1..].to_vec();
+    let inner_resolved = ResolvedClassicSelection {
+        result_shape: selection_result_shape(&inner_dims),
+        result_elements: selection_result_elements(&inner_dims)?,
+        dims: inner_dims,
+    };
+    let inner_plan = build_contiguous_selection_plan::<T>(inner_shape, &inner_resolved.dims)?;
+    let mut spans = Vec::new();
+
+    match &resolved.dims[0] {
+        ResolvedClassicSelectionDim::Index(record) => append_one_record_slice_spans(
+            var.data_offset,
+            record_stride,
+            &inner_plan,
+            *record,
+            &mut spans,
+        )?,
+        ResolvedClassicSelectionDim::Slice {
+            start, step, count, ..
+        } => {
+            for ordinal in 0..*count {
+                let record = start
+                    .checked_add(checked_mul_u64(
+                        ordinal as u64,
+                        *step,
+                        "classic record slice coordinate",
+                    )?)
+                    .ok_or_else(|| {
+                        Error::InvalidData(
+                            "classic record slice coordinate exceeds u64".to_string(),
+                        )
+                    })?;
+                append_one_record_slice_spans(
+                    var.data_offset,
+                    record_stride,
+                    &inner_plan,
+                    record,
+                    &mut spans,
+                )?;
+            }
+        }
+    }
+
+    let values = read_planned_spans_maybe_parallel::<T>(storage, &spans, resolved.result_elements)?;
     ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {e}")))
 }
@@ -667,6 +814,26 @@ fn append_one_record_slice<T: NcReadType>(
     Ok(())
 }
 
+#[cfg(feature = "rayon")]
+fn append_one_record_slice_spans(
+    base_offset: u64,
+    record_stride: u64,
+    inner_plan: &ContiguousSelectionPlan,
+    record: u64,
+    spans: &mut Vec<PlannedReadSpan>,
+) -> Result<()> {
+    let record_offset = base_offset
+        .checked_add(record.checked_mul(record_stride).ok_or_else(|| {
+            Error::InvalidData("classic record byte offset exceeds u64".to_string())
+        })?)
+        .ok_or_else(|| Error::InvalidData("classic record byte offset exceeds u64".to_string()))?;
+    let record_spans = plan_contiguous_selection_spans(record_offset, inner_plan, 1)?;
+    for span in record_spans {
+        push_planned_span(spans, span)?;
+    }
+    Ok(())
+}
+
 fn plan_selected_blocks_recursive(
     level: usize,
     current_offset: u64,
@@ -776,6 +943,84 @@ fn push_planned_span(spans: &mut Vec<PlannedReadSpan>, span: PlannedReadSpan) ->
 
     spans.push(span);
     Ok(())
+}
+
+#[cfg(feature = "rayon")]
+fn read_planned_spans_maybe_parallel<T: NcReadType>(
+    storage: &ClassicStorage,
+    spans: &[PlannedReadSpan],
+    result_elements: usize,
+) -> Result<Vec<T>> {
+    let total_bytes = planned_spans_total_bytes(spans)?;
+    if total_bytes < CLASSIC_PARALLEL_MIN_BYTES || spans.is_empty() {
+        return read_planned_spans_serial::<T>(storage, spans, result_elements);
+    }
+
+    let split_spans = split_planned_spans_for_parallel::<T>(spans)?;
+    let chunks = split_spans
+        .par_iter()
+        .map(|span| {
+            let data = storage.read_range(span.offset, span.bytes)?;
+            T::decode_bulk_be(data.as_ref(), span.elements)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(data::flatten_ordered_chunks(chunks, result_elements))
+}
+
+#[cfg(feature = "rayon")]
+fn planned_spans_total_bytes(spans: &[PlannedReadSpan]) -> Result<usize> {
+    let mut total = 0usize;
+    for span in spans {
+        total = total.checked_add(span.bytes).ok_or_else(|| {
+            Error::InvalidData("classic planned byte count exceeds platform usize".to_string())
+        })?;
+    }
+    Ok(total)
+}
+
+#[cfg(feature = "rayon")]
+fn split_planned_spans_for_parallel<T: NcReadType>(
+    spans: &[PlannedReadSpan],
+) -> Result<Vec<PlannedReadSpan>> {
+    let elem_size = T::element_size();
+    let elements_per_chunk = (CLASSIC_PARALLEL_TARGET_CHUNK_BYTES / elem_size.max(1)).max(1);
+    let mut split = Vec::new();
+
+    for span in spans {
+        if span.elements <= elements_per_chunk {
+            split.push(span.clone());
+            continue;
+        }
+
+        let chunk_count = span.elements.div_ceil(elements_per_chunk);
+        for chunk in 0..chunk_count {
+            let start_element = chunk.checked_mul(elements_per_chunk).ok_or_else(|| {
+                Error::InvalidData(
+                    "classic planned chunk offset exceeds platform usize".to_string(),
+                )
+            })?;
+            let elements = elements_per_chunk.min(span.elements - start_element);
+            let byte_delta = checked_mul_u64(
+                start_element as u64,
+                elem_size as u64,
+                "classic planned chunk byte offset",
+            )?;
+            let offset = span.offset.checked_add(byte_delta).ok_or_else(|| {
+                Error::InvalidData("classic planned chunk byte offset exceeds u64".to_string())
+            })?;
+            split.push(PlannedReadSpan {
+                offset,
+                elements,
+                bytes: elements.checked_mul(elem_size).ok_or_else(|| {
+                    Error::InvalidData(
+                        "classic planned chunk byte count exceeds platform usize".to_string(),
+                    )
+                })?,
+            });
+        }
+    }
+
+    Ok(split)
 }
 
 #[cfg(test)]
