@@ -6,6 +6,7 @@ use memmap2::Mmap;
 use crate::error::{Error, Result};
 
 /// Header prefix read on the first pass for range-backed classic opens.
+#[cfg(feature = "netcdf4")]
 const INITIAL_HEADER_READ: usize = 64 * 1024;
 
 #[derive(Clone)]
@@ -64,10 +65,12 @@ impl ClassicStorage {
         }
     }
 
+    #[cfg(feature = "netcdf4")]
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
 
+    #[cfg(feature = "netcdf4")]
     pub(crate) fn initial_header_len(&self) -> usize {
         usize::try_from(self.len.min(INITIAL_HEADER_READ as u64)).unwrap_or(INITIAL_HEADER_READ)
     }
@@ -114,6 +117,7 @@ impl ClassicStorage {
         }
     }
 
+    #[cfg(feature = "netcdf4")]
     pub(crate) fn read_header_prefix(&self, len: usize) -> Result<ClassicBuffer> {
         let capped = len.min(usize::try_from(self.len).unwrap_or(usize::MAX));
         self.read_range(0, capped)
@@ -121,6 +125,7 @@ impl ClassicStorage {
 }
 
 impl ClassicBuffer {
+    #[cfg(feature = "netcdf4")]
     pub(crate) fn len(&self) -> usize {
         match self {
             ClassicBuffer::Bytes { len, .. } | ClassicBuffer::Mmap { len, .. } => *len,
