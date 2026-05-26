@@ -144,11 +144,11 @@ fn reject_unsupported_classic_features(header: &header::ClassicHeader) -> Result
     let has_subfiling_marker = header
         .global_attributes
         .iter()
-        .any(|attr| attr.name.starts_with("_PnetCDF_SubFiling"))
+        .any(|attr| is_subfiling_attribute_name(&attr.name))
         || header.variables.iter().any(|var| {
             var.attributes
                 .iter()
-                .any(|attr| attr.name.starts_with("_PnetCDF_SubFiling"))
+                .any(|attr| is_subfiling_attribute_name(&attr.name))
         });
 
     if has_subfiling_marker {
@@ -158,6 +158,11 @@ fn reject_unsupported_classic_features(header: &header::ClassicHeader) -> Result
     }
 
     Ok(())
+}
+
+fn is_subfiling_attribute_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("_pnetcdf_subfiling") || lower.starts_with("subfiling")
 }
 
 #[cfg(feature = "netcdf4")]
