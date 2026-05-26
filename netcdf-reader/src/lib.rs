@@ -6,6 +6,12 @@
 //! - **CDF-5** (64-bit data): `CDF\x05` magic
 //! - **NetCDF-4** (HDF5-backed): `\x89HDF\r\n\x1a\n` magic (requires `netcdf4` feature)
 //!
+//! PnetCDF-produced CDF-1/2/5 files are supported as files. NetCDF-C files
+//! created through parallel NetCDF-4/HDF5 APIs are supported when the final
+//! HDF5 file uses supported HDF5 features. This crate does not implement
+//! MPI communicators, `nc_open_par`, `nc_create_par`, collective/independent
+//! access modes, PnetCDF subfiling, or write APIs.
+//!
 //! # Example
 //!
 //! ```no_run

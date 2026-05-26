@@ -123,6 +123,22 @@ let labels = file.dataset("/labels")?.read_strings()?;
 - Slice reads, lazy slice iteration, and parallel NC4 slice reads
 - Cache and filter configuration through `NcOpenOptions`, including in-memory and storage-backed opens
 
+## Parallel-I/O Compatibility
+
+This project reads files. It does not provide distributed parallel I/O APIs.
+
+- PnetCDF-produced CDF-1, CDF-2, and CDF-5 files are supported as ordinary
+  classic-format NetCDF files. PnetCDF's MPI-IO API surface is not implemented.
+- NetCDF-C files created with `nc_create_par` or Parallel HDF5 are supported
+  when the final file is a normal NetCDF-4/HDF5 file that uses HDF5 features
+  supported by `hdf5-reader`. Parallel access mode is an open-time API concern,
+  not a persistent file property.
+- The Rayon APIs in this crate parallelize local decoding and independent byte
+  range reads inside one process. They are not equivalent to MPI-IO collective
+  or independent access modes.
+- PnetCDF subfiling is out of scope for now because it is not an ordinary
+  single-file CDF-1/2/5 dataset.
+
 ## Feature flags
 
 Minimum supported Rust version: 1.81.
