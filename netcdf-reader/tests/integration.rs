@@ -339,6 +339,66 @@ fn record_vars() {
     assert_eq!(into.as_slice(), data.as_slice().unwrap());
 }
 
+#[test]
+fn pnetcdf_cdf1_fixed_fixture_reads_as_classic_file() {
+    let path = skip_if_missing!("pnetcdf", "pnetcdf_cdf1_fixed.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    assert_eq!(file.format(), netcdf_reader::NcFormat::Classic);
+    let fixed: ndarray::ArrayD<i32> = file.read_variable("fixed").unwrap();
+    assert_eq!(fixed.shape(), &[3, 4]);
+    assert_eq!(fixed[[0, 0]], 0);
+    assert_eq!(fixed[[2, 3]], 23);
+}
+
+#[test]
+fn pnetcdf_cdf2_interleaved_record_fixture_reads_record_variables() {
+    let path = skip_if_missing!("pnetcdf", "pnetcdf_cdf2_interleaved_records.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    assert_eq!(file.format(), netcdf_reader::NcFormat::Offset64);
+    assert_eq!(file.dimension("time").unwrap().size, 3);
+
+    let temp: ndarray::ArrayD<f32> = file.read_variable("temp").unwrap();
+    assert_eq!(temp.shape(), &[3, 3]);
+    assert_eq!(
+        temp.as_slice().unwrap(),
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+    );
+
+    let quality: ndarray::ArrayD<i32> = file.read_variable("quality").unwrap();
+    assert_eq!(quality.as_slice().unwrap(), &[10, 20, 30]);
+}
+
+#[test]
+fn pnetcdf_cdf5_unsigned_and_64_bit_fixture_reads_new_types() {
+    let path = skip_if_missing!("pnetcdf", "pnetcdf_cdf5_unsigned_int64.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    assert_eq!(file.format(), netcdf_reader::NcFormat::Cdf5);
+
+    let flags: ndarray::ArrayD<u8> = file.read_variable("flags").unwrap();
+    assert_eq!(flags.as_slice().unwrap(), &[1, 2, 253, 254]);
+
+    let ids: ndarray::ArrayD<u32> = file.read_variable("ids").unwrap();
+    assert_eq!(
+        ids.as_slice().unwrap(),
+        &[1, 4_000_000_000, 4_000_000_001, 4_000_000_002]
+    );
+
+    let signed_big: ndarray::ArrayD<i64> = file.read_variable("int64_values").unwrap();
+    assert_eq!(
+        signed_big.as_slice().unwrap(),
+        &[-5, -4, 9_223_372_036_854_775_806, i64::MAX]
+    );
+
+    let unsigned_big: ndarray::ArrayD<u64> = file.read_variable("unsigned_big").unwrap();
+    assert_eq!(
+        unsigned_big.as_slice().unwrap(),
+        &[1, 2, 18_446_744_073_709_551_614, u64::MAX]
+    );
+}
+
 // ---- NetCDF-4 tests ----
 
 #[cfg(feature = "netcdf4")]
@@ -364,6 +424,24 @@ fn nc4_basic() {
 
     let vars = file.variables().unwrap();
     assert!(!vars.is_empty());
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn parallel_created_nc4_fixture_reads_like_ordinary_nc4_file() {
+    let path = skip_if_missing!("parallel", "parallel_nc4_compat.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    assert!(matches!(
+        file.format(),
+        netcdf_reader::NcFormat::Nc4 | netcdf_reader::NcFormat::Nc4Classic
+    ));
+    let values: ndarray::ArrayD<f32> = file.read_variable("values").unwrap();
+    assert_eq!(values.shape(), &[2, 5]);
+    assert_eq!(
+        values.as_slice().unwrap(),
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0, 14.0]
+    );
 }
 
 #[cfg(feature = "netcdf4")]

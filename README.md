@@ -187,6 +187,12 @@ scripts/generate-fixtures.sh
 cargo test --workspace
 ```
 
+Small compatibility fixtures under `testdata/pnetcdf` and `testdata/parallel`
+exercise standard CDF-1/2/5 and NetCDF-4 files matching layouts produced by
+PnetCDF and parallel netCDF-C/HDF5 workflows. Reference C generators that use
+those external parallel libraries live under `testdata/external`; they are not
+library dependencies.
+
 For reference comparisons and current benchmark results against
 `georust/netcdf`, see [docs/benchmark-report.md](docs/benchmark-report.md).
 
