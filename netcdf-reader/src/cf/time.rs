@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn discover_variable_time_coordinate() {
+    fn discovers_variable_time_coordinate() {
         let time = coordinate_var("time", 3, vec![attr("units", "hours since 2000-01-01")]);
         let lat = coordinate_var("lat", 2, vec![attr("units", "degrees_north")]);
         let temperature = NcVariable {

@@ -4,12 +4,12 @@ set -euo pipefail
 base_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 if ! command -v ncgen >/dev/null 2>&1; then
-  echo "ncgen is required to generate compatibility fixtures" >&2
-  exit 1
+  echo "SKIPPED: ncgen not found; committed compatibility fixtures are unchanged"
+  exit 0
 fi
 if ! command -v nc-config >/dev/null 2>&1; then
-  echo "nc-config is required to generate the CDF-5 compatibility fixture" >&2
-  exit 1
+  echo "SKIPPED: nc-config not found; committed compatibility fixtures are unchanged"
+  exit 0
 fi
 
 tmp_dir="$(mktemp -d)"
