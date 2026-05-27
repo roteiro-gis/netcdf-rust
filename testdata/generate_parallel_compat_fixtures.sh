@@ -2,14 +2,23 @@
 set -euo pipefail
 
 base_dir="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+require_tools="${REQUIRE_PARALLEL_COMPAT_TOOLS:-0}"
+
+missing_tool() {
+  local tool="$1"
+  if [[ "$require_tools" == "1" ]]; then
+    echo "$tool is required to regenerate compatibility fixtures" >&2
+    exit 1
+  fi
+  echo "SKIPPED: $tool not found; committed compatibility fixtures are unchanged"
+  exit 0
+}
 
 if ! command -v ncgen >/dev/null 2>&1; then
-  echo "SKIPPED: ncgen not found; committed compatibility fixtures are unchanged"
-  exit 0
+  missing_tool "ncgen"
 fi
 if ! command -v nc-config >/dev/null 2>&1; then
-  echo "SKIPPED: nc-config not found; committed compatibility fixtures are unchanged"
-  exit 0
+  missing_tool "nc-config"
 fi
 
 tmp_dir="$(mktemp -d)"
