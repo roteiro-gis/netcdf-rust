@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-05-28
+
+- Added internal Rayon parallelism for classic NetCDF CDF-1/2/5 full-variable
+  reads and hyperslab slices.
+- Added storage-aware classic parallel read policy so local byte and mmap reads
+  use larger thresholds and chunks, while range-backed storage can still use
+  more aggressive request parallelism.
+- Optimized classic parallel reads and planned slice spans to decode directly
+  into final result buffers instead of allocating per-chunk vectors and
+  flattening them.
+- Kept classic `from_storage` opens range-backed after header parsing so
+  variable reads can use the caller's storage backend instead of copying the
+  whole file into memory.
+- Added committed compatibility fixtures and docs for PnetCDF-style CDF-1/2/5
+  and parallel NetCDF-C/HDF5-produced files.
+- Added CDF-5 huge-dimension overflow coverage and explicit unsupported-feature
+  errors for classic subfiling markers, including lowercase marker attributes.
+- Fixed classic range-header helper builds when `netcdf-reader` is compiled
+  without default NetCDF-4 support.
+- Fixed `hdf5-reader` local file storage linkability on `wasm32` targets.
+
 ## 0.5.0 - 2026-05-17
 
 - Added generic range-request storage helpers and block-cache storage wrappers for HTTP, S3, object-store, and other range-capable backends.
