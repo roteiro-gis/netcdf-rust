@@ -23,6 +23,44 @@ pub(crate) struct ClassicStorage {
     len: u64,
 }
 
+#[cfg(feature = "rayon")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClassicStorageKind {
+    Bytes,
+    Mmap,
+    #[cfg(feature = "netcdf4")]
+    Range,
+}
+
+#[cfg(feature = "rayon")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ClassicParallelReadPolicy {
+    pub(crate) min_bytes: usize,
+    pub(crate) target_chunk_bytes: usize,
+}
+
+#[cfg(feature = "rayon")]
+impl ClassicParallelReadPolicy {
+    const LOCAL_MIN_BYTES: usize = 32 * 1024 * 1024;
+    const LOCAL_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+    const RANGE_MIN_BYTES: usize = 1024 * 1024;
+    const RANGE_TARGET_CHUNK_BYTES: usize = 1024 * 1024;
+
+    fn for_kind(kind: ClassicStorageKind) -> Self {
+        match kind {
+            ClassicStorageKind::Bytes | ClassicStorageKind::Mmap => Self {
+                min_bytes: Self::LOCAL_MIN_BYTES,
+                target_chunk_bytes: Self::LOCAL_TARGET_CHUNK_BYTES,
+            },
+            #[cfg(feature = "netcdf4")]
+            ClassicStorageKind::Range => Self {
+                min_bytes: Self::RANGE_MIN_BYTES,
+                target_chunk_bytes: Self::RANGE_TARGET_CHUNK_BYTES,
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum ClassicBuffer {
     Bytes {
@@ -68,6 +106,21 @@ impl ClassicStorage {
     #[cfg(feature = "netcdf4")]
     pub(crate) fn len(&self) -> u64 {
         self.len
+    }
+
+    #[cfg(feature = "rayon")]
+    pub(crate) fn kind(&self) -> ClassicStorageKind {
+        match &self.backing {
+            ClassicStorageBacking::Bytes(_) => ClassicStorageKind::Bytes,
+            ClassicStorageBacking::Mmap(_) => ClassicStorageKind::Mmap,
+            #[cfg(feature = "netcdf4")]
+            ClassicStorageBacking::Range(_) => ClassicStorageKind::Range,
+        }
+    }
+
+    #[cfg(feature = "rayon")]
+    pub(crate) fn parallel_read_policy(&self) -> ClassicParallelReadPolicy {
+        ClassicParallelReadPolicy::for_kind(self.kind())
     }
 
     #[cfg(feature = "netcdf4")]

@@ -16,11 +16,6 @@ use crate::types::{NcType, NcVariable};
 
 use super::storage::ClassicStorage;
 
-#[cfg(feature = "rayon")]
-pub(crate) const CLASSIC_PARALLEL_MIN_BYTES: usize = 1 << 20;
-#[cfg(feature = "rayon")]
-pub(crate) const CLASSIC_PARALLEL_TARGET_CHUNK_BYTES: usize = 1 << 20;
-
 /// Trait for types that can be read from classic NetCDF data.
 pub trait NcReadType: Clone + Default + Send + 'static {
     /// The NetCDF type this Rust type corresponds to.
@@ -294,7 +289,8 @@ pub(crate) fn read_non_record_variable_parallel_from_storage<T: NcReadType>(
 
     let total_elements = checked_non_record_element_count(var)?;
     let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
-    if total_bytes < CLASSIC_PARALLEL_MIN_BYTES || total_elements == 0 {
+    let policy = storage.parallel_read_policy();
+    if total_bytes < policy.min_bytes || total_elements == 0 {
         return read_non_record_variable_from_storage(storage, var);
     }
 
@@ -302,7 +298,7 @@ pub(crate) fn read_non_record_variable_parallel_from_storage<T: NcReadType>(
         storage,
         var.data_offset,
         total_elements,
-        CLASSIC_PARALLEL_TARGET_CHUNK_BYTES,
+        policy.target_chunk_bytes,
     )?;
     let shape = checked_variable_shape(var)?;
 
@@ -554,31 +550,38 @@ pub(crate) fn read_record_variable_parallel_from_storage<T: NcReadType>(
             var.name
         ))
     })?;
-    if logical_bytes < CLASSIC_PARALLEL_MIN_BYTES || numrecs_usize <= 1 {
+    let policy = storage.parallel_read_policy();
+    if logical_bytes < policy.min_bytes || numrecs_usize <= 1 {
         return read_record_variable_from_storage(storage, var, numrecs, record_stride);
     }
 
-    let records_per_chunk = (CLASSIC_PARALLEL_TARGET_CHUNK_BYTES / bytes_per_record.max(1)).max(1);
-    let chunk_count = numrecs_usize.div_ceil(records_per_chunk);
-    let chunks = (0..chunk_count)
-        .into_par_iter()
-        .map(|chunk| {
+    let records_per_chunk = (policy.target_chunk_bytes / bytes_per_record.max(1)).max(1);
+    let elements_per_chunk = records_per_chunk
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(
+                "classic record chunk element count exceeds platform usize".to_string(),
+            )
+        })?;
+    let mut values = vec![T::default(); total_elements];
+    let chunk_plan = RecordChunkReadPlan {
+        var,
+        record_stride,
+        elements_per_record,
+        bytes_per_record,
+    };
+    values
+        .par_chunks_mut(elements_per_chunk)
+        .enumerate()
+        .try_for_each(|(chunk, dst)| {
             let first_record = chunk.checked_mul(records_per_chunk).ok_or_else(|| {
                 Error::InvalidData("classic record chunk offset exceeds platform usize".to_string())
             })?;
-            let records = records_per_chunk.min(numrecs_usize - first_record);
-            read_record_chunk::<T>(
-                storage,
-                var,
-                first_record as u64,
-                records,
-                record_stride,
-                elements_per_record,
-                bytes_per_record,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let values = flatten_ordered_chunks(chunks, total_elements);
+            let records = dst.len().checked_div(elements_per_record).ok_or_else(|| {
+                Error::InvalidData("classic record elements per record is zero".to_string())
+            })?;
+            read_record_chunk_into::<T>(storage, &chunk_plan, first_record as u64, records, dst)
+        })?;
 
     ArrayD::from_shape_vec(IxDyn(&shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
@@ -852,16 +855,16 @@ pub(crate) fn read_contiguous_range_parallel<T: NcReadType>(
 
     let elem_size = T::element_size();
     let elements_per_chunk = (target_chunk_bytes / elem_size.max(1)).max(1);
-    let chunk_count = total_elements.div_ceil(elements_per_chunk);
-    let chunks = (0..chunk_count)
-        .into_par_iter()
-        .map(|chunk| {
+    let mut values = vec![T::default(); total_elements];
+    values
+        .par_chunks_mut(elements_per_chunk)
+        .enumerate()
+        .try_for_each(|(chunk, dst)| {
             let start_element = chunk.checked_mul(elements_per_chunk).ok_or_else(|| {
                 Error::InvalidData(
                     "classic parallel chunk offset exceeds platform usize".to_string(),
                 )
             })?;
-            let elements = elements_per_chunk.min(total_elements - start_element);
             let byte_offset = crate::types::checked_mul_u64(
                 start_element as u64,
                 elem_size as u64,
@@ -870,67 +873,88 @@ pub(crate) fn read_contiguous_range_parallel<T: NcReadType>(
             let offset = base_offset.checked_add(byte_offset).ok_or_else(|| {
                 Error::InvalidData("classic parallel byte offset exceeds u64".to_string())
             })?;
-            let bytes = variable_data_bytes::<T>("parallel chunk", elements)?;
+            let bytes = variable_data_bytes::<T>("parallel chunk", dst.len())?;
             let data = storage.read_range(offset, bytes)?;
-            T::decode_bulk_be(data.as_ref(), elements)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(flatten_ordered_chunks(chunks, total_elements))
-}
-
-#[cfg(feature = "rayon")]
-fn read_record_chunk<T: NcReadType>(
-    storage: &ClassicStorage,
-    var: &NcVariable,
-    first_record: u64,
-    records: usize,
-    record_stride: u64,
-    elements_per_record: usize,
-    bytes_per_record: usize,
-) -> Result<Vec<T>> {
-    if records == 0 {
-        return Ok(Vec::new());
-    }
-
-    if record_stride == bytes_per_record as u64 {
-        let offset = record_byte_offset(var, first_record, record_stride)?;
-        let elements = records.checked_mul(elements_per_record).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "record variable '{}' chunk element count exceeds platform usize",
-                var.name
-            ))
+            T::decode_bulk_be_into(data.as_ref(), dst)
         })?;
-        let bytes = records.checked_mul(bytes_per_record).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "record variable '{}' chunk byte count exceeds platform usize",
-                var.name
-            ))
-        })?;
-        let data = storage.read_range(offset, bytes)?;
-        return T::decode_bulk_be(data.as_ref(), elements);
-    }
 
-    let mut values = Vec::with_capacity(records * elements_per_record);
-    for ordinal in 0..records {
-        let record = first_record
-            .checked_add(ordinal as u64)
-            .ok_or_else(|| Error::InvalidData("classic record index exceeds u64".to_string()))?;
-        let offset = record_byte_offset(var, record, record_stride)?;
-        let data = storage.read_range(offset, bytes_per_record)?;
-        let mut decoded = T::decode_bulk_be(data.as_ref(), elements_per_record)?;
-        values.append(&mut decoded);
-    }
     Ok(values)
 }
 
 #[cfg(feature = "rayon")]
-pub(crate) fn flatten_ordered_chunks<T>(chunks: Vec<Vec<T>>, total_elements: usize) -> Vec<T> {
-    let mut values = Vec::with_capacity(total_elements);
-    for mut chunk in chunks {
-        values.append(&mut chunk);
+struct RecordChunkReadPlan<'a> {
+    var: &'a NcVariable,
+    record_stride: u64,
+    elements_per_record: usize,
+    bytes_per_record: usize,
+}
+
+#[cfg(feature = "rayon")]
+fn read_record_chunk_into<T: NcReadType>(
+    storage: &ClassicStorage,
+    plan: &RecordChunkReadPlan<'_>,
+    first_record: u64,
+    records: usize,
+    dst: &mut [T],
+) -> Result<()> {
+    if records == 0 {
+        return Ok(());
     }
-    values
+
+    let expected_elements = records
+        .checked_mul(plan.elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' chunk element count exceeds platform usize",
+                plan.var.name
+            ))
+        })?;
+    if dst.len() != expected_elements {
+        return Err(Error::InvalidData(format!(
+            "record variable '{}' chunk destination has {} elements, expected {}",
+            plan.var.name,
+            dst.len(),
+            expected_elements
+        )));
+    }
+
+    if plan.record_stride == plan.bytes_per_record as u64 {
+        let offset = record_byte_offset(plan.var, first_record, plan.record_stride)?;
+        let bytes = records.checked_mul(plan.bytes_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' chunk byte count exceeds platform usize",
+                plan.var.name
+            ))
+        })?;
+        let data = storage.read_range(offset, bytes)?;
+        return T::decode_bulk_be_into(data.as_ref(), dst);
+    }
+
+    for ordinal in 0..records {
+        let record = first_record
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| Error::InvalidData("classic record index exceeds u64".to_string()))?;
+        let offset = record_byte_offset(plan.var, record, plan.record_stride)?;
+        let data = storage.read_range(offset, plan.bytes_per_record)?;
+        let dst_start = ordinal
+            .checked_mul(plan.elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' chunk destination offset exceeds platform usize",
+                    plan.var.name
+                ))
+            })?;
+        let dst_end = dst_start
+            .checked_add(plan.elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' chunk destination range exceeds platform usize",
+                    plan.var.name
+                ))
+            })?;
+        T::decode_bulk_be_into(data.as_ref(), &mut dst[dst_start..dst_end])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -13,8 +13,6 @@ use crate::types::{
 };
 
 use super::data::{self, compute_record_stride, NcReadType};
-#[cfg(feature = "rayon")]
-use super::data::{CLASSIC_PARALLEL_MIN_BYTES, CLASSIC_PARALLEL_TARGET_CHUNK_BYTES};
 use super::storage::ClassicStorage;
 use super::ClassicFile;
 
@@ -67,6 +65,13 @@ struct PlannedReadSpan {
     offset: u64,
     elements: usize,
     bytes: usize,
+}
+
+#[cfg(feature = "rayon")]
+#[derive(Debug)]
+struct PlannedReadChunk {
+    spans: Vec<PlannedReadSpan>,
+    elements: usize,
 }
 
 struct RecordSliceContext<'a> {
@@ -783,14 +788,37 @@ fn read_planned_spans_serial<T: NcReadType>(
     spans: &[PlannedReadSpan],
     result_elements: usize,
 ) -> Result<Vec<T>> {
-    let mut values = Vec::with_capacity(result_elements);
+    let total_elements = planned_spans_total_elements(spans)?;
+    if total_elements != result_elements {
+        return Err(Error::InvalidData(format!(
+            "classic planned span element count {total_elements} does not match result size {result_elements}"
+        )));
+    }
+
+    let mut values = vec![T::default(); result_elements];
+    let mut dst_start = 0usize;
     for span in spans {
         let data = storage.read_range(span.offset, span.bytes)?;
-        let mut decoded = T::decode_bulk_be(data.as_ref(), span.elements)?;
-        values.append(&mut decoded);
+        let dst_end = dst_start.checked_add(span.elements).ok_or_else(|| {
+            Error::InvalidData(
+                "classic planned destination range exceeds platform usize".to_string(),
+            )
+        })?;
+        T::decode_bulk_be_into(data.as_ref(), &mut values[dst_start..dst_end])?;
+        dst_start = dst_end;
     }
     debug_assert_eq!(values.len(), result_elements);
     Ok(values)
+}
+
+fn planned_spans_total_elements(spans: &[PlannedReadSpan]) -> Result<usize> {
+    let mut total = 0usize;
+    for span in spans {
+        total = total.checked_add(span.elements).ok_or_else(|| {
+            Error::InvalidData("classic planned element count exceeds platform usize".to_string())
+        })?;
+    }
+    Ok(total)
 }
 
 fn append_one_record_slice<T: NcReadType>(
@@ -952,19 +980,27 @@ fn read_planned_spans_maybe_parallel<T: NcReadType>(
     result_elements: usize,
 ) -> Result<Vec<T>> {
     let total_bytes = planned_spans_total_bytes(spans)?;
-    if total_bytes < CLASSIC_PARALLEL_MIN_BYTES || spans.is_empty() {
+    let policy = storage.parallel_read_policy();
+    if total_bytes < policy.min_bytes || spans.is_empty() {
         return read_planned_spans_serial::<T>(storage, spans, result_elements);
     }
 
-    let split_spans = split_planned_spans_for_parallel::<T>(spans)?;
-    let chunks = split_spans
-        .par_iter()
-        .map(|span| {
-            let data = storage.read_range(span.offset, span.bytes)?;
-            T::decode_bulk_be(data.as_ref(), span.elements)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(data::flatten_ordered_chunks(chunks, result_elements))
+    let total_elements = planned_spans_total_elements(spans)?;
+    if total_elements != result_elements {
+        return Err(Error::InvalidData(format!(
+            "classic planned span element count {total_elements} does not match result size {result_elements}"
+        )));
+    }
+
+    let (chunks, elements_per_chunk) =
+        split_planned_spans_for_parallel::<T>(spans, policy.target_chunk_bytes)?;
+    let mut values = vec![T::default(); result_elements];
+    debug_assert_eq!(values.len().div_ceil(elements_per_chunk), chunks.len());
+    values
+        .par_chunks_mut(elements_per_chunk)
+        .zip(chunks.par_iter())
+        .try_for_each(|(dst, chunk)| read_planned_chunk_into::<T>(storage, chunk, dst))?;
+    Ok(values)
 }
 
 #[cfg(feature = "rayon")]
@@ -981,46 +1017,86 @@ fn planned_spans_total_bytes(spans: &[PlannedReadSpan]) -> Result<usize> {
 #[cfg(feature = "rayon")]
 fn split_planned_spans_for_parallel<T: NcReadType>(
     spans: &[PlannedReadSpan],
-) -> Result<Vec<PlannedReadSpan>> {
+    target_chunk_bytes: usize,
+) -> Result<(Vec<PlannedReadChunk>, usize)> {
     let elem_size = T::element_size();
-    let elements_per_chunk = (CLASSIC_PARALLEL_TARGET_CHUNK_BYTES / elem_size.max(1)).max(1);
-    let mut split = Vec::new();
+    let elements_per_chunk = (target_chunk_bytes / elem_size.max(1)).max(1);
+    let mut chunks = Vec::new();
+    let mut current = PlannedReadChunk {
+        spans: Vec::new(),
+        elements: 0,
+    };
 
     for span in spans {
-        if span.elements <= elements_per_chunk {
-            split.push(span.clone());
-            continue;
-        }
+        let mut remaining = span.elements;
+        let mut offset = span.offset;
+        while remaining > 0 {
+            if current.elements == elements_per_chunk {
+                chunks.push(current);
+                current = PlannedReadChunk {
+                    spans: Vec::new(),
+                    elements: 0,
+                };
+            }
 
-        let chunk_count = span.elements.div_ceil(elements_per_chunk);
-        for chunk in 0..chunk_count {
-            let start_element = chunk.checked_mul(elements_per_chunk).ok_or_else(|| {
+            let available = elements_per_chunk - current.elements;
+            let elements = remaining.min(available);
+            let bytes = elements.checked_mul(elem_size).ok_or_else(|| {
                 Error::InvalidData(
-                    "classic planned chunk offset exceeds platform usize".to_string(),
+                    "classic planned chunk byte count exceeds platform usize".to_string(),
                 )
             })?;
-            let elements = elements_per_chunk.min(span.elements - start_element);
-            let byte_delta = checked_mul_u64(
-                start_element as u64,
-                elem_size as u64,
-                "classic planned chunk byte offset",
-            )?;
-            let offset = span.offset.checked_add(byte_delta).ok_or_else(|| {
-                Error::InvalidData("classic planned chunk byte offset exceeds u64".to_string())
-            })?;
-            split.push(PlannedReadSpan {
+
+            current.spans.push(PlannedReadSpan {
                 offset,
                 elements,
-                bytes: elements.checked_mul(elem_size).ok_or_else(|| {
-                    Error::InvalidData(
-                        "classic planned chunk byte count exceeds platform usize".to_string(),
-                    )
-                })?,
+                bytes,
             });
+            current.elements = current.elements.checked_add(elements).ok_or_else(|| {
+                Error::InvalidData(
+                    "classic planned chunk element count exceeds platform usize".to_string(),
+                )
+            })?;
+            remaining -= elements;
+            offset = offset.checked_add(bytes as u64).ok_or_else(|| {
+                Error::InvalidData("classic planned chunk byte offset exceeds u64".to_string())
+            })?;
         }
     }
 
-    Ok(split)
+    if current.elements > 0 {
+        chunks.push(current);
+    }
+
+    Ok((chunks, elements_per_chunk))
+}
+
+#[cfg(feature = "rayon")]
+fn read_planned_chunk_into<T: NcReadType>(
+    storage: &ClassicStorage,
+    chunk: &PlannedReadChunk,
+    dst: &mut [T],
+) -> Result<()> {
+    if dst.len() != chunk.elements {
+        return Err(Error::InvalidData(format!(
+            "classic planned chunk destination has {} elements, expected {}",
+            dst.len(),
+            chunk.elements
+        )));
+    }
+
+    let mut dst_start = 0usize;
+    for span in &chunk.spans {
+        let data = storage.read_range(span.offset, span.bytes)?;
+        let dst_end = dst_start.checked_add(span.elements).ok_or_else(|| {
+            Error::InvalidData(
+                "classic planned chunk destination range exceeds platform usize".to_string(),
+            )
+        })?;
+        T::decode_bulk_be_into(data.as_ref(), &mut dst[dst_start..dst_end])?;
+        dst_start = dst_end;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
