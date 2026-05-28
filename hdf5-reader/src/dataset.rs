@@ -3870,13 +3870,13 @@ mod tests {
     }
 
     #[test]
-    fn test_slice_info_all() {
+    fn slice_info_all() {
         let s = SliceInfo::all(3);
         assert_eq!(s.selections.len(), 3);
     }
 
     #[test]
-    fn test_raw_element_size_uses_file_vlen_reference_width() {
+    fn raw_element_size_uses_file_vlen_reference_width() {
         let dtype = Datatype::VarLen {
             base: Box::new(Datatype::FixedPoint {
                 size: 1,
@@ -3902,7 +3902,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_raw_data_requires_exact_logical_length() {
+    fn compact_raw_data_requires_exact_logical_length() {
         let dataset = fixed_u16_dataset(
             DataLayout::Compact {
                 data: vec![1, 0, 2, 0, 3],
@@ -3921,7 +3921,7 @@ mod tests {
     }
 
     #[test]
-    fn test_contiguous_raw_data_requires_exact_logical_length() {
+    fn contiguous_raw_data_requires_exact_logical_length() {
         let dataset = fixed_u16_dataset(
             DataLayout::Contiguous {
                 address: 0,
@@ -3941,7 +3941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_chunk_1d() {
+    fn copy_chunk_1d() {
         let chunk_data = vec![1u8, 2, 3, 4]; // 4 elements of 1 byte each
         let mut flat = vec![0u8; 8];
         let chunk_offsets = vec![2u64]; // starts at index 2
@@ -3961,7 +3961,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_chunk_2d_rowwise() {
+    fn copy_chunk_2d_rowwise() {
         let chunk_data = vec![1u8, 2, 3, 4, 5, 6];
         let mut flat = vec![0u8; 16];
         let chunk_offsets = vec![1u64, 1u64];
@@ -3982,7 +3982,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_unit_stride_chunk_overlap_2d_partial() {
+    fn copy_unit_stride_chunk_overlap_2d_partial() {
         let chunk_data: Vec<u8> = (1..=16).collect();
         let mut result = vec![0u8; 6];
         let chunk_offsets = vec![0u64, 0u64];
@@ -4037,7 +4037,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_grid_coverage_detects_missing_chunk() {
+    fn chunk_grid_coverage_detects_missing_chunk() {
         let mut entries = vec![
             chunk_entry(&[0, 0], 0x1000),
             chunk_entry(&[0, 2], 0x2000),
@@ -4051,7 +4051,7 @@ mod tests {
     }
 
     #[test]
-    fn test_chunk_grid_coverage_rejects_duplicate_offsets() {
+    fn chunk_grid_coverage_rejects_duplicate_offsets() {
         let mut entries = vec![
             chunk_entry(&[0, 0], 0x1000),
             chunk_entry(&[0, 0], 0x2000),
@@ -4066,7 +4066,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decoded_chunk_len_requires_exact_size() {
+    fn decoded_chunk_len_requires_exact_size() {
         let entry = chunk_entry(&[0, 0], 0x1000);
 
         validate_decoded_chunk_len(&entry, &[2, 3], 4, 24).unwrap();
@@ -4076,7 +4076,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_chunk_errors_on_short_row() {
+    fn copy_chunk_errors_on_short_row() {
         let chunk_data = vec![1u8, 2, 3, 4, 5];
         let mut flat = vec![0u8; 16];
         let chunk_offsets = vec![1u64, 1u64];
@@ -4097,7 +4097,7 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_unit_stride_chunk_overlap_errors_on_short_row() {
+    fn copy_unit_stride_chunk_overlap_errors_on_short_row() {
         let chunk_data: Vec<u8> = (1..=7).collect();
         let mut result = vec![0u8; 6];
         let chunk_offsets = vec![0u64, 0u64];

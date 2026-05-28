@@ -203,7 +203,7 @@ fn build_cdf1_float_var(var_name: &str, values: &[f32], attrs: Vec<AttrSpec>) ->
 // ===========================================================================
 
 #[test]
-fn test_read_i16_variable_as_f64() {
+fn read_i16_variable_as_f64() {
     let values: Vec<i16> = vec![100, 200, -300, 0, 32767];
     let data = build_cdf1_short_var("temp", &values, vec![]);
 
@@ -224,7 +224,7 @@ fn test_read_i16_variable_as_f64() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_unpacked_scale_and_offset() {
+fn read_variable_unpacked_scale_and_offset() {
     // Stored i16 values; actual = stored * 0.01 + 273.15
     let values: Vec<i16> = vec![0, 100, 1000, -500, 2000];
     let attrs = vec![
@@ -261,7 +261,7 @@ fn test_read_variable_unpacked_scale_and_offset() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_masked_fill_value() {
+fn read_variable_masked_fill_value() {
     // Use -9999 as the fill value for i16 data.
     let fill: i16 = -9999;
     let values: Vec<i16> = vec![10, -9999, 30, -9999, 50];
@@ -286,7 +286,7 @@ fn test_read_variable_masked_fill_value() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_unpacked_masked_combined() {
+fn read_variable_unpacked_masked_combined() {
     let fill: i16 = -32768; // i16::MIN as fill sentinel
                             // stored values: 1000, fill, 2000, 3000, fill
     let values: Vec<i16> = vec![1000, -32768, 2000, 3000, -32768];
@@ -336,7 +336,7 @@ fn test_read_variable_unpacked_masked_combined() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_slice_classic() {
+fn read_variable_slice_classic() {
     let values: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
     let data = build_cdf1_float_var("data", &values, vec![]);
 
@@ -384,7 +384,7 @@ fn test_read_variable_slice_classic() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_masked_missing_value() {
+fn read_variable_masked_missing_value() {
     let missing: i16 = -1;
     let values: Vec<i16> = vec![5, -1, 15, 25, -1];
     let attrs = vec![short_attr("missing_value", missing)];
@@ -406,7 +406,7 @@ fn test_read_variable_masked_missing_value() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_unpacked_scale_only() {
+fn read_variable_unpacked_scale_only() {
     let values: Vec<i16> = vec![10, 20, 30];
     let attrs = vec![double_attr("scale_factor", 0.5)];
     let data = build_cdf1_short_var("scaled", &values, attrs);
@@ -426,7 +426,7 @@ fn test_read_variable_unpacked_scale_only() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_unpacked_offset_only() {
+fn read_variable_unpacked_offset_only() {
     let values: Vec<i16> = vec![0, 100, -50];
     let attrs = vec![double_attr("add_offset", 1000.0)];
     let data = build_cdf1_short_var("offset_var", &values, attrs);
@@ -446,7 +446,7 @@ fn test_read_variable_unpacked_offset_only() {
 // ===========================================================================
 
 #[test]
-fn test_read_variable_unpacked_masked_no_attrs_returns_raw() {
+fn read_variable_unpacked_masked_no_attrs_returns_raw() {
     let values: Vec<i16> = vec![1, 2, 3, 4];
     let data = build_cdf1_short_var("plain", &values, vec![]);
 

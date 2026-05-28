@@ -1,6 +1,7 @@
 # Benchmark Report
 
 Date: 2026-03-17
+Targeted update: 2026-05-28
 
 This report summarizes the current benchmark suite for `netcdf-rust` and a
 representative local run against the C-backed `georust/netcdf` baseline. It
@@ -51,6 +52,12 @@ python3 scripts/criterion_summary.py --speedup \
 
 # Follow-up reruns used for the updated warm full-read numbers:
 cargo bench -p netcdf-reader --bench compare_georust -- --noplot 'read_full_reuse_handle'
+
+# Targeted classic internal-parallel follow-up, run in Docker:
+BENCH_THREAD_LIST=1,2,4,8,16 \
+  cargo bench -p netcdf-reader --bench compare_georust \
+  'read_full_internal_parallel_classic|slice_internal_parallel_classic' \
+  -- --noplot --sample-size 12 --measurement-time 0.4 --warm-up-time 0.2
 ```
 
 Notes:
@@ -85,6 +92,30 @@ Notes:
 | `parallel_open_and_read` `large_nc4_compressed` | `497 MiB/s -> 1.60 GiB/s` (`x1 -> x4`) | `383 MiB/s -> 1.22 GiB/s` | `netcdf-rust` leads through `x4` |
 | `read_full_internal_parallel_nocache` | `362 MiB/s -> 1.23 GiB/s` (`x1 -> x8`) | n/a | cold chunk work still parallelizes |
 
+### Classic Internal Parallel Follow-Up
+
+A targeted Docker run on 2026-05-28 compared the previous classic local-read
+policy against the storage-aware policy and final-buffer decode path. The
+classic fixtures in this benchmark are still only a few MiB, so these numbers
+mainly exercise Rayon overhead control rather than PnetCDF-scale throughput.
+
+| group | current/base median geomean | result |
+| --- | ---: | --- |
+| `read_full_internal_parallel_classic` | `0.886x` | 11.4% faster |
+| `slice_internal_parallel_classic` | `0.553x` | 44.7% faster |
+
+Selected median deltas from that run:
+
+| workload | base | current | result |
+| --- | ---: | ---: | --- |
+| full `large_cdf5` `x1` | 2.307 ms | 2.366 ms | 2.6% slower |
+| full `large_cdf5` `x4` | 5.030 ms | 2.443 ms | 51.4% faster |
+| full `large_cdf5` `x8` | 2.887 ms | 2.453 ms | 15.0% faster |
+| full `large_record_cdf5` `x1` | 1.531 ms | 1.282 ms | 16.2% faster |
+| slice `large_cdf5` `x8` | 629.2 us | 535.0 us | 15.0% faster |
+| slice `large_cdf5` `x16` | 3.831 ms | 536.9 us | 86.0% faster |
+| slice `large_record_cdf5` `x1` | 1.617 ms | 741.0 us | 54.2% faster |
+
 ## Interpretation
 
 - `netcdf-rust` is faster than `georust/netcdf` on the measured classic-format
@@ -102,11 +133,15 @@ Notes:
   now slightly ahead rather than behind.
 - Warm single-read scaling now appears more constrained by this host than by
   obvious decoder serialization.
+- The 2026-05-28 classic internal-parallel follow-up shows that storage-aware
+  thresholds avoid most local Rayon overhead on small CDF-5 fixtures, while
+  decoding directly into final buffers materially improves planned record
+  slices.
 
 ## Limits
 
 - This report reflects one local system.
-- GitHub Actions is useful for benchmark smoke tests, but not for authoritative
+- GitHub Actions is useful for benchmark regression checks, but not for authoritative
   performance claims on bandwidth-sensitive workloads like these.
 - The large warm cached single-read results should be interpreted as
   machine-specific latency behavior, not as a general statement about internal

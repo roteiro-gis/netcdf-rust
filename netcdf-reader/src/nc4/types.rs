@@ -189,7 +189,7 @@ mod tests {
     use hdf5_reader::error::ByteOrder;
 
     #[test]
-    fn test_integer_types() {
+    fn integer_types() {
         let bo = ByteOrder::LittleEndian;
         assert_eq!(
             hdf5_to_nc_type(&Datatype::FixedPoint {
@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn test_float_types() {
+    fn float_types() {
         let bo = ByteOrder::LittleEndian;
         assert_eq!(
             hdf5_to_nc_type(&Datatype::FloatingPoint {
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_varlen_u8_maps_to_string() {
+    fn varlen_u8_maps_to_string() {
         let bo = ByteOrder::LittleEndian;
         assert_eq!(
             hdf5_to_nc_type(&Datatype::VarLen {
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sequence_varlen_u8_maps_to_vlen() {
+    fn sequence_varlen_u8_maps_to_vlen() {
         let bo = ByteOrder::LittleEndian;
         assert_eq!(
             hdf5_to_nc_type(&Datatype::VarLen {

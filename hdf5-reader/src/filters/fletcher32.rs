@@ -34,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_verify_valid() {
+    fn verify_valid() {
         let payload = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         let checksum = crate::checksum::fletcher32(&payload);
         let mut data = payload.clone();
@@ -44,7 +44,7 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_invalid() {
+    fn verify_invalid() {
         let mut data = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
         assert!(verify_and_strip(&data).is_err());

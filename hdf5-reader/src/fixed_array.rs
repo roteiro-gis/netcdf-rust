@@ -738,7 +738,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fahd_bad_signature() {
+    fn fahd_bad_signature() {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         let err = parse_header(&data, 0, 8, 8).unwrap_err();
@@ -746,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fadb_bad_signature() {
+    fn fadb_bad_signature() {
         let header = FaHeader {
             client_id: 0,
             entry_size: 8,

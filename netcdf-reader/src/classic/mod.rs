@@ -5,6 +5,7 @@
 
 pub mod data;
 pub mod header;
+pub(crate) mod storage;
 pub mod types;
 pub mod variable;
 
@@ -17,26 +18,13 @@ use crate::error::Result;
 use crate::types::NcGroup;
 use crate::NcFormat;
 
-/// Backing storage for a classic NetCDF file.
-pub(crate) enum ClassicData {
-    Mmap(Mmap),
-    Bytes(Vec<u8>),
-}
-
-impl ClassicData {
-    pub fn as_slice(&self) -> &[u8] {
-        match self {
-            ClassicData::Mmap(m) => m,
-            ClassicData::Bytes(b) => b,
-        }
-    }
-}
+use storage::ClassicStorage;
 
 /// An opened classic-format NetCDF file (CDF-1, CDF-2, or CDF-5).
 pub struct ClassicFile {
     pub(crate) format: NcFormat,
     pub(crate) root_group: NcGroup,
-    pub(crate) data: ClassicData,
+    pub(crate) storage: ClassicStorage,
     pub(crate) numrecs: u64,
 }
 
@@ -47,6 +35,8 @@ impl ClassicFile {
         // SAFETY: read-only mapping; caller must not modify the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
         let header = header::parse_header(&mmap, format)?;
+        reject_unsupported_classic_features(&header)?;
+        let storage = ClassicStorage::from_mmap(mmap);
 
         let root_group = NcGroup {
             name: "/".to_string(),
@@ -59,7 +49,7 @@ impl ClassicFile {
         Ok(ClassicFile {
             format,
             root_group,
-            data: ClassicData::Mmap(mmap),
+            storage,
             numrecs: header.numrecs,
         })
     }
@@ -67,6 +57,8 @@ impl ClassicFile {
     /// Open a classic NetCDF file from in-memory bytes.
     pub fn from_bytes(bytes: &[u8], format: NcFormat) -> Result<Self> {
         let header = header::parse_header(bytes, format)?;
+        reject_unsupported_classic_features(&header)?;
+        let storage = ClassicStorage::from_bytes(bytes.to_vec());
 
         let root_group = NcGroup {
             name: "/".to_string(),
@@ -79,7 +71,7 @@ impl ClassicFile {
         Ok(ClassicFile {
             format,
             root_group,
-            data: ClassicData::Bytes(bytes.to_vec()),
+            storage,
             numrecs: header.numrecs,
         })
     }
@@ -87,6 +79,8 @@ impl ClassicFile {
     /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
     pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
         let header = header::parse_header(&mmap, format)?;
+        reject_unsupported_classic_features(&header)?;
+        let storage = ClassicStorage::from_mmap(mmap);
 
         let root_group = NcGroup {
             name: "/".to_string(),
@@ -99,7 +93,33 @@ impl ClassicFile {
         Ok(ClassicFile {
             format,
             root_group,
-            data: ClassicData::Mmap(mmap),
+            storage,
+            numrecs: header.numrecs,
+        })
+    }
+
+    /// Open a classic NetCDF file from a random-access storage backend.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_storage(
+        storage: hdf5_reader::storage::DynStorage,
+        format: NcFormat,
+    ) -> Result<Self> {
+        let storage = ClassicStorage::from_range(storage);
+        let header = parse_header_from_storage(&storage, format)?;
+        reject_unsupported_classic_features(&header)?;
+
+        let root_group = NcGroup {
+            name: "/".to_string(),
+            dimensions: header.dimensions,
+            variables: header.variables,
+            attributes: header.global_attributes,
+            groups: Vec::new(),
+        };
+
+        Ok(ClassicFile {
+            format,
+            root_group,
+            storage,
             numrecs: header.numrecs,
         })
     }
@@ -117,5 +137,50 @@ impl ClassicFile {
     /// Number of records in the unlimited dimension.
     pub fn numrecs(&self) -> u64 {
         self.numrecs
+    }
+}
+
+fn reject_unsupported_classic_features(header: &header::ClassicHeader) -> Result<()> {
+    let has_subfiling_marker = header
+        .global_attributes
+        .iter()
+        .any(|attr| is_subfiling_attribute_name(&attr.name))
+        || header.variables.iter().any(|var| {
+            var.attributes
+                .iter()
+                .any(|attr| is_subfiling_attribute_name(&attr.name))
+        });
+
+    if has_subfiling_marker {
+        return Err(crate::Error::UnsupportedFeature(
+            "PnetCDF subfiling datasets require a virtual multi-file storage adapter".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_subfiling_attribute_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("_pnetcdf_subfiling") || lower.starts_with("subfiling")
+}
+
+#[cfg(feature = "netcdf4")]
+fn parse_header_from_storage(
+    storage: &ClassicStorage,
+    format: NcFormat,
+) -> Result<header::ClassicHeader> {
+    let mut len = storage.initial_header_len();
+
+    loop {
+        let prefix = storage.read_header_prefix(len)?;
+        match header::parse_header(prefix.as_ref(), format) {
+            Ok(header) => return Ok(header),
+            Err(crate::Error::UnexpectedEof { .. }) if (prefix.len() as u64) < storage.len() => {
+                let current = prefix.len().max(1);
+                len = current.saturating_mul(2);
+            }
+            Err(err) => return Err(err),
+        }
     }
 }

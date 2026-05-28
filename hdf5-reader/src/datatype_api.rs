@@ -364,7 +364,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_f32_bulk_decode_native_endian() {
+    fn f32_bulk_decode_native_endian() {
         let dtype = <f32 as H5Type>::hdf5_type();
         let raw = [0.5f32.to_ne_bytes(), 1.25f32.to_ne_bytes()].concat();
         let values = <f32 as H5Type>::decode_vec(&raw, &dtype, 2)
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_u32_bulk_decode_big_endian() {
+    fn u32_bulk_decode_big_endian() {
         let dtype = Datatype::FixedPoint {
             size: 4,
             signed: false,

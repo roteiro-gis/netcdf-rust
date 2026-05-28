@@ -45,7 +45,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_resolve_object_reference_8byte() {
+    fn resolve_object_reference_8byte() {
         let addr: u64 = 0x1234_5678_9ABC_DEF0;
         let bytes = addr.to_le_bytes();
         let result = resolve_object_reference(&bytes, 8).unwrap();
@@ -53,7 +53,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_object_reference_4byte() {
+    fn resolve_object_reference_4byte() {
         let addr: u32 = 0x1234_5678;
         let bytes = addr.to_le_bytes();
         let result = resolve_object_reference(&bytes, 4).unwrap();
@@ -61,7 +61,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_object_references() {
+    fn object_references_read_8_byte_addresses() {
         let mut data = Vec::new();
         data.extend_from_slice(&0x1000u64.to_le_bytes());
         data.extend_from_slice(&0x2000u64.to_le_bytes());
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_object_references_4byte() {
+    fn read_object_references_4byte() {
         let mut data = Vec::new();
         data.extend_from_slice(&0xAAAAu32.to_le_bytes());
         data.extend_from_slice(&0xBBBBu32.to_le_bytes());
@@ -82,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn test_too_short_reference() {
+    fn too_short_reference() {
         let data = [0x01, 0x02];
         let err = resolve_object_reference(&data, 8).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));

@@ -287,7 +287,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_nil_message() {
+    fn parse_nil_message() {
         let data = [0u8; 16];
         let mut cursor = Cursor::new(&data);
         let msg = parse_message(MSG_NIL, 16, &mut cursor, 8, 8).unwrap();
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_unknown_message() {
+    fn parse_unknown_message() {
         let data = [0xAA, 0xBB, 0xCC, 0xDD];
         let mut cursor = Cursor::new(&data);
         let msg = parse_message(0xFFFF, 4, &mut cursor, 8, 8).unwrap();
@@ -310,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_comment_message() {
+    fn parse_comment_message() {
         let data = b"hello world\0\0\0\0\0";
         let mut cursor = Cursor::new(data.as_ref());
         let msg = parse_message(MSG_COMMENT, 16, &mut cursor, 8, 8).unwrap();
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_reference_count() {
+    fn parse_reference_count() {
         let data = 42u32.to_le_bytes();
         let mut cursor = Cursor::new(&data);
         let msg = parse_message(MSG_REFERENCE_COUNT, 4, &mut cursor, 8, 8).unwrap();
@@ -332,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_symbol_table_via_dispatch() {
+    fn parse_symbol_table_via_dispatch() {
         let mut data = Vec::new();
         data.extend_from_slice(&0x1234u64.to_le_bytes());
         data.extend_from_slice(&0x5678u64.to_le_bytes());
@@ -349,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_continuation_via_dispatch() {
+    fn parse_continuation_via_dispatch() {
         let mut data = Vec::new();
         data.extend_from_slice(&0xAAAAu64.to_le_bytes());
         data.extend_from_slice(&512u64.to_le_bytes());
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_message_type_name() {
+    fn message_type_names_cover_known_and_unknown_ids() {
         assert_eq!(message_type_name(MSG_DATASPACE), "Dataspace");
         assert_eq!(message_type_name(MSG_DATATYPE), "Datatype");
         assert_eq!(message_type_name(0x9999), "Unknown");

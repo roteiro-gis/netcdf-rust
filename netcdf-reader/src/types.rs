@@ -550,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_path_lookup() {
+    fn group_path_lookup() {
         let root = sample_group_tree();
 
         let surface = root.group("obs/surface").unwrap();
@@ -560,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_path_lookup() {
+    fn variable_path_lookup() {
         let root = sample_group_tree();
 
         assert_eq!(root.variable("root_var").unwrap().name(), "root_var");
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_and_attribute_path_lookup() {
+    fn dimension_and_attribute_path_lookup() {
         let root = sample_group_tree();
 
         assert_eq!(root.dimension("root_dim").unwrap().size, 2);
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_coordinate_variable_detection_and_lookup() {
+    fn coordinate_variable_detection_and_lookup() {
         let time_dim = NcDimension {
             name: "time".to_string(),
             size: 3,
@@ -645,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checked_shape_elements_overflow() {
+    fn checked_shape_elements_overflow() {
         let err = checked_shape_elements(&[u64::MAX, 2], "test overflow").unwrap_err();
         assert!(matches!(err, crate::Error::InvalidData(_)));
     }

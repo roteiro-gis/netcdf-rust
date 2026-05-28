@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v1_scalar_u32_attr() {
+    fn parse_v1_scalar_u32_attr() {
         let dt = u32_le_datatype();
         let ds = scalar_dataspace();
 
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v3_scalar_attr() {
+    fn parse_v3_scalar_attr() {
         let dt = u32_le_datatype();
         let ds = scalar_dataspace();
 
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v3_utf8_name_attr() {
+    fn parse_v3_utf8_name_attr() {
         let dt = u32_le_datatype();
         let ds = scalar_dataspace();
 

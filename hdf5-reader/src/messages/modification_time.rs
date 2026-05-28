@@ -69,7 +69,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_new_modification_time() {
+    fn parse_new_modification_time() {
         let mut data = vec![
             0x01, // version
             0x00, 0x00, 0x00, // reserved

@@ -21,7 +21,7 @@ export BENCH_SAMPLE_SIZE="${BENCH_SAMPLE_SIZE:-15}"
 export BENCH_MEASUREMENT_TIME="${BENCH_MEASUREMENT_TIME:-0.2}"
 export BENCH_WARMUP_TIME="${BENCH_WARMUP_TIME:-0.2}"
 export BENCH_REGRESSION_THRESHOLD_PERCENT="${BENCH_REGRESSION_THRESHOLD_PERCENT:-10}"
-export BENCH_SMOKE_FILTER="${BENCH_SMOKE_FILTER:-open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_classic/netcdf_rust/(large_cdf5|large_record_cdf5)|parallel_open_and_read/netcdf_rust_x(1|4)/large_nc4_compressed|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed}"
+export BENCH_CI_CHECK_FILTER="${BENCH_CI_CHECK_FILTER:-open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_classic/netcdf_rust/(large_cdf5|large_record_cdf5)|parallel_open_and_read/netcdf_rust_x(1|4)/large_nc4_compressed|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed}"
 
 if ! command -v critcmp >/dev/null 2>&1; then
   env -u RUSTFLAGS cargo install --locked critcmp
@@ -47,7 +47,7 @@ run_compare_bench() {
   (
     cd "$repo_dir"
     cargo bench -p netcdf-reader --bench compare_georust \
-      "$BENCH_SMOKE_FILTER" \
+      "$BENCH_CI_CHECK_FILTER" \
       -- --noplot \
       --sample-size "$BENCH_SAMPLE_SIZE" \
       --measurement-time "$BENCH_MEASUREMENT_TIME" \
@@ -102,7 +102,7 @@ for base_file in base_files:
     with pr_file.open() as fh:
         pr_estimates = json.load(fh)
 
-    # Median is more robust than mean for short smoke-style CI runs on noisy
+    # Median is more robust than mean for short CI benchmark checks on noisy
     # shared runners.
     base_mean = base_estimates["median"]["point_estimate"]
     pr_mean = pr_estimates["median"]["point_estimate"]

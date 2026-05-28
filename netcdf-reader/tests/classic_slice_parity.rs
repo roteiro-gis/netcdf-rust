@@ -74,7 +74,7 @@ fn record_strided_slice() -> NcSliceInfo {
 }
 
 #[test]
-fn test_classic_non_record_slice_matches_georust_for_strided_inner_selection() {
+fn classic_non_record_slice_matches_georust_for_strided_inner_selection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_parity.nc");
     create_classic_slice_fixture(&path);
@@ -102,8 +102,44 @@ fn test_classic_non_record_slice_matches_georust_for_strided_inner_selection() {
     );
 }
 
+#[cfg(feature = "rayon")]
 #[test]
-fn test_classic_non_record_slice_allows_empty_results() {
+fn classic_non_record_parallel_reads_match_serial() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("classic_parallel_read.nc");
+    create_classic_slice_fixture(&path);
+
+    let file = NcFile::open(&path).unwrap();
+    let serial: ndarray::ArrayD<f32> = file.read_variable("data").unwrap();
+    let parallel: ndarray::ArrayD<f32> = file.read_variable_parallel("data").unwrap();
+    assert_eq!(parallel, serial);
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let in_pool: ndarray::ArrayD<f32> = file.read_variable_in_pool("data", &pool).unwrap();
+    assert_eq!(in_pool, serial);
+}
+
+#[cfg(feature = "rayon")]
+#[test]
+fn classic_non_record_parallel_slice_matches_serial() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("classic_parallel_slice.nc");
+    create_classic_slice_fixture(&path);
+
+    let file = NcFile::open(&path).unwrap();
+    let selection = classic_strided_inner_slice();
+    let serial: ndarray::ArrayD<f32> = file.read_variable_slice("data", &selection).unwrap();
+    let parallel: ndarray::ArrayD<f32> = file
+        .read_variable_slice_parallel("data", &selection)
+        .unwrap();
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn classic_non_record_slice_allows_empty_results() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_empty.nc");
     create_classic_slice_fixture(&path);
@@ -130,7 +166,7 @@ fn test_classic_non_record_slice_allows_empty_results() {
 }
 
 #[test]
-fn test_classic_non_record_slice_rejects_start_past_dimension_end() {
+fn classic_non_record_slice_rejects_start_past_dimension_end() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("classic_slice_oob.nc");
     create_classic_slice_fixture(&path);
@@ -158,7 +194,7 @@ fn test_classic_non_record_slice_rejects_start_past_dimension_end() {
 }
 
 #[test]
-fn test_classic_record_slice_matches_georust_for_strided_selection() {
+fn classic_record_slice_matches_georust_for_strided_selection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("record_slice_parity.nc");
     create_record_slice_fixture(&path);
@@ -187,8 +223,37 @@ fn test_classic_record_slice_matches_georust_for_strided_selection() {
     );
 }
 
+#[cfg(feature = "rayon")]
 #[test]
-fn test_classic_record_slice_index_collapses_record_axis() {
+fn classic_record_parallel_reads_match_serial() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("record_parallel_read.nc");
+    create_record_slice_fixture(&path);
+
+    let file = NcFile::open(&path).unwrap();
+    let serial: ndarray::ArrayD<f32> = file.read_variable("series").unwrap();
+    let parallel: ndarray::ArrayD<f32> = file.read_variable_parallel("series").unwrap();
+    assert_eq!(parallel, serial);
+}
+
+#[cfg(feature = "rayon")]
+#[test]
+fn classic_record_parallel_slice_matches_serial() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("record_parallel_slice.nc");
+    create_record_slice_fixture(&path);
+
+    let file = NcFile::open(&path).unwrap();
+    let selection = record_strided_slice();
+    let serial: ndarray::ArrayD<f32> = file.read_variable_slice("series", &selection).unwrap();
+    let parallel: ndarray::ArrayD<f32> = file
+        .read_variable_slice_parallel("series", &selection)
+        .unwrap();
+    assert_eq!(parallel, serial);
+}
+
+#[test]
+fn classic_record_slice_index_collapses_record_axis() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("record_slice_index.nc");
     create_record_slice_fixture(&path);

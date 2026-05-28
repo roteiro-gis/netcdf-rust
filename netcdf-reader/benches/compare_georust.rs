@@ -589,6 +589,27 @@ fn slice_checksum_netcdf_rust_file(file: &NcFile, case: &BenchCase, slice: Slice
     }
 }
 
+fn slice_checksum_netcdf_rust_file_parallel_in_pool(
+    file: &NcFile,
+    case: &BenchCase,
+    slice: SliceSpec,
+    pool: &rayon::ThreadPool,
+) -> u64 {
+    let selection = nc_slice_selection(slice);
+    pool.install(|| match case.kind {
+        NumericKind::F32 => checksum_f32(
+            file.read_variable_slice_parallel::<f32>(case.variable, &selection)
+                .unwrap()
+                .iter(),
+        ),
+        NumericKind::F64 => checksum_f64(
+            file.read_variable_slice_parallel::<f64>(case.variable, &selection)
+                .unwrap()
+                .iter(),
+        ),
+    })
+}
+
 fn slice_checksum_netcdf_rust_dataset(
     dataset: &hdf5_reader::Dataset,
     case: &BenchCase,
@@ -982,7 +1003,9 @@ fn benchmark_group_selected(group_name: &str) -> bool {
         "sparse_huge_logical_slice",
         "parallel_slice_batch",
         "read_full_internal_parallel",
+        "read_full_internal_parallel_classic",
         "read_full_internal_parallel_nocache",
+        "slice_internal_parallel_classic",
         "cf_conventions_overhead",
         "slice_selectivity",
         "memory_profile",
@@ -1014,19 +1037,17 @@ fn validate_cases() {
                 case.id
             );
 
-            if case.is_netcdf4 {
-                let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
-                let netcdf_rust_parallel = full_read_checksum_netcdf_rust_file_in_pool(
-                    &NcFile::open(&path).unwrap(),
-                    case,
-                    &pool,
-                );
-                assert_eq!(
-                    netcdf_rust_full, netcdf_rust_parallel,
-                    "parallel full-read checksum mismatch for {}",
-                    case.id
-                );
-            }
+            let pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+            let netcdf_rust_parallel = full_read_checksum_netcdf_rust_file_in_pool(
+                &NcFile::open(&path).unwrap(),
+                case,
+                &pool,
+            );
+            assert_eq!(
+                netcdf_rust_full, netcdf_rust_parallel,
+                "parallel full-read checksum mismatch for {}",
+                case.id
+            );
 
             let netcdf_rust_metadata = metadata_netcdf_rust(&path);
             let georust_metadata = metadata_georust(&path);
@@ -1503,6 +1524,102 @@ fn bench_read_full_internal_parallel(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_read_full_internal_parallel_classic(c: &mut Criterion) {
+    if !benchmark_group_selected("read_full_internal_parallel_classic") {
+        return;
+    }
+    validate_cases();
+    let mut group = c.benchmark_group("read_full_internal_parallel_classic");
+
+    for case in CASES
+        .iter()
+        .filter(|case| matches!(case.id, "large_cdf5" | "large_record_cdf5"))
+    {
+        let path = case_path(case);
+        let netcdf_rust = NcFile::open(&path).unwrap();
+        let georust = netcdf::open(&path).unwrap();
+        group.throughput(Throughput::Bytes(case_bytes(case) as u64));
+
+        group.bench_function(BenchmarkId::new("netcdf_rust_x1", case.id), |b| {
+            b.iter(|| black_box(full_read_checksum_netcdf_rust_file(&netcdf_rust, case)));
+        });
+
+        group.bench_function(BenchmarkId::new("georust_x1", case.id), |b| {
+            b.iter(|| black_box(full_read_checksum_georust_file(&georust, case)));
+        });
+
+        for threads in thread_counts().into_iter().filter(|threads| *threads > 1) {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            group.bench_function(
+                BenchmarkId::new(format!("netcdf_rust_x{threads}"), case.id),
+                |b| {
+                    b.iter(|| {
+                        black_box(full_read_checksum_netcdf_rust_file_in_pool(
+                            &netcdf_rust,
+                            case,
+                            &pool,
+                        ))
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_slice_internal_parallel_classic(c: &mut Criterion) {
+    if !benchmark_group_selected("slice_internal_parallel_classic") {
+        return;
+    }
+    validate_cases();
+    let mut group = c.benchmark_group("slice_internal_parallel_classic");
+
+    for case in CASES
+        .iter()
+        .filter(|case| !case.is_netcdf4 && case.slice.is_some())
+    {
+        let path = case_path(case);
+        let slice = case.slice.unwrap();
+        let netcdf_rust = NcFile::open(&path).unwrap();
+        let georust = netcdf::open(&path).unwrap();
+        group.throughput(Throughput::Bytes(slice_bytes(case).unwrap() as u64));
+
+        group.bench_function(BenchmarkId::new("netcdf_rust_x1", case.id), |b| {
+            b.iter(|| black_box(slice_checksum_netcdf_rust_file(&netcdf_rust, case, slice)));
+        });
+
+        group.bench_function(BenchmarkId::new("georust_x1", case.id), |b| {
+            b.iter(|| black_box(slice_checksum_georust_file(&georust, case, slice)));
+        });
+
+        for threads in thread_counts().into_iter().filter(|threads| *threads > 1) {
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            group.bench_function(
+                BenchmarkId::new(format!("netcdf_rust_x{threads}"), case.id),
+                |b| {
+                    b.iter(|| {
+                        black_box(slice_checksum_netcdf_rust_file_parallel_in_pool(
+                            &netcdf_rust,
+                            case,
+                            slice,
+                            &pool,
+                        ))
+                    });
+                },
+            );
+        }
+    }
+
+    group.finish();
+}
+
 fn bench_read_full_internal_parallel_nocache(c: &mut Criterion) {
     if !benchmark_group_selected("read_full_internal_parallel_nocache") {
         return;
@@ -1730,6 +1847,7 @@ criterion_group!(
     bench_metadata_reuse_handle,
     bench_read_full_reuse_handle,
     bench_read_full_internal_parallel,
+    bench_read_full_internal_parallel_classic,
     bench_read_full_internal_parallel_nocache,
     bench_open_and_read_full,
     bench_slice_reuse_handle,
@@ -1738,6 +1856,7 @@ criterion_group!(
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
     bench_parallel_slice_batch,
+    bench_slice_internal_parallel_classic,
     bench_sparse_huge_logical_slice,
     bench_cf_conventions_overhead,
     bench_slice_selectivity,
@@ -1750,6 +1869,7 @@ criterion_group!(
     bench_metadata_reuse_handle,
     bench_read_full_reuse_handle,
     bench_read_full_internal_parallel,
+    bench_read_full_internal_parallel_classic,
     bench_read_full_internal_parallel_nocache,
     bench_open_and_read_full,
     bench_slice_reuse_handle,
@@ -1758,6 +1878,7 @@ criterion_group!(
     bench_parallel_read_shared_netcdf_rust,
     bench_parallel_metadata_batch,
     bench_parallel_slice_batch,
+    bench_slice_internal_parallel_classic,
     bench_sparse_huge_logical_slice,
     bench_cf_conventions_overhead,
     bench_slice_selectivity,

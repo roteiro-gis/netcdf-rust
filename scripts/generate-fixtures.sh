@@ -19,3 +19,7 @@ if [[ "${INSTALL_FIXTURE_DEPS:-1}" == "1" ]]; then
 fi
 
 "$python_bin" "$repo_root/testdata/generate_fixtures.py"
+
+if [[ -x "$repo_root/testdata/generate_parallel_compat_fixtures.sh" ]]; then
+  "$repo_root/testdata/generate_parallel_compat_fixtures.sh" "$repo_root/testdata"
+fi

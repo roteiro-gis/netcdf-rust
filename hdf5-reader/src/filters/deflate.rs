@@ -20,7 +20,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn test_roundtrip() {
+    fn roundtrip() {
         let original = b"hello world, this is a test of zlib compression!";
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(original).unwrap();

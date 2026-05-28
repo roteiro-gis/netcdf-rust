@@ -249,7 +249,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_magic_detection() {
+    fn magic_detection() {
         // Valid magic at offset 0
         let mut data = HDF5_MAGIC.to_vec();
         data.extend_from_slice(&[0u8; 100]);
@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn test_no_magic() {
+    fn no_magic() {
         let data = [0u8; 100];
         let cursor = Cursor::new(&data);
         assert!(find_magic(&cursor).is_err());

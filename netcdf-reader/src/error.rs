@@ -28,6 +28,18 @@ pub enum Error {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    #[error("unsupported feature: {0}")]
+    UnsupportedFeature(String),
+
+    #[error(
+        "unexpected end of file at offset {offset}: need {needed} bytes, available {available}"
+    )]
+    UnexpectedEof {
+        offset: u64,
+        needed: u64,
+        available: u64,
+    },
+
     #[error("HDF5 error: {0}")]
     #[cfg(feature = "netcdf4")]
     Hdf5(#[from] hdf5_reader::error::Error),

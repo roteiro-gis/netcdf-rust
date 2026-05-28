@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_heap() {
+    fn parse_local_heap() {
         let data = build_heap_header(256, 128, 0x2000);
 
         let mut cursor = Cursor::new(&data);
@@ -176,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_local_heap_4byte() {
+    fn parse_local_heap_4byte() {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"HEAP");
         buf.push(0); // version
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_signature() {
+    fn bad_signature() {
         let mut data = build_heap_header(256, 128, 0x2000);
         data[0] = b'X'; // corrupt signature
         let mut cursor = Cursor::new(&data);
@@ -205,7 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_version() {
+    fn bad_version() {
         let mut data = build_heap_header(256, 128, 0x2000);
         data[4] = 1; // version 1 (unsupported)
         let mut cursor = Cursor::new(&data);
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_string() {
+    fn local_heap_reads_null_terminated_strings() {
         // Simulate a file where the data segment starts at offset 100.
         let mut file_data = vec![0u8; 200];
         // Place "hello\0world\0" at the data segment.
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_string_out_of_bounds() {
+    fn get_string_out_of_bounds() {
         let file_data = vec![0u8; 50];
         let heap = LocalHeap {
             data_segment_size: 100,
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_string_missing_null() {
+    fn get_string_missing_null() {
         // Data segment with no null terminator.
         let mut file_data = vec![0xFFu8; 200];
         file_data[100..105].copy_from_slice(b"abcde");

@@ -36,7 +36,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_symbol_table_msg() {
+    fn parse_symbol_table_msg() {
         let mut data = Vec::new();
         // btree address = 0x1000
         data.extend_from_slice(&0x1000u64.to_le_bytes());

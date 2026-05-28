@@ -354,7 +354,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_v3_contiguous() {
+    fn parse_v3_contiguous() {
         let mut data = vec![
             0x03, // version 3
             0x01, // layout class = contiguous
@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v3_compact() {
+    fn parse_v3_compact() {
         let mut data = vec![
             0x03, // version 3
             0x00, // layout class = compact
@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v3_chunked() {
+    fn parse_v3_chunked() {
         let mut data = vec![
             0x03, // version 3
             0x02, // layout class = chunked
@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v4_chunked_direct_dim_size_encoding() {
+    fn parse_v4_chunked_direct_dim_size_encoding() {
         let mut data = vec![
             0x04, // version 4
             0x02, // layout class = chunked
@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v4_chunked_legacy_dim_size_encoding() {
+    fn parse_v4_chunked_legacy_dim_size_encoding() {
         let mut data = vec![
             0x04, // version 4
             0x02, // layout class = chunked

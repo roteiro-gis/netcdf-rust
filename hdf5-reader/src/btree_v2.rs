@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_header() {
+    fn parse_header() {
         let data = build_header(5, 4096, 12, 0, 0x1000, 3, 3, 8, 8);
         let mut cursor = Cursor::new(&data);
         let hdr = BTreeV2Header::parse(&mut cursor, 8, 8).unwrap();
@@ -1134,7 +1134,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_signature() {
+    fn bad_signature() {
         let mut data = build_header(5, 4096, 12, 0, 0x1000, 0, 0, 8, 8);
         data[0] = b'X';
         let mut cursor = Cursor::new(&data);
@@ -1145,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bad_checksum() {
+    fn bad_checksum() {
         let mut data = build_header(5, 4096, 12, 0, 0x1000, 0, 0, 8, 8);
         // Corrupt a byte in the middle.
         data[6] = 0xFF;
@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_empty_tree() {
+    fn collect_empty_tree() {
         let header = BTreeV2Header {
             btree_type: 5,
             node_size: 4096,
@@ -1175,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_heap_id_len() {
+    fn heap_id_len_uses_record_type_sizes() {
         // Type 5: record_size - 4
         let h5 = BTreeV2Header {
             btree_type: 5,
@@ -1200,14 +1200,14 @@ mod tests {
     }
 
     #[test]
-    fn test_max_leaf_records() {
+    fn max_leaf_records_accounts_for_node_overhead() {
         // node_size=4096, record_size=12, overhead=10
         // => (4096 - 10) / 12 = 340
         assert_eq!(max_leaf_records(4096, 12), 340);
     }
 
     #[test]
-    fn test_num_records_size() {
+    fn record_count_size_scales_at_integer_boundaries() {
         assert_eq!(num_records_size(0), 1);
         assert_eq!(num_records_size(255), 1);
         assert_eq!(num_records_size(256), 2);
@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_huge_indirect_record() {
+    fn parse_huge_indirect_record() {
         let mut data = Vec::new();
         data.extend_from_slice(&0x1234u64.to_le_bytes());
         data.extend_from_slice(&99u64.to_le_bytes());
@@ -1239,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_shared_heap_record() {
+    fn parse_shared_heap_record() {
         let mut data = Vec::new();
         data.push(0);
         data.extend_from_slice(&[0, 0, 0]);
@@ -1264,7 +1264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_leaf_with_type5_records() {
+    fn parse_leaf_with_type5_records() {
         // Build a leaf node with 2 type-5 records (link name hash).
         // record_size = 12 (hash=4 + heap_id=8)
         let record_size: u16 = 12;

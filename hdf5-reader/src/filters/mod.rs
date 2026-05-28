@@ -183,7 +183,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_filter_registry_default() {
+    fn filter_registry_default() {
         let registry = FilterRegistry::new();
         // Built-in filters should be registered
         assert!(registry.filters.contains_key(&FILTER_DEFLATE));
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_registry_custom() {
+    fn filter_registry_custom() {
         let mut registry = FilterRegistry::new();
         // Register a no-op custom filter
         registry.register(32000, Box::new(|_, data, _| Ok(data.to_vec())));
@@ -208,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_registry_unknown() {
+    fn filter_registry_unknown() {
         let registry = FilterRegistry::new();
         let filter = FilterDescription {
             id: 9999,

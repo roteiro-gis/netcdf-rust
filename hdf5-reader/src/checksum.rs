@@ -159,14 +159,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_jenkins_empty() {
+    fn jenkins_empty() {
         let hash = jenkins_lookup3(b"");
         // Empty input produces a deterministic hash from the initial state
         assert_ne!(hash, 0);
     }
 
     #[test]
-    fn test_jenkins_known_value() {
+    fn jenkins_known_value() {
         // Test with known input — the hash is deterministic
         let h1 = jenkins_lookup3(b"hello");
         let h2 = jenkins_lookup3(b"hello");
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fletcher32_simple() {
+    fn fletcher32_simple() {
         let data = [0x01, 0x02, 0x03, 0x04];
         let checksum = fletcher32(&data);
         // Verify it's deterministic
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fletcher32_known_reference() {
+    fn fletcher32_known_reference() {
         // Known reference: 4 bytes [0x00, 0x01, 0x00, 0x02] interpreted as
         // big-endian u16 words: 0x0001 and 0x0002.
         // sum1 = (0 + 1) % 65535 = 1; sum2 = (0 + 1) % 65535 = 1
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fletcher32_roundtrip_with_filter() {
+    fn fletcher32_roundtrip_with_filter() {
         // Build a payload + checksum and verify the filter can strip it
         let payload = vec![0x00u8, 0x80, 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00];
         let ck = fletcher32(&payload);

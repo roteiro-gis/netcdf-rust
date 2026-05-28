@@ -8,9 +8,13 @@
 //!   boundary in CDF-1/2).
 
 use ndarray::{ArrayD, IxDyn};
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
 
 use crate::error::{Error, Result};
 use crate::types::{NcType, NcVariable};
+
+use super::storage::ClassicStorage;
 
 /// Trait for types that can be read from classic NetCDF data.
 pub trait NcReadType: Clone + Default + Send + 'static {
@@ -250,6 +254,58 @@ pub fn read_non_record_variable<T: NcReadType>(
     .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
 }
 
+/// Read the entire data for a non-record variable from range-backed storage.
+pub(crate) fn read_non_record_variable_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+) -> Result<ArrayD<T>> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_from_storage for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
+    let data = storage.read_range(var.data_offset, total_bytes)?;
+    let values = T::decode_bulk_be(data.as_ref(), total_elements)?;
+    let shape = checked_variable_shape(var)?;
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
+/// Read the entire data for a non-record variable using Rayon for large reads.
+#[cfg(feature = "rayon")]
+pub(crate) fn read_non_record_variable_parallel_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+) -> Result<ArrayD<T>> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_parallel_from_storage for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
+    let policy = storage.parallel_read_policy();
+    if total_bytes < policy.min_bytes || total_elements == 0 {
+        return read_non_record_variable_from_storage(storage, var);
+    }
+
+    let values = read_contiguous_range_parallel::<T>(
+        storage,
+        var.data_offset,
+        total_elements,
+        policy.target_chunk_bytes,
+    )?;
+    let shape = checked_variable_shape(var)?;
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
 /// Read the entire data for a non-record variable into a caller-provided buffer.
 pub fn read_non_record_variable_into<T: NcReadType>(
     file_data: &[u8],
@@ -298,6 +354,33 @@ pub fn read_non_record_variable_into<T: NcReadType>(
     }
 
     T::decode_bulk_be_into(&file_data[offset..end], dst)
+}
+
+/// Read a non-record variable from range-backed storage into a caller-provided buffer.
+pub(crate) fn read_non_record_variable_into_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    dst: &mut [T],
+) -> Result<()> {
+    if var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_record_variable_into_from_storage for record variables".to_string(),
+        ));
+    }
+
+    let total_elements = checked_non_record_element_count(var)?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    let total_bytes = variable_data_bytes::<T>(var.name.as_str(), total_elements)?;
+    let data = storage.read_range(var.data_offset, total_bytes)?;
+    T::decode_bulk_be_into(data.as_ref(), dst)
 }
 
 /// Read the entire data for a record variable into an ndarray.
@@ -391,6 +474,114 @@ pub fn read_record_variable<T: NcReadType>(
         let rec_values = T::decode_bulk_be(rec_slice, elements_per_record)?;
         values.extend(rec_values);
     }
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
+/// Read the entire data for a record variable from range-backed storage.
+pub(crate) fn read_record_variable_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+) -> Result<ArrayD<T>> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_from_storage for non-record variables".to_string(),
+        ));
+    }
+
+    let shape = checked_record_shape(var, numrecs)?;
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    let mut values = Vec::with_capacity(total_elements);
+
+    for rec in 0..numrecs {
+        let rec_offset = record_byte_offset(var, rec, record_stride)?;
+        let rec_slice = storage.read_range(rec_offset, bytes_per_record)?;
+        let rec_values = T::decode_bulk_be(rec_slice.as_ref(), elements_per_record)?;
+        values.extend(rec_values);
+    }
+
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+}
+
+/// Read the entire data for a record variable using Rayon for large reads.
+#[cfg(feature = "rayon")]
+pub(crate) fn read_record_variable_parallel_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+) -> Result<ArrayD<T>> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_parallel_from_storage for non-record variables"
+                .to_string(),
+        ));
+    }
+
+    let shape = checked_record_shape(var, numrecs)?;
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    let logical_bytes = numrecs_usize.checked_mul(bytes_per_record).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "record variable '{}' logical byte count exceeds platform usize",
+            var.name
+        ))
+    })?;
+    let policy = storage.parallel_read_policy();
+    if logical_bytes < policy.min_bytes || numrecs_usize <= 1 {
+        return read_record_variable_from_storage(storage, var, numrecs, record_stride);
+    }
+
+    let records_per_chunk = (policy.target_chunk_bytes / bytes_per_record.max(1)).max(1);
+    let elements_per_chunk = records_per_chunk
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(
+                "classic record chunk element count exceeds platform usize".to_string(),
+            )
+        })?;
+    let mut values = vec![T::default(); total_elements];
+    let chunk_plan = RecordChunkReadPlan {
+        var,
+        record_stride,
+        elements_per_record,
+        bytes_per_record,
+    };
+    values
+        .par_chunks_mut(elements_per_chunk)
+        .enumerate()
+        .try_for_each(|(chunk, dst)| {
+            let first_record = chunk.checked_mul(records_per_chunk).ok_or_else(|| {
+                Error::InvalidData("classic record chunk offset exceeds platform usize".to_string())
+            })?;
+            let records = dst.len().checked_div(elements_per_record).ok_or_else(|| {
+                Error::InvalidData("classic record elements per record is zero".to_string())
+            })?;
+            read_record_chunk_into::<T>(storage, &chunk_plan, first_record as u64, records, dst)
+        })?;
 
     ArrayD::from_shape_vec(IxDyn(&shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
@@ -494,6 +685,69 @@ pub fn read_record_variable_into<T: NcReadType>(
     Ok(())
 }
 
+/// Read a record variable from range-backed storage into a caller-provided buffer.
+pub(crate) fn read_record_variable_into_from_storage<T: NcReadType>(
+    storage: &ClassicStorage,
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+    dst: &mut [T],
+) -> Result<()> {
+    if !var.is_record_var {
+        return Err(Error::InvalidData(
+            "use read_non_record_variable_into_from_storage for non-record variables".to_string(),
+        ));
+    }
+
+    if var.dimensions.is_empty() {
+        return Err(Error::InvalidData(
+            "record variable must have at least one dimension".to_string(),
+        ));
+    }
+
+    let elements_per_record = checked_record_elements_per_record(var)?;
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    let total_elements = numrecs_usize
+        .checked_mul(elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' element count exceeds platform usize",
+                var.name
+            ))
+        })?;
+    if dst.len() != total_elements {
+        return Err(Error::InvalidData(format!(
+            "destination has {} elements, variable '{}' requires {}",
+            dst.len(),
+            var.name,
+            total_elements
+        )));
+    }
+
+    for rec in 0..numrecs {
+        let rec_offset = record_byte_offset(var, rec, record_stride)?;
+        let rec_slice = storage.read_range(rec_offset, bytes_per_record)?;
+        let dst_start = crate::types::checked_usize_from_u64(rec, "record index")?
+            .checked_mul(elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' destination offset exceeds platform usize",
+                    var.name
+                ))
+            })?;
+        let dst_end = dst_start.checked_add(elements_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' destination range exceeds platform usize",
+                var.name
+            ))
+        })?;
+        T::decode_bulk_be_into(rec_slice.as_ref(), &mut dst[dst_start..dst_end])?;
+    }
+
+    Ok(())
+}
+
 /// Compute the record stride: total bytes per record across all record variables.
 ///
 /// Each record variable's per-record contribution is its `record_size` (already stored
@@ -525,6 +779,28 @@ fn checked_non_record_element_count(var: &NcVariable) -> Result<usize> {
     crate::types::checked_usize_from_u64(total, "variable element count")
 }
 
+pub(crate) fn checked_variable_shape(var: &NcVariable) -> Result<Vec<usize>> {
+    var.shape()
+        .iter()
+        .map(|&s| crate::types::checked_usize_from_u64(s, "variable dimension"))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn checked_record_shape(var: &NcVariable, numrecs: u64) -> Result<Vec<usize>> {
+    let mut shape: Vec<usize> = var
+        .shape()
+        .iter()
+        .map(|&s| crate::types::checked_usize_from_u64(s, "record variable dimension"))
+        .collect::<Result<Vec<_>>>()?;
+    if shape.is_empty() {
+        return Err(Error::InvalidData(
+            "record variable must have at least one dimension".to_string(),
+        ));
+    }
+    shape[0] = crate::types::checked_usize_from_u64(numrecs, "record count")?;
+    Ok(shape)
+}
+
 fn checked_record_elements_per_record(var: &NcVariable) -> Result<usize> {
     let mut elements = 1usize;
     for dim in var.dimensions.iter().skip(1) {
@@ -539,13 +815,155 @@ fn checked_record_elements_per_record(var: &NcVariable) -> Result<usize> {
     Ok(elements)
 }
 
+pub(crate) fn variable_data_bytes<T: NcReadType>(
+    var_name: &str,
+    element_count: usize,
+) -> Result<usize> {
+    element_count.checked_mul(T::element_size()).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "variable '{var_name}' size in bytes exceeds platform usize"
+        ))
+    })
+}
+
+pub(crate) fn record_byte_offset(var: &NcVariable, record: u64, record_stride: u64) -> Result<u64> {
+    var.data_offset
+        .checked_add(record.checked_mul(record_stride).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' byte offset exceeds u64",
+                var.name
+            ))
+        })?)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' byte offset exceeds u64",
+                var.name
+            ))
+        })
+}
+
+#[cfg(feature = "rayon")]
+pub(crate) fn read_contiguous_range_parallel<T: NcReadType>(
+    storage: &ClassicStorage,
+    base_offset: u64,
+    total_elements: usize,
+    target_chunk_bytes: usize,
+) -> Result<Vec<T>> {
+    if total_elements == 0 {
+        return Ok(Vec::new());
+    }
+
+    let elem_size = T::element_size();
+    let elements_per_chunk = (target_chunk_bytes / elem_size.max(1)).max(1);
+    let mut values = vec![T::default(); total_elements];
+    values
+        .par_chunks_mut(elements_per_chunk)
+        .enumerate()
+        .try_for_each(|(chunk, dst)| {
+            let start_element = chunk.checked_mul(elements_per_chunk).ok_or_else(|| {
+                Error::InvalidData(
+                    "classic parallel chunk offset exceeds platform usize".to_string(),
+                )
+            })?;
+            let byte_offset = crate::types::checked_mul_u64(
+                start_element as u64,
+                elem_size as u64,
+                "classic parallel byte offset",
+            )?;
+            let offset = base_offset.checked_add(byte_offset).ok_or_else(|| {
+                Error::InvalidData("classic parallel byte offset exceeds u64".to_string())
+            })?;
+            let bytes = variable_data_bytes::<T>("parallel chunk", dst.len())?;
+            let data = storage.read_range(offset, bytes)?;
+            T::decode_bulk_be_into(data.as_ref(), dst)
+        })?;
+
+    Ok(values)
+}
+
+#[cfg(feature = "rayon")]
+struct RecordChunkReadPlan<'a> {
+    var: &'a NcVariable,
+    record_stride: u64,
+    elements_per_record: usize,
+    bytes_per_record: usize,
+}
+
+#[cfg(feature = "rayon")]
+fn read_record_chunk_into<T: NcReadType>(
+    storage: &ClassicStorage,
+    plan: &RecordChunkReadPlan<'_>,
+    first_record: u64,
+    records: usize,
+    dst: &mut [T],
+) -> Result<()> {
+    if records == 0 {
+        return Ok(());
+    }
+
+    let expected_elements = records
+        .checked_mul(plan.elements_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' chunk element count exceeds platform usize",
+                plan.var.name
+            ))
+        })?;
+    if dst.len() != expected_elements {
+        return Err(Error::InvalidData(format!(
+            "record variable '{}' chunk destination has {} elements, expected {}",
+            plan.var.name,
+            dst.len(),
+            expected_elements
+        )));
+    }
+
+    if plan.record_stride == plan.bytes_per_record as u64 {
+        let offset = record_byte_offset(plan.var, first_record, plan.record_stride)?;
+        let bytes = records.checked_mul(plan.bytes_per_record).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' chunk byte count exceeds platform usize",
+                plan.var.name
+            ))
+        })?;
+        let data = storage.read_range(offset, bytes)?;
+        return T::decode_bulk_be_into(data.as_ref(), dst);
+    }
+
+    for ordinal in 0..records {
+        let record = first_record
+            .checked_add(ordinal as u64)
+            .ok_or_else(|| Error::InvalidData("classic record index exceeds u64".to_string()))?;
+        let offset = record_byte_offset(plan.var, record, plan.record_stride)?;
+        let data = storage.read_range(offset, plan.bytes_per_record)?;
+        let dst_start = ordinal
+            .checked_mul(plan.elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' chunk destination offset exceeds platform usize",
+                    plan.var.name
+                ))
+            })?;
+        let dst_end = dst_start
+            .checked_add(plan.elements_per_record)
+            .ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{}' chunk destination range exceeds platform usize",
+                    plan.var.name
+                ))
+            })?;
+        T::decode_bulk_be_into(data.as_ref(), &mut dst[dst_start..dst_end])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::NcDimension;
 
     #[test]
-    fn test_read_non_record_1d_float() {
+    fn read_non_record_1d_float() {
         // Create a fake file with 3 floats starting at offset 100.
         let mut file_data = vec![0u8; 200];
         let values = [1.0f32, 2.0f32, 3.0f32];
@@ -577,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_into() {
+    fn non_record_variable_into_copies_values() {
         let mut file_data = vec![0u8; 200];
         let values = [1.0f32, 2.0f32, 3.0f32];
         for (i, &v) in values.iter().enumerate() {
@@ -605,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_2d_int() {
+    fn read_non_record_2d_int() {
         // 2x3 array of i32 at offset 0
         let values: Vec<i32> = vec![10, 20, 30, 40, 50, 60];
         let mut file_data = Vec::new();
@@ -644,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_into_rejects_wrong_destination_len() {
+    fn read_non_record_variable_into_rejects_wrong_destination_len() {
         let var = NcVariable {
             name: "grid".to_string(),
             dimensions: vec![NcDimension {
@@ -666,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_record_stride() {
+    fn record_stride_sums_padded_record_variables() {
         let vars = vec![
             NcVariable {
                 name: "a".to_string(),
@@ -704,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable() {
+    fn record_variable_reads_all_records() {
         // Single record variable "temp" with shape [time, x] where x=2.
         // 3 records, each with 2 floats = 8 bytes per record.
         // Record stride = 8 (only one record var, already 4-aligned).
@@ -749,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_into() {
+    fn record_variable_into_copies_values() {
         let mut file_data = vec![0u8; 200];
         let base = 100usize;
         let record_values: Vec<Vec<f32>> = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
@@ -788,7 +1206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_into_rejects_wrong_destination_len() {
+    fn read_record_variable_into_rejects_wrong_destination_len() {
         let var = NcVariable {
             name: "temp".to_string(),
             dimensions: vec![
@@ -817,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_record_variable_rejects_element_count_overflow() {
+    fn read_non_record_variable_rejects_element_count_overflow() {
         let var = NcVariable {
             name: "huge".to_string(),
             dimensions: vec![
@@ -845,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_record_variable_rejects_record_offset_overflow() {
+    fn read_record_variable_rejects_record_offset_overflow() {
         let var = NcVariable {
             name: "huge_record".to_string(),
             dimensions: vec![

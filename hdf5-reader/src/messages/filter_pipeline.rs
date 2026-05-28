@@ -146,7 +146,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_v2_deflate() {
+    fn parse_v2_deflate() {
         let mut data = vec![
             0x02, // version 2
             0x01, // 1 filter

@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_group_info_all_present() {
+    fn parse_group_info_all_present() {
         let mut data = vec![
             0x00, // version
             0x03, // flags: both bits set
@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_group_info_empty() {
+    fn parse_group_info_empty() {
         let data = vec![0x00, 0x00];
         let mut cursor = Cursor::new(&data);
         let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();

@@ -170,7 +170,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_v1_scalar() {
+    fn parse_v1_scalar() {
         // Version 1, rank=0 (scalar), flags=0, reserved bytes
         let data = [
             0x01, // version
@@ -189,7 +189,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v1_simple_2d() {
+    fn parse_v1_simple_2d() {
         // Version 1, rank=2, flags=0x01 (has max dims), 8-byte lengths
         let mut data = vec![
             0x01, // version
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v2_simple_1d() {
+    fn parse_v2_simple_1d() {
         // Version 2, rank=1, flags=0x00, type=1 (simple), 4-byte lengths
         let mut data = vec![
             0x02, // version
@@ -237,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v2_null() {
+    fn parse_v2_null() {
         let data = [
             0x02, // version
             0x00, // rank
@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v2_with_max_dims() {
+    fn parse_v2_with_max_dims() {
         let mut data = vec![
             0x02, // version
             0x03, // rank = 3
@@ -277,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_version() {
+    fn unsupported_version() {
         let data = [0x03, 0x00, 0x00, 0x00];
         let mut cursor = Cursor::new(&data);
         assert!(parse(&mut cursor, 8, 8, data.len()).is_err());

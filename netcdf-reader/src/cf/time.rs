@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_days_since() {
+    fn parse_days_since() {
         let tr = parse_time_units("days since 1970-01-01", CfCalendar::Standard).unwrap();
         assert_eq!(tr.unit, CfTimeUnit::Days);
         assert_eq!(
@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_hours_since_with_time() {
+    fn parse_hours_since_with_time() {
         let tr = parse_time_units("hours since 2000-01-01 00:00:00", CfCalendar::Standard).unwrap();
         assert_eq!(tr.unit, CfTimeUnit::Hours);
         assert_eq!(
@@ -908,21 +908,21 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_days() {
+    fn decode_days() {
         let tr = parse_time_units("days since 1970-01-01", CfCalendar::Standard).unwrap();
         let dt = decode_time(365.0, &tr).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "1971-01-01");
     }
 
     #[test]
-    fn test_decode_hours() {
+    fn decode_hours() {
         let tr = parse_time_units("hours since 2000-01-01 00:00:00", CfCalendar::Standard).unwrap();
         let dt = decode_time(24.0, &tr).unwrap();
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2000-01-02");
     }
 
     #[test]
-    fn test_calendar_from_str() {
+    fn calendar_from_str() {
         assert_eq!(CfCalendar::parse("standard"), CfCalendar::Standard);
         assert_eq!(CfCalendar::parse("noleap"), CfCalendar::NoLeap);
         assert_eq!(CfCalendar::parse("365_day"), CfCalendar::NoLeap);
@@ -934,13 +934,13 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_units() {
+    fn invalid_units() {
         assert!(parse_time_units("invalid", CfCalendar::Standard).is_err());
         assert!(parse_time_units("furlongs since yesterday", CfCalendar::Standard).is_err());
     }
 
     #[test]
-    fn test_standard_calendar_uses_gregorian_reform_transition() {
+    fn standard_calendar_uses_gregorian_reform_transition() {
         let tr = parse_time_units("days since 1582-10-04", CfCalendar::Standard).unwrap();
 
         let exact = decode_time_exact(1.0, &tr).unwrap();
@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_360_day_epoch_with_february_30() {
+    fn parse_360_day_epoch_with_february_30() {
         let tr =
             parse_time_units("days since 2000-02-30 06:30:15.250", CfCalendar::Day360).unwrap();
 
@@ -964,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn test_noleap_calendar_skips_february_29() {
+    fn noleap_calendar_skips_february_29() {
         let tr = parse_time_units("days since 2000-01-01", CfCalendar::NoLeap).unwrap();
 
         let exact = decode_time_exact(59.0, &tr).unwrap();
@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_leap_calendar_has_february_29_every_year() {
+    fn all_leap_calendar_has_february_29_every_year() {
         let tr = parse_time_units("days since 2001-02-28", CfCalendar::AllLeap).unwrap();
 
         let exact = decode_time_exact(1.0, &tr).unwrap();
@@ -984,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn test_360_day_calendar_uses_uniform_30_day_months() {
+    fn calendar_360_day_uses_uniform_30_day_months() {
         let tr = parse_time_units("hours since 2000-01-30 12:00:00", CfCalendar::Day360).unwrap();
 
         let exact = decode_time_exact(12.0, &tr).unwrap();
@@ -997,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_julian_calendar_leap_years_are_exact() {
+    fn julian_calendar_leap_years_are_exact() {
         let tr = parse_time_units("days since 1900-02-28", CfCalendar::Julian).unwrap();
 
         let exact = decode_time_exact(1.0, &tr).unwrap();
@@ -1009,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn test_negative_offsets_use_calendar_arithmetic() {
+    fn negative_offsets_use_calendar_arithmetic() {
         let tr = parse_time_units("days since 2001-01-01", CfCalendar::NoLeap).unwrap();
 
         let exact = decode_time_exact(-1.0, &tr).unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_360_day_integer_month_offsets() {
+    fn calendar_360_day_integer_month_offsets() {
         let tr = parse_time_units("months since 2000-01-30", CfCalendar::Day360).unwrap();
 
         let exact = decode_time_exact(1.0, &tr).unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn test_time_ref_from_variable() {
+    fn time_reference_from_variable_uses_units_and_calendar() {
         let var = coordinate_var(
             "time",
             3,
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_time_coordinates_only_uses_coordinate_variables() {
+    fn discover_time_coordinates_only_uses_coordinate_variables() {
         let time = coordinate_var("time", 3, vec![attr("units", "days since 1970-01-01")]);
         let data_time = NcVariable {
             name: "data_time".into(),
@@ -1081,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_variable_time_coordinate() {
+    fn discovers_variable_time_coordinate() {
         let time = coordinate_var("time", 3, vec![attr("units", "hours since 2000-01-01")]);
         let lat = coordinate_var("lat", 2, vec![attr("units", "degrees_north")]);
         let temperature = NcVariable {
@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_time_coordinate_values() {
+    fn time_coordinate_values_decode_from_units() {
         let var = coordinate_var("time", 2, vec![attr("units", "days since 1970-01-01")]);
 
         let decoded = decode_time_coordinate_values(&var, &[0.0, 1.0])

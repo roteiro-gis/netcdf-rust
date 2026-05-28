@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn test_axis_attribute() {
+    fn axis_attribute() {
         let var = make_var(vec![NcAttribute {
             name: "axis".into(),
             value: NcAttrValue::Chars("X".into()),
@@ -229,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn test_standard_name_latitude() {
+    fn standard_name_latitude() {
         let var = make_var(vec![NcAttribute {
             name: "standard_name".into(),
             value: NcAttrValue::Chars("latitude".into()),
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_standard_name_time() {
+    fn standard_name_time() {
         let var = make_var(vec![NcAttribute {
             name: "standard_name".into(),
             value: NcAttrValue::Chars("time".into()),
@@ -247,7 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn test_units_degrees_north() {
+    fn units_degrees_north() {
         let var = make_var(vec![NcAttribute {
             name: "units".into(),
             value: NcAttrValue::Chars("degrees_north".into()),
@@ -256,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn test_units_time_since() {
+    fn units_time_since() {
         let var = make_var(vec![NcAttribute {
             name: "units".into(),
             value: NcAttrValue::Chars("days since 1970-01-01".into()),
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_positive_up() {
+    fn positive_up() {
         let var = make_var(vec![NcAttribute {
             name: "positive".into(),
             value: NcAttrValue::Chars("up".into()),
@@ -274,13 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown() {
+    fn unknown() {
         let var = make_var(vec![]);
         assert_eq!(identify_axis(&var), CfAxisType::Unknown);
     }
 
     #[test]
-    fn test_axis_takes_precedence() {
+    fn axis_takes_precedence() {
         // axis="X" should win over standard_name="latitude"
         let var = make_var(vec![
             NcAttribute {
@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_coordinate_axes_from_group() {
+    fn discover_coordinate_axes_from_group() {
         let time = make_coordinate_var(
             "time",
             4,
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_variable_axes_follows_dimension_order() {
+    fn discover_variable_axes_follows_dimension_order() {
         let time = make_coordinate_var(
             "time",
             4,

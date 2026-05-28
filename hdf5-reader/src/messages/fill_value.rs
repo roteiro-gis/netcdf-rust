@@ -153,7 +153,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_old_fill() {
+    fn parse_old_fill() {
         let data = [0x01, 0x02, 0x03, 0x04];
         let mut cursor = Cursor::new(&data);
         let msg = parse_old(&mut cursor, 8, 8, 4).unwrap();
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_old_fill_empty() {
+    fn parse_old_fill_empty() {
         let data = [];
         let mut cursor = Cursor::new(&data);
         let msg = parse_old(&mut cursor, 8, 8, 0).unwrap();
@@ -171,7 +171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_new_v2_defined() {
+    fn parse_new_v2_defined() {
         let mut data = vec![
             0x02, // version 2
             0x01, // alloc time
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_new_v3_undefined() {
+    fn parse_new_v3_undefined() {
         let data = [
             0x03, // version 3
             0x20, // flags: undefined bit set

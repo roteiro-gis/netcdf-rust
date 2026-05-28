@@ -6,6 +6,12 @@
 //! - **CDF-5** (64-bit data): `CDF\x05` magic
 //! - **NetCDF-4** (HDF5-backed): `\x89HDF\r\n\x1a\n` magic (requires `netcdf4` feature)
 //!
+//! PnetCDF-produced CDF-1/2/5 files are supported as files. NetCDF-C files
+//! created through parallel NetCDF-4/HDF5 APIs are supported when the final
+//! HDF5 file uses supported HDF5 features. This crate does not implement
+//! MPI communicators, `nc_open_par`, `nc_create_par`, collective/independent
+//! access modes, PnetCDF subfiling, or write APIs.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -177,8 +183,7 @@ impl NcFile {
 
     /// Open a NetCDF file from a custom random-access storage backend.
     ///
-    /// NetCDF-4 files stay fully range-backed. Classic formats are read from
-    /// the provided storage into an owned buffer.
+    /// Both NetCDF-4 and classic CDF-1/2/5 files stay range-backed.
     #[cfg(feature = "netcdf4")]
     pub fn from_storage(storage: DynStorage) -> Result<Self> {
         Self::from_storage_with_options(storage, NcOpenOptions::default())
@@ -193,13 +198,7 @@ impl NcFile {
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
-                let len = usize::try_from(storage.len()).map_err(|_| {
-                    Error::InvalidData(
-                        "classic storage length exceeds platform usize capacity".into(),
-                    )
-                })?;
-                let bytes = storage.read_range(0, len)?;
-                let classic = classic::ClassicFile::from_bytes(bytes.as_ref(), format)?;
+                let classic = classic::ClassicFile::from_storage(storage, format)?;
                 Ok(NcFile {
                     format,
                     inner: NcFileInner::Classic(classic),
@@ -488,7 +487,7 @@ impl NcFile {
     #[cfg(feature = "rayon")]
     pub fn read_variable_parallel<T: NcReadable>(&self, name: &str) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            NcFileInner::Classic(c) => c.read_variable_parallel::<T>(name),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_parallel::<T>(name)?),
         }
@@ -504,7 +503,7 @@ impl NcFile {
         pool: &ThreadPool,
     ) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable::<T>(name),
+            NcFileInner::Classic(c) => pool.install(|| c.read_variable_parallel::<T>(name)),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_in_pool::<T>(name, pool)?),
         }
@@ -665,7 +664,7 @@ impl NcFile {
         selection: &NcSliceInfo,
     ) -> Result<ArrayD<T>> {
         match &self.inner {
-            NcFileInner::Classic(c) => c.read_variable_slice::<T>(name, selection),
+            NcFileInner::Classic(c) => c.read_variable_slice_parallel::<T>(name, selection),
             #[cfg(feature = "netcdf4")]
             NcFileInner::Nc4(n) => Ok(n.read_variable_slice_parallel::<T>(name, selection)?),
         }
@@ -902,34 +901,36 @@ mod tests {
     use super::*;
     #[cfg(feature = "netcdf4")]
     use std::sync::Arc;
+    #[cfg(feature = "netcdf4")]
+    use std::sync::Mutex;
 
     #[test]
-    fn test_detect_cdf1() {
+    fn detect_cdf1() {
         let data = b"CDF\x01rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Classic);
     }
 
     #[test]
-    fn test_detect_cdf2() {
+    fn detect_cdf2() {
         let data = b"CDF\x02rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Offset64);
     }
 
     #[test]
-    fn test_detect_cdf5() {
+    fn detect_cdf5() {
         let data = b"CDF\x05rest_of_file";
         assert_eq!(detect_format(data).unwrap(), NcFormat::Cdf5);
     }
 
     #[test]
-    fn test_detect_hdf5() {
+    fn detect_hdf5() {
         let mut data = vec![0x89, b'H', b'D', b'F', 0x0D, 0x0A, 0x1A, 0x0A];
         data.extend_from_slice(b"rest_of_file");
         assert_eq!(detect_format(&data).unwrap(), NcFormat::Nc4);
     }
 
     #[test]
-    fn test_detect_invalid_magic() {
+    fn detect_invalid_magic() {
         let data = b"XXXX";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -938,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_unsupported_version() {
+    fn detect_unsupported_version() {
         let data = b"CDF\x03";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -947,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_too_short() {
+    fn detect_too_short() {
         let data = b"CD";
         assert!(matches!(
             detect_format(data).unwrap_err(),
@@ -956,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes_minimal_cdf1() {
+    fn from_bytes_minimal_cdf1() {
         // Minimal valid CDF-1 file: magic + numrecs + absent dim/att/var lists.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -979,8 +980,235 @@ mod tests {
     }
 
     #[cfg(feature = "netcdf4")]
+    struct CountingStorage {
+        data: Arc<[u8]>,
+        reads: Mutex<Vec<(u64, usize)>>,
+    }
+
+    #[cfg(feature = "netcdf4")]
+    impl CountingStorage {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data: Arc::<[u8]>::from(data),
+                reads: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reads(&self) -> Vec<(u64, usize)> {
+            self.reads.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg(feature = "netcdf4")]
+    impl hdf5_reader::Storage for CountingStorage {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(
+            &self,
+            offset: u64,
+            len: usize,
+        ) -> hdf5_reader::error::Result<hdf5_reader::StorageBuffer> {
+            self.reads.lock().unwrap().push((offset, len));
+            let start = usize::try_from(offset)
+                .map_err(|_| hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+            let end = start
+                .checked_add(len)
+                .ok_or(hdf5_reader::error::Error::OffsetOutOfBounds(offset))?;
+            if end > self.data.len() {
+                return Err(hdf5_reader::error::Error::UnexpectedEof {
+                    offset,
+                    needed: len as u64,
+                    available: self.len().saturating_sub(offset),
+                });
+            }
+            Ok(hdf5_reader::StorageBuffer::from_vec(
+                self.data[start..end].to_vec(),
+            ))
+        }
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn classic_large_offset_fixture() -> Vec<u8> {
+        fn write_name(buf: &mut Vec<u8>, name: &str) {
+            buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            while buf.len() % 4 != 0 {
+                buf.push(0);
+            }
+        }
+
+        const DATA_OFFSET: usize = 70 * 1024;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_name(&mut buf, "x");
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_name(&mut buf, "data");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&16u32.to_be_bytes());
+        buf.extend_from_slice(&(DATA_OFFSET as u32).to_be_bytes());
+
+        buf.resize(DATA_OFFSET, 0);
+        for value in [10i32, 20, 30, 40] {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+        buf
+    }
+
+    fn write_cdf1_name(buf: &mut Vec<u8>, name: &str) {
+        buf.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn write_cdf5_count(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn write_cdf5_name(buf: &mut Vec<u8>, name: &str) {
+        write_cdf5_count(buf, name.len() as u64);
+        buf.extend_from_slice(name.as_bytes());
+        while buf.len() % 4 != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn cdf5_huge_dimension_fixture() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x05");
+        write_cdf5_count(&mut buf, 0);
+
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_name(&mut buf, "n");
+        write_cdf5_count(&mut buf, u64::MAX);
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 0);
+
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_name(&mut buf, "big");
+        write_cdf5_count(&mut buf, 1);
+        write_cdf5_count(&mut buf, 0);
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 0);
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        write_cdf5_count(&mut buf, 4);
+        let offset_pos = buf.len();
+        buf.extend_from_slice(&0u64.to_be_bytes());
+
+        let data_offset = buf.len() as u64;
+        buf[offset_pos..offset_pos + 8].copy_from_slice(&data_offset.to_be_bytes());
+        buf.extend_from_slice(&123i32.to_be_bytes());
+        buf
+    }
+
+    fn subfiling_marker_fixture() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Cu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "_PnetCDF_SubFiling_enabled");
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&1i32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf
+    }
+
     #[test]
-    fn test_from_storage_minimal_cdf1() {
+    fn cdf5_huge_dimension_can_slice_but_full_read_errors_cleanly() {
+        let file = NcFile::from_bytes(&cdf5_huge_dimension_fixture()).unwrap();
+        let selection = NcSliceInfo {
+            selections: vec![NcSliceInfoElem::Index(0)],
+        };
+
+        let sliced: ndarray::ArrayD<i32> = file.read_variable_slice("big", &selection).unwrap();
+        assert_eq!(sliced.as_slice().unwrap(), &[123]);
+
+        let err = file.read_variable::<i32>("big").unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn classic_subfiling_marker_returns_unsupported_feature() {
+        let err = match NcFile::from_bytes(&subfiling_marker_fixture()) {
+            Ok(_) => panic!("subfiling marker should be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            Error::UnsupportedFeature(message) if message.contains("PnetCDF subfiling")
+        ));
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn classic_from_storage_keeps_open_range_backed() {
+        let data = classic_large_offset_fixture();
+        let full_len = data.len();
+        let storage = Arc::new(CountingStorage::new(data));
+
+        let file = NcFile::from_storage(storage.clone()).unwrap();
+        assert_eq!(file.format(), NcFormat::Classic);
+        assert!(!storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| offset == 0 && len == full_len));
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("data").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20, 30, 40]);
+        assert!(storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| { offset == (70 * 1024) as u64 && len == 16 }));
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn classic_from_storage_slice_reads_planned_range() {
+        let storage = Arc::new(CountingStorage::new(classic_large_offset_fixture()));
+        let file = NcFile::from_storage(storage.clone()).unwrap();
+        let selection = NcSliceInfo {
+            selections: vec![NcSliceInfoElem::Slice {
+                start: 1,
+                end: 3,
+                step: 1,
+            }],
+        };
+
+        let values: ndarray::ArrayD<i32> = file.read_variable_slice("data", &selection).unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[20, 30]);
+        assert!(storage
+            .reads()
+            .iter()
+            .any(|&(offset, len)| { offset == (70 * 1024 + 4) as u64 && len == 8 }));
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn from_storage_minimal_cdf1() {
         // Minimal valid CDF-1 file: magic + numrecs + absent dim/att/var lists.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -1004,7 +1232,7 @@ mod tests {
 
     #[cfg(feature = "netcdf4")]
     #[test]
-    fn test_from_storage_short_input_reports_invalid_magic() {
+    fn from_storage_short_input_reports_invalid_magic() {
         let err = NcFile::from_storage(Arc::new(BytesStorage::new(vec![b'C', b'D'])))
             .err()
             .expect("short storage should not parse as NetCDF");
@@ -1012,7 +1240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_bytes_cdf1_with_data() {
+    fn from_bytes_cdf1_with_data() {
         // Build a CDF-1 file with one dimension, one global attribute, and one variable.
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
@@ -1098,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_not_found() {
+    fn variable_not_found() {
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
         data.extend_from_slice(&0u32.to_be_bytes());
@@ -1118,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_not_found() {
+    fn group_not_found() {
         let mut data = Vec::new();
         data.extend_from_slice(b"CDF\x01");
         data.extend_from_slice(&0u32.to_be_bytes());
