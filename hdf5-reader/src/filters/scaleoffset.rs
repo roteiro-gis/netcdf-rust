@@ -89,6 +89,22 @@ impl<'a> BitReader<'a> {
 }
 
 pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
+    decompress_inner(data, client_data, None)
+}
+
+pub fn decompress_with_limit(
+    data: &[u8],
+    client_data: &[u32],
+    max_output_len: usize,
+) -> Result<Vec<u8>> {
+    decompress_inner(data, client_data, Some(max_output_len))
+}
+
+fn decompress_inner(
+    data: &[u8],
+    client_data: &[u32],
+    max_output_len: Option<usize>,
+) -> Result<Vec<u8>> {
     let params = parse_params(client_data)?;
     let full_width_bits = params
         .size
@@ -100,6 +116,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     if params.scale_type != SCALE_FLOAT_DSCALE && params.scale_factor as usize == full_width_bits {
+        validate_output_limit(data.len(), max_output_len)?;
         return Ok(data.to_vec());
     }
 
@@ -145,6 +162,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
         .element_count
         .checked_mul(params.size)
         .ok_or_else(|| filter_error("scaleoffset output size overflowed"))?;
+    validate_output_limit(total_size, max_output_len)?;
     let mut out = vec![0u8; total_size];
 
     if minbits == full_width_bits {
@@ -181,6 +199,17 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+fn validate_output_limit(len: usize, max_output_len: Option<usize>) -> Result<()> {
+    if let Some(max_output_len) = max_output_len {
+        if len > max_output_len {
+            return Err(filter_error(&format!(
+                "scaleoffset output size {len} exceeds limit {max_output_len}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_params(client_data: &[u32]) -> Result<ScaleOffsetParams<'_>> {

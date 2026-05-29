@@ -287,8 +287,7 @@ fn validate_decoded_chunk_len(
     elem_size: usize,
     actual_len: usize,
 ) -> Result<()> {
-    let chunk_elements = checked_shape_elements_usize(chunk_shape, "decoded chunk element count")?;
-    let expected_len = checked_mul_usize(chunk_elements, elem_size, "decoded chunk byte length")?;
+    let expected_len = decoded_chunk_expected_len(chunk_shape, elem_size)?;
     if actual_len != expected_len {
         return Err(Error::InvalidData(format!(
             "chunk at offsets {:?} decoded to {} bytes, expected {} bytes",
@@ -296,6 +295,11 @@ fn validate_decoded_chunk_len(
         )));
     }
     Ok(())
+}
+
+fn decoded_chunk_expected_len(chunk_shape: &[u64], elem_size: usize) -> Result<usize> {
+    let chunk_elements = checked_shape_elements_usize(chunk_shape, "decoded chunk element count")?;
+    checked_mul_usize(chunk_elements, elem_size, "decoded chunk byte length")
 }
 
 fn validate_chunk_grid_coverage(
@@ -2128,24 +2132,26 @@ impl Dataset {
             dataset_addr,
             chunk_offsets: smallvec::SmallVec::from_slice(&entry.offsets),
         };
+        let expected_len = decoded_chunk_expected_len(chunk_shape, elem_size)?;
+        let filter_output_limit =
+            checked_add_usize(expected_len, 1, "decoded chunk filter output limit")?;
 
         self.chunk_cache.get_or_insert_with(cache_key, || {
             let size = if entry.size > 0 {
                 checked_usize(entry.size, "encoded chunk size")?
             } else {
-                let chunk_elements =
-                    checked_shape_elements_usize(chunk_shape, "chunk element count")?;
-                checked_mul_usize(chunk_elements, elem_size, "chunk byte size")?
+                expected_len
             };
             let raw = self.context.read_range(entry.address, size)?;
 
             if let Some(ref pipeline) = self.filters {
-                filters::apply_pipeline(
+                filters::apply_pipeline_with_limit(
                     raw.as_ref(),
                     &pipeline.filters,
                     entry.filter_mask,
                     elem_size,
                     Some(&self.filter_registry),
+                    Some(filter_output_limit),
                 )
             } else {
                 Ok(raw.to_vec())

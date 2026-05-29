@@ -4,6 +4,8 @@
 
 - Hardened HDF5 external raw data handling so filesystem resolution is opt-in
   and confined to relative paths under the resolver base directory.
+- Limited filtered HDF5 chunk and fractal-heap decompression to the expected
+  decoded size plus one byte before final size validation.
 
 ## 0.6.0 - 2026-05-28
 

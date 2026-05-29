@@ -138,6 +138,22 @@ impl<'a> BitReader<'a> {
 }
 
 pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
+    decompress_inner(data, client_data, None)
+}
+
+pub fn decompress_with_limit(
+    data: &[u8],
+    client_data: &[u32],
+    max_output_len: usize,
+) -> Result<Vec<u8>> {
+    decompress_inner(data, client_data, Some(max_output_len))
+}
+
+fn decompress_inner(
+    data: &[u8],
+    client_data: &[u32],
+    max_output_len: Option<usize>,
+) -> Result<Vec<u8>> {
     if client_data.len() < 3 {
         return Err(filter_error("nbit filter is missing required client data"));
     }
@@ -150,6 +166,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     if client_data[1] != 0 {
+        validate_output_limit(data.len(), max_output_len)?;
         return Ok(data.to_vec());
     }
 
@@ -166,6 +183,7 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     let total_size = element_count
         .checked_mul(size)
         .ok_or_else(|| filter_error("nbit output size overflowed"))?;
+    validate_output_limit(total_size, max_output_len)?;
     let mut out = vec![0u8; total_size];
     let mut bits = BitReader::new(data);
 
@@ -174,6 +192,17 @@ pub fn decompress(data: &[u8], client_data: &[u32]) -> Result<Vec<u8>> {
     }
 
     Ok(out)
+}
+
+fn validate_output_limit(len: usize, max_output_len: Option<usize>) -> Result<()> {
+    if let Some(max_output_len) = max_output_len {
+        if len > max_output_len {
+            return Err(filter_error(&format!(
+                "nbit output size {len} exceeds limit {max_output_len}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_desc(params: &[u32], index: &mut usize) -> Result<TypeDesc> {

@@ -27,12 +27,17 @@ pub const FILTER_LZ4: u16 = 32004;
 /// the decoded output.
 pub type FilterFn = Box<dyn Fn(&FilterDescription, &[u8], usize) -> Result<Vec<u8>> + Send + Sync>;
 
+enum FilterImplementation {
+    Builtin,
+    Custom(FilterFn),
+}
+
 /// A registry of filter implementations.
 ///
 /// Comes pre-loaded with deflate, shuffle, and fletcher32. Users can register
 /// additional filters (e.g., Blosc, LZ4, ZFP) before reading datasets.
 pub struct FilterRegistry {
-    filters: HashMap<u16, FilterFn>,
+    filters: HashMap<u16, FilterImplementation>,
 }
 
 impl FilterRegistry {
@@ -41,36 +46,25 @@ impl FilterRegistry {
         let mut registry = FilterRegistry {
             filters: HashMap::new(),
         };
-        registry.register(
-            FILTER_DEFLATE,
-            Box::new(|_, data, _| deflate::decompress(data)),
-        );
-        registry.register(
-            FILTER_SHUFFLE,
-            Box::new(|_, data, elem_size| Ok(shuffle::unshuffle(data, elem_size))),
-        );
-        registry.register(
-            FILTER_FLETCHER32,
-            Box::new(|_, data, _| fletcher32::verify_and_strip(data)),
-        );
-        registry.register(
-            FILTER_NBIT,
-            Box::new(|filter, data, _| nbit::decompress(data, &filter.client_data)),
-        );
-        registry.register(
-            FILTER_SCALEOFFSET,
-            Box::new(|filter, data, _| scaleoffset::decompress(data, &filter.client_data)),
-        );
+        registry.register_builtin(FILTER_DEFLATE);
+        registry.register_builtin(FILTER_SHUFFLE);
+        registry.register_builtin(FILTER_FLETCHER32);
+        registry.register_builtin(FILTER_NBIT);
+        registry.register_builtin(FILTER_SCALEOFFSET);
         #[cfg(feature = "lz4")]
-        registry.register(FILTER_LZ4, Box::new(|_, data, _| lz4::decompress(data)));
+        registry.register_builtin(FILTER_LZ4);
         registry
+    }
+
+    fn register_builtin(&mut self, id: u16) {
+        self.filters.insert(id, FilterImplementation::Builtin);
     }
 
     /// Register a custom filter implementation for the given filter ID.
     ///
     /// Overwrites any previously registered filter with the same ID.
     pub fn register(&mut self, id: u16, f: FilterFn) {
-        self.filters.insert(id, f);
+        self.filters.insert(id, FilterImplementation::Custom(f));
     }
 
     /// Apply a single filter by ID.
@@ -80,8 +74,23 @@ impl FilterRegistry {
         data: &[u8],
         element_size: usize,
     ) -> Result<Vec<u8>> {
+        self.apply_with_limit(filter, data, element_size, None)
+    }
+
+    /// Apply a single filter by ID, passing a maximum decoded output length to
+    /// built-in filters that can enforce it while decoding.
+    pub fn apply_with_limit(
+        &self,
+        filter: &FilterDescription,
+        data: &[u8],
+        element_size: usize,
+        max_output_len: Option<usize>,
+    ) -> Result<Vec<u8>> {
         match self.filters.get(&filter.id) {
-            Some(f) => f(filter, data, element_size),
+            Some(FilterImplementation::Builtin) => {
+                apply_builtin_filter_with_limit(filter, data, element_size, max_output_len)
+            }
+            Some(FilterImplementation::Custom(f)) => f(filter, data, element_size),
             None => Err(Error::UnsupportedFilter(format!("filter id {}", filter.id))),
         }
     }
@@ -108,7 +117,21 @@ pub fn apply_pipeline(
     element_size: usize,
     registry: Option<&FilterRegistry>,
 ) -> Result<Vec<u8>> {
-    // Count active filters to decide on single-buffer vs double-buffer strategy.
+    apply_pipeline_with_limit(data, filters, filter_mask, element_size, registry, None)
+}
+
+/// Apply the filter pipeline in reverse (decompression direction) to a chunk,
+/// passing a maximum decoded output length to built-in filters that support
+/// bounded decompression.
+pub fn apply_pipeline_with_limit(
+    data: &[u8],
+    filters: &[FilterDescription],
+    filter_mask: u32,
+    element_size: usize,
+    registry: Option<&FilterRegistry>,
+    max_output_len: Option<usize>,
+) -> Result<Vec<u8>> {
+    // Count active filters so an all-skipped pipeline can avoid the loop.
     let active_count = filters
         .iter()
         .enumerate()
@@ -117,21 +140,8 @@ pub fn apply_pipeline(
         .count();
 
     if active_count == 0 {
+        validate_output_limit("filter pipeline", data.len(), max_output_len)?;
         return Ok(data.to_vec());
-    }
-
-    // For a single active filter, avoid the double-buffer overhead.
-    if active_count == 1 {
-        for (i, filter) in filters.iter().enumerate().rev() {
-            if filter_mask & (1 << i) != 0 {
-                continue;
-            }
-            return if let Some(reg) = registry {
-                reg.apply(filter, data, element_size)
-            } else {
-                apply_builtin_filter(filter, data, element_size)
-            };
-        }
     }
 
     // Multi-filter pipeline: the first stage reads from the borrowed input
@@ -151,36 +161,69 @@ pub fn apply_pipeline(
         };
 
         owned = Some(if let Some(reg) = registry {
-            reg.apply(filter, input, element_size)?
+            reg.apply_with_limit(filter, input, element_size, max_output_len)?
         } else {
-            apply_builtin_filter(filter, input, element_size)?
+            apply_builtin_filter_with_limit(filter, input, element_size, max_output_len)?
         });
     }
 
-    Ok(owned.unwrap_or_else(|| data.to_vec()))
+    let output = owned.unwrap_or_else(|| data.to_vec());
+    validate_output_limit("filter pipeline", output.len(), max_output_len)?;
+    Ok(output)
 }
 
-fn apply_builtin_filter(
+fn apply_builtin_filter_with_limit(
     filter: &FilterDescription,
     data: &[u8],
     element_size: usize,
+    max_output_len: Option<usize>,
 ) -> Result<Vec<u8>> {
     match filter.id {
-        FILTER_DEFLATE => deflate::decompress(data),
+        FILTER_DEFLATE => match max_output_len {
+            Some(max_output_len) => deflate::decompress_with_limit(data, max_output_len),
+            None => deflate::decompress(data),
+        },
         FILTER_SHUFFLE => Ok(shuffle::unshuffle(data, element_size)),
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
         FILTER_SZIP => Err(Error::UnsupportedFilter("szip".into())),
-        FILTER_NBIT => nbit::decompress(data, &filter.client_data),
-        FILTER_SCALEOFFSET => scaleoffset::decompress(data, &filter.client_data),
+        FILTER_NBIT => match max_output_len {
+            Some(max_output_len) => {
+                nbit::decompress_with_limit(data, &filter.client_data, max_output_len)
+            }
+            None => nbit::decompress(data, &filter.client_data),
+        },
+        FILTER_SCALEOFFSET => match max_output_len {
+            Some(max_output_len) => {
+                scaleoffset::decompress_with_limit(data, &filter.client_data, max_output_len)
+            }
+            None => scaleoffset::decompress(data, &filter.client_data),
+        },
         #[cfg(feature = "lz4")]
-        FILTER_LZ4 => lz4::decompress(data),
+        FILTER_LZ4 => match max_output_len {
+            Some(max_output_len) => lz4::decompress_with_limit(data, max_output_len),
+            None => lz4::decompress(data),
+        },
         id => Err(Error::UnsupportedFilter(format!("filter id {}", id))),
     }
+}
+
+fn validate_output_limit(context: &str, len: usize, max_output_len: Option<usize>) -> Result<()> {
+    if let Some(max_output_len) = max_output_len {
+        if len > max_output_len {
+            return Err(Error::DecompressionError(format!(
+                "{context} decoded to {len} bytes, limit {max_output_len}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
 
     #[test]
     fn filter_registry_default() {
@@ -217,5 +260,40 @@ mod tests {
         };
         let err = registry.apply(&filter, &[1, 2, 3], 1).unwrap_err();
         assert!(matches!(err, Error::UnsupportedFilter(_)));
+    }
+
+    #[test]
+    fn apply_pipeline_with_limit_caps_registry_deflate_output() {
+        let original = vec![0u8; 4096];
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let filter = FilterDescription {
+            id: FILTER_DEFLATE,
+            name: None,
+            client_data: vec![6],
+        };
+        let registry = FilterRegistry::new();
+
+        let decoded =
+            apply_pipeline_with_limit(&compressed, &[filter], 0, 1, Some(&registry), Some(65))
+                .unwrap();
+
+        assert_eq!(decoded.len(), 65);
+        assert_eq!(decoded, original[..65]);
+    }
+
+    #[test]
+    fn apply_pipeline_with_limit_rejects_oversized_final_output() {
+        let filter = FilterDescription {
+            id: FILTER_SHUFFLE,
+            name: None,
+            client_data: Vec::new(),
+        };
+
+        let err =
+            apply_pipeline_with_limit(&[1, 2, 3, 4], &[filter], 0, 1, None, Some(3)).unwrap_err();
+
+        assert!(err.to_string().contains("limit 3"));
     }
 }

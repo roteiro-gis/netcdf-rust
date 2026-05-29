@@ -13,15 +13,38 @@ use crate::error::{Error, Result};
 
 /// Decompress HDF5 LZ4-filtered data.
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    decompress_inner(data, None)
+}
+
+/// Decompress HDF5 LZ4-filtered data, rejecting declared output sizes above
+/// `max_output_len` before allocating the output buffer.
+pub fn decompress_with_limit(data: &[u8], max_output_len: usize) -> Result<Vec<u8>> {
+    decompress_inner(data, Some(max_output_len))
+}
+
+fn decompress_inner(data: &[u8], max_output_len: Option<usize>) -> Result<Vec<u8>> {
     if data.len() < 8 {
         return Err(Error::DecompressionError(
             "LZ4: input too short for header".into(),
         ));
     }
 
-    let orig_size = u64::from_be_bytes([
+    let declared_orig_size = u64::from_be_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]) as usize;
+    ]);
+    let orig_size = usize::try_from(declared_orig_size).map_err(|_| {
+        Error::DecompressionError(format!(
+            "LZ4: declared output size {declared_orig_size} exceeds platform usize capacity"
+        ))
+    })?;
+    if let Some(max_output_len) = max_output_len {
+        if orig_size > max_output_len {
+            return Err(Error::DecompressionError(format!(
+                "LZ4: declared output size {orig_size} exceeds limit {max_output_len}"
+            )));
+        }
+    }
+
     let mut output = Vec::with_capacity(orig_size);
     let mut pos = 8;
 
@@ -39,6 +62,16 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
         let compressed_size =
             u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
+
+        let block_end = output
+            .len()
+            .checked_add(orig_block_size)
+            .ok_or_else(|| Error::DecompressionError("LZ4: block output size overflowed".into()))?;
+        if block_end > orig_size {
+            return Err(Error::DecompressionError(
+                "LZ4: block output exceeds declared output size".into(),
+            ));
+        }
 
         if pos + compressed_size > data.len() {
             return Err(Error::DecompressionError(
@@ -108,5 +141,24 @@ mod tests {
         data.extend_from_slice(&100u32.to_be_bytes()); // compressed_size = 100
         data.extend_from_slice(&[0; 5]); // only 5 bytes of "100"
         assert!(decompress(&data).is_err());
+    }
+
+    #[test]
+    fn lz4_declared_size_above_limit_errors_before_allocation() {
+        let data = (4096u64).to_be_bytes();
+        let err = decompress_with_limit(&data, 32).unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[test]
+    fn lz4_block_cannot_exceed_declared_size() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&4u64.to_be_bytes());
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(&8u32.to_be_bytes());
+        data.extend_from_slice(&[0; 8]);
+
+        let err = decompress(&data).unwrap_err();
+        assert!(err.to_string().contains("exceeds declared output size"));
     }
 }
