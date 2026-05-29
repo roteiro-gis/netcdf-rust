@@ -776,7 +776,8 @@ pub struct NcOpenOptions {
     /// Custom filter registry (NC4 only).
     #[cfg(feature = "netcdf4")]
     pub filter_registry: Option<hdf5_reader::FilterRegistry>,
-    /// Resolver for HDF5 external raw data files (NC4 only).
+    /// Resolver for HDF5 external raw data files (NC4 only). If `None`,
+    /// external raw data files are not resolved.
     #[cfg(feature = "netcdf4")]
     pub external_file_resolver: Option<Arc<dyn hdf5_reader::ExternalFileResolver>>,
     /// Resolver for HDF5 external links (NC4 only).

@@ -156,6 +156,27 @@ netcdf-reader = { version = "0.6", default-features = false }  # CDF-1/2/5 only
 | `lz4` | yes | LZ4 filter support (hdf5-reader) |
 | `cf` | no | CF Conventions helpers (axis identification, time decoding, CRS extraction, bounds) |
 
+## External Raw Data Files
+
+HDF5 external raw data files are not resolved by default. To allow them for
+trusted files, opt in with a resolver rooted at the directory that should
+contain the external data. The filesystem resolver rejects absolute paths,
+`..`, and canonical paths that escape that root.
+
+```rust
+use std::path::Path;
+use std::sync::Arc;
+
+use hdf5_reader::{FilesystemExternalFileResolver, Hdf5File, OpenOptions};
+
+let path = Path::new("data.h5");
+let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+let file = Hdf5File::open_with_options(path, OpenOptions {
+    external_file_resolver: Some(Arc::new(FilesystemExternalFileResolver::new(base_dir))),
+    ..Default::default()
+})?;
+```
+
 ## Custom filters
 
 Register filters before opening files:

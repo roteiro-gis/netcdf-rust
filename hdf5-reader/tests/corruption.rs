@@ -3,10 +3,13 @@
 //! These tests programmatically construct or manipulate byte sequences to verify
 //! that the reader returns specific error types instead of panicking.
 
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use hdf5_reader::checksum::jenkins_lookup3;
 use hdf5_reader::error::Error;
 use hdf5_reader::superblock::HDF5_MAGIC;
 use hdf5_reader::Hdf5File;
+use std::io::Write;
 use std::path::Path;
 
 /// Extract the `Err` from a result, panicking if `Ok`.
@@ -607,6 +610,42 @@ fn duplicate_chunk_offsets_error_in_full_chunk_fast_path() {
     assert!(
         error_chain_contains_invalid_data(&err, "duplicate chunk output offsets"),
         "expected duplicate chunk offset error, got: {err}"
+    );
+}
+
+#[test]
+fn deflate_chunk_bomb_stops_at_expected_length_plus_one() {
+    let mut bytes = match fixture_bytes("simple_chunked_deflate.h5") {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: fixture simple_chunked_deflate.h5 not found");
+            return;
+        }
+    };
+
+    let btree =
+        find_raw_chunk_btree(&bytes, 4).expect("fixture should contain a 4-entry chunk B-tree");
+    let key0 = btree + 24;
+    let child0 = key0 + 32;
+    let original_chunk_size =
+        u32::from_le_bytes(bytes[key0..key0 + 4].try_into().unwrap()) as usize;
+    let chunk_address = u64::from_le_bytes(bytes[child0..child0 + 8].try_into().unwrap()) as usize;
+
+    let bomb = vec![0u8; 4096];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&bomb).unwrap();
+    let compressed_bomb = encoder.finish().unwrap();
+    assert!(compressed_bomb.len() <= original_chunk_size);
+
+    bytes[key0..key0 + 4].copy_from_slice(&(compressed_bomb.len() as u32).to_le_bytes());
+    bytes[chunk_address..chunk_address + compressed_bomb.len()].copy_from_slice(&compressed_bomb);
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("/temperature").unwrap();
+    let err = expect_err(dataset.read_array::<f32>());
+    assert!(
+        error_chain_contains_invalid_data(&err, "decoded to 201 bytes, expected 200 bytes"),
+        "expected capped decoded chunk length error, got: {err}"
     );
 }
 

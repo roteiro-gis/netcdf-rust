@@ -370,7 +370,16 @@ fn fill_value() {
 #[test]
 fn external_raw_data_file() {
     let path = skip_if_missing!("external_raw.h5");
-    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let file = hdf5_reader::Hdf5File::open_with_options(
+        &path,
+        hdf5_reader::OpenOptions {
+            external_file_resolver: Some(Arc::new(
+                hdf5_reader::FilesystemExternalFileResolver::new(path.parent().unwrap()),
+            )),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let ds = file.dataset("/data").unwrap();
     let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
@@ -385,6 +394,17 @@ fn external_raw_data_file() {
     };
     let sliced: ndarray::ArrayD<i32> = ds.read_slice(&selection).unwrap();
     assert_eq!(sliced.as_slice().unwrap(), &[3, 4, 5, 6]);
+}
+
+#[test]
+fn external_raw_data_file_requires_resolver() {
+    let path = skip_if_missing!("external_raw.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    let result: hdf5_reader::error::Result<ndarray::ArrayD<i32>> = ds.read_array();
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("could not be resolved"));
 }
 
 #[test]

@@ -682,11 +682,22 @@ impl FractalHeap {
         filter_registry: Option<&FilterRegistry>,
     ) -> Result<Vec<u8>> {
         let pipeline = self.filter_pipeline()?;
-        let decoded =
-            filters::apply_pipeline(bytes, &pipeline.filters, filter_mask, 1, filter_registry)?;
         let expected = usize::try_from(expected_len).map_err(|_| {
             Error::InvalidData(format!("{context} size exceeds platform usize capacity"))
         })?;
+        let filter_output_limit = expected.checked_add(1).ok_or_else(|| {
+            Error::InvalidData(format!(
+                "{context} filter output limit exceeds platform usize capacity"
+            ))
+        })?;
+        let decoded = filters::apply_pipeline_with_limit(
+            bytes,
+            &pipeline.filters,
+            filter_mask,
+            1,
+            filter_registry,
+            Some(filter_output_limit),
+        )?;
         if decoded.len() != expected {
             return Err(Error::InvalidData(format!(
                 "{context} decoded to {} bytes, expected {} bytes",

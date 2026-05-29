@@ -36,7 +36,8 @@ pub mod filters;
 pub mod cache;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use memmap2::Mmap;
@@ -76,7 +77,8 @@ pub struct OpenOptions {
     pub chunk_cache_slots: usize,
     /// Custom filter registry. If `None`, the default built-in filters are used.
     pub filter_registry: Option<FilterRegistry>,
-    /// Resolver for HDF5 external raw data files.
+    /// Resolver for HDF5 external raw data files. If `None`, external raw data
+    /// files are not resolved.
     pub external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
     /// Optional resolver for HDF5 external links.
     pub external_link_resolver: Option<Arc<dyn ExternalLinkResolver>>,
@@ -104,6 +106,54 @@ pub trait ExternalLinkResolver: Send + Sync {
     fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>>;
 }
 
+fn resolve_path_within_base(
+    base_dir: &Path,
+    filename: &str,
+    description: &str,
+) -> Result<Option<PathBuf>> {
+    let path = Path::new(filename);
+    if path.as_os_str().is_empty() {
+        return Err(Error::InvalidData(format!("{description} path is empty")));
+    }
+
+    if path.is_absolute() {
+        return Err(Error::InvalidData(format!(
+            "{description} path must be relative: {filename}"
+        )));
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(Error::InvalidData(format!(
+            "{description} path must stay within the resolver base directory: {filename}"
+        )));
+    }
+
+    let base = match base_dir.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let candidate = base.join(path);
+    let resolved = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    if !resolved.starts_with(&base) {
+        return Err(Error::InvalidData(format!(
+            "{description} path escapes the resolver base directory: {filename}"
+        )));
+    }
+
+    Ok(Some(resolved))
+}
+
 /// Filesystem resolver for external raw data files.
 #[derive(Debug, Clone)]
 pub struct FilesystemExternalFileResolver {
@@ -117,22 +167,16 @@ impl FilesystemExternalFileResolver {
         }
     }
 
-    fn path_for(&self, filename: &str) -> PathBuf {
-        let path = Path::new(filename);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        }
+    fn path_for(&self, filename: &str) -> Result<Option<PathBuf>> {
+        resolve_path_within_base(&self.base_dir, filename, "external raw data file")
     }
 }
 
 impl ExternalFileResolver for FilesystemExternalFileResolver {
     fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>> {
-        let path = self.path_for(filename);
-        if !path.exists() {
+        let Some(path) = self.path_for(filename)? else {
             return Ok(None);
-        }
+        };
         Ok(Some(Arc::new(FileStorage::open(path)?)))
     }
 }
@@ -366,15 +410,6 @@ impl Hdf5File {
     /// Open an HDF5 file with custom options.
     pub fn open_with_options(path: impl AsRef<Path>, options: OpenOptions) -> Result<Self> {
         let path = path.as_ref();
-        let mut options = options;
-        if options.external_file_resolver.is_none() {
-            let base_dir = path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            options.external_file_resolver =
-                Some(Arc::new(FilesystemExternalFileResolver::new(base_dir)));
-        }
         Self::from_storage_with_options(Arc::new(FileStorage::open(path)?), options)
     }
 
@@ -519,6 +554,7 @@ mod tests {
         let opts = OpenOptions::default();
         assert_eq!(opts.chunk_cache_bytes, 64 * 1024 * 1024);
         assert_eq!(opts.chunk_cache_slots, 521);
+        assert!(opts.external_file_resolver.is_none());
     }
 
     #[test]
@@ -541,5 +577,50 @@ mod tests {
             .expect("raw file should resolve");
         let bytes = storage.read_range(2, 3).unwrap();
         assert_eq!(bytes.as_ref(), b"cde");
+    }
+
+    #[test]
+    fn filesystem_external_file_resolver_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+        let err = match resolver.resolve_external_file(path.to_str().unwrap()) {
+            Ok(_) => panic!("absolute external file path should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn filesystem_external_file_resolver_rejects_parent_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+
+        let err = match resolver.resolve_external_file("../raw.bin") {
+            Ok(_) => panic!("parent external file path should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("resolver base directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_external_file_resolver_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("raw.bin");
+        std::fs::write(&outside_path, b"abcdef").unwrap();
+        symlink(&outside_path, dir.path().join("raw.bin")).unwrap();
+
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+        let err = match resolver.resolve_external_file("raw.bin") {
+            Ok(_) => panic!("symlink escape should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("escapes"));
     }
 }
