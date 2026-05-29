@@ -141,9 +141,7 @@ fn resolve_path_within_base(
     let candidate = base.join(path);
     let resolved = match candidate.canonicalize() {
         Ok(path) => path,
-        Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
-            return Ok(None);
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
 

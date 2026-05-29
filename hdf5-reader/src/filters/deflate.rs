@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use std::io::Read;
 
 /// Decompress DEFLATE/zlib-compressed data.
@@ -14,19 +15,32 @@ pub fn decompress_with_limit(data: &[u8], max_output_len: usize) -> Result<Vec<u
 }
 
 fn decompress_inner(data: &[u8], max_output_len: Option<usize>) -> Result<Vec<u8>> {
+    if let Some(max_output_len) = max_output_len {
+        return decompress_bounded(data, max_output_len);
+    }
+
     let mut decoder = ZlibDecoder::new(data);
     let mut output = Vec::new();
-    if let Some(max_output_len) = max_output_len {
-        decoder
-            .take(max_output_len as u64)
-            .read_to_end(&mut output)
-            .map_err(|e| Error::DecompressionError(format!("DEFLATE decompression failed: {e}")))?;
-    } else {
-        decoder
-            .read_to_end(&mut output)
-            .map_err(|e| Error::DecompressionError(format!("DEFLATE decompression failed: {e}")))?;
-    }
+    decoder
+        .read_to_end(&mut output)
+        .map_err(|e| Error::DecompressionError(format!("DEFLATE decompression failed: {e}")))?;
     Ok(output)
+}
+
+fn decompress_bounded(data: &[u8], max_output_len: usize) -> Result<Vec<u8>> {
+    let mut decoder = Decompress::new(true);
+    let mut output = Vec::with_capacity(max_output_len);
+    let status = decoder
+        .decompress_vec(data, &mut output, FlushDecompress::Finish)
+        .map_err(|e| Error::DecompressionError(format!("DEFLATE decompression failed: {e}")))?;
+
+    if matches!(status, Status::StreamEnd) || output.len() == max_output_len {
+        return Ok(output);
+    }
+
+    Err(Error::DecompressionError(
+        "DEFLATE decompression failed: stream did not finish".into(),
+    ))
 }
 
 #[cfg(test)]

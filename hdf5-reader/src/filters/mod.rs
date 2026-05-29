@@ -144,6 +144,22 @@ pub fn apply_pipeline_with_limit(
         return Ok(data.to_vec());
     }
 
+    // For a single active filter, avoid the double-buffer loop overhead.
+    if active_count == 1 {
+        for (i, filter) in filters.iter().enumerate().rev() {
+            if filter_mask & (1 << i) != 0 {
+                continue;
+            }
+            let output = if let Some(reg) = registry {
+                reg.apply_with_limit(filter, data, element_size, max_output_len)?
+            } else {
+                apply_builtin_filter_with_limit(filter, data, element_size, max_output_len)?
+            };
+            validate_output_limit("filter pipeline", output.len(), max_output_len)?;
+            return Ok(output);
+        }
+    }
+
     // Multi-filter pipeline: the first stage reads from the borrowed input
     // slice (avoiding a copy), subsequent stages consume the previous output.
     // Each filter stage necessarily allocates (output sizes are unpredictable),
