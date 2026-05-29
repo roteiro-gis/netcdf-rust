@@ -6,6 +6,8 @@
   and confined to relative paths under the resolver base directory.
 - Limited filtered HDF5 chunk and fractal-heap decompression to the expected
   decoded size plus one byte before final size validation.
+- Replaced unchecked HDF5/NetCDF shape, array-type, and implicit chunk size
+  products with fallible overflow checks.
 
 ## 0.6.0 - 2026-05-28
 

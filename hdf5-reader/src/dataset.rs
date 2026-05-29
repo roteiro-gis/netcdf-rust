@@ -777,7 +777,9 @@ impl Dataset {
         let layout = normalize_layout(layout, &dataspace);
         let attr_fill_value = attributes
             .iter()
-            .find(|attr| attr.name == "_FillValue" && attr.dataspace.num_elements() == 1)
+            .find(|attr| {
+                attr.name == "_FillValue" && matches!(attr.dataspace.num_elements(), Ok(1))
+            })
             .map(|attr| FillValueMessage {
                 defined: !attr.raw_data.is_empty(),
                 fill_time: FillTime::IfSet,
@@ -876,14 +878,14 @@ impl Dataset {
                 entries: Vec::new(),
                 index_address: *address,
                 chunk_shape: dims.iter().map(|&d| d as u64).collect(),
-                elem_size: self.raw_element_size(),
+                elem_size: self.raw_element_size()?,
                 next: 0,
             });
         }
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = self.raw_element_size();
+        let elem_size = self.raw_element_size()?;
         let chunk_shape: Vec<u64> = dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let entries = self.collect_chunk_entries(
@@ -963,7 +965,7 @@ impl Dataset {
             } => {
                 let raw = self.read_raw_bytes()?;
                 let elem_size = *len as usize;
-                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let count = checked_usize(self.num_elements()?, "dataset string element count")?;
                 let expected_bytes =
                     checked_mul_usize(count, elem_size, "dataset string byte size")?;
                 if raw.len() < expected_bytes {
@@ -989,7 +991,7 @@ impl Dataset {
                 padding,
             } => {
                 let raw = self.read_raw_bytes()?;
-                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let count = checked_usize(self.num_elements()?, "dataset string element count")?;
                 let ref_size = 4 + self.offset_size() as usize + 4;
                 let expected_bytes =
                     checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
@@ -1031,7 +1033,7 @@ impl Dataset {
                 }
 
                 let raw = self.read_raw_bytes()?;
-                let count = checked_usize(self.num_elements(), "dataset string element count")?;
+                let count = checked_usize(self.num_elements()?, "dataset string element count")?;
                 let ref_size = 4 + self.offset_size() as usize + 4;
                 let expected_bytes =
                     checked_mul_usize(count, ref_size, "dataset string reference byte size")?;
@@ -1067,16 +1069,8 @@ impl Dataset {
     }
 
     /// Total number of elements in the dataset.
-    pub fn num_elements(&self) -> u64 {
-        if self.dataspace.dims.is_empty() {
-            match self.dataspace.dataspace_type {
-                DataspaceType::Scalar => 1,
-                DataspaceType::Null => 0,
-                DataspaceType::Simple => 0,
-            }
-        } else {
-            self.dataspace.dims.iter().product()
-        }
+    pub fn num_elements(&self) -> Result<u64> {
+        self.dataspace.num_elements()
     }
 
     /// Read the entire dataset into an n-dimensional array.
@@ -1097,7 +1091,7 @@ impl Dataset {
     /// Read the entire dataset into a caller-provided typed buffer.
     pub fn read_into<T: H5Type>(&self, dst: &mut [T]) -> Result<()> {
         let result = (|| {
-            let element_count = checked_usize(self.num_elements(), "dataset element count")?;
+            let element_count = checked_usize(self.num_elements()?, "dataset element count")?;
             if dst.len() != element_count {
                 return Err(Error::InvalidData(format!(
                     "destination has {} elements, dataset requires {}",
@@ -1106,7 +1100,7 @@ impl Dataset {
                 )));
             }
 
-            let elem_size = self.raw_element_size();
+            let elem_size = self.raw_element_size()?;
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
                 let dst_bytes = unsafe {
                     std::slice::from_raw_parts_mut(
@@ -1246,8 +1240,8 @@ impl Dataset {
 
     /// Number of logical raw bytes in the entire dataset.
     pub fn raw_byte_len(&self) -> Result<usize> {
-        let elem_size = self.raw_element_size();
-        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let elem_size = self.raw_element_size()?;
+        let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
         checked_mul_usize(total_elements, elem_size, "dataset size in bytes")
     }
 
@@ -1330,7 +1324,7 @@ impl Dataset {
     ///
     /// Variable-length strings and sequences are stored as global-heap
     /// references whose width depends on the file offset size.
-    pub fn raw_element_size(&self) -> usize {
+    pub fn raw_element_size(&self) -> Result<usize> {
         raw_element_size_for_datatype(&self.datatype, self.vlen_reference_size())
     }
 
@@ -1390,8 +1384,8 @@ impl Dataset {
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
         if self.external_files.is_some() {
-            let elem_size = self.raw_element_size();
-            let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+            let elem_size = self.raw_element_size()?;
+            let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
             let total_bytes =
                 checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
             let raw = self.read_external_range(0, total_bytes)?;
@@ -1569,8 +1563,8 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = self.raw_element_size();
-        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let elem_size = self.raw_element_size()?;
+        let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
         if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
@@ -1735,7 +1729,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = self.raw_element_size();
+        let elem_size = self.raw_element_size()?;
 
         if dst.len() <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
             if let Some(cached_bytes) = self.full_dataset_bytes.get() {
@@ -1818,8 +1812,8 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = self.raw_element_size();
-        let total_elements = checked_usize(self.num_elements(), "dataset element count")?;
+        let elem_size = self.raw_element_size()?;
+        let total_elements = checked_usize(self.num_elements()?, "dataset element count")?;
         let total_bytes = checked_mul_usize(total_elements, elem_size, "dataset size in bytes")?;
 
         if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
@@ -2037,13 +2031,13 @@ impl Dataset {
                 chunk_dims,
                 selection.chunk_bounds,
             ),
-            Some(ChunkIndexing::Implicit) => Ok(chunk_index::collect_implicit_chunk_entries(
+            Some(ChunkIndexing::Implicit) => chunk_index::collect_implicit_chunk_entries(
                 index_address,
                 selection.shape,
                 chunk_dims,
                 selection.elem_size,
                 selection.chunk_bounds,
-            )),
+            ),
             Some(ChunkIndexing::FixedArray { .. }) => {
                 crate::fixed_array::collect_fixed_array_chunk_entries_storage(
                     self.context.storage.as_ref(),
@@ -2195,7 +2189,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = dtype_element_size(&self.datatype)?;
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
@@ -2431,7 +2425,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = dtype_element_size(&self.datatype)?;
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
@@ -2692,7 +2686,7 @@ impl Dataset {
             return self.read_contiguous::<T>(address, size);
         }
 
-        let elem_size = self.raw_element_size();
+        let elem_size = self.raw_element_size()?;
         let result_total_bytes = checked_mul_usize(
             resolved.result_elements,
             elem_size,
@@ -2740,7 +2734,7 @@ impl Dataset {
 
         let storage_len = if self.external_files.is_some() {
             checked_mul_usize(
-                checked_usize(self.num_elements(), "dataset element count")?,
+                checked_usize(self.num_elements()?, "dataset element count")?,
                 layout.elem_size,
                 "external dataset size",
             )?
@@ -2886,7 +2880,7 @@ impl Dataset {
         n: usize,
         shape: &[usize],
     ) -> Result<ArrayD<T>> {
-        let elem_size = self.raw_element_size();
+        let elem_size = self.raw_element_size()?;
         let expected_bytes = checked_mul_usize(n, elem_size, "decoded buffer byte length")?;
         if raw.len() != expected_bytes {
             return Err(Error::InvalidData(format!(
@@ -2914,7 +2908,7 @@ impl Dataset {
     }
 
     fn decode_raw_data<T: H5Type>(&self, raw: &[u8]) -> Result<ArrayD<T>> {
-        let n = checked_usize(self.num_elements(), "dataset element count")?;
+        let n = checked_usize(self.num_elements()?, "dataset element count")?;
         let mut shape = Vec::with_capacity(self.dataspace.dims.len());
         for &dim in &self.dataspace.dims {
             shape.push(checked_usize(dim, "dataset dimension")?);
@@ -2923,7 +2917,7 @@ impl Dataset {
     }
 
     fn make_fill_array<T: H5Type>(&self) -> Result<ArrayD<T>> {
-        let n = checked_usize(self.num_elements(), "dataset element count")?;
+        let n = checked_usize(self.num_elements()?, "dataset element count")?;
         let mut shape = Vec::with_capacity(self.dataspace.dims.len());
         for &dim in &self.dataspace.dims {
             shape.push(checked_usize(dim, "dataset dimension")?);
@@ -2936,7 +2930,7 @@ impl Dataset {
         element_count: usize,
         shape: &[usize],
     ) -> Result<ArrayD<T>> {
-        let elem_size = dtype_element_size(&self.datatype);
+        let elem_size = dtype_element_size(&self.datatype)?;
         let total_bytes = checked_mul_usize(element_count, elem_size, "fill result size in bytes")?;
         let fill = self.make_output_buffer(total_bytes);
         self.decode_buffer_with_shape::<T>(&fill, element_count, shape)
@@ -2972,7 +2966,7 @@ impl Dataset {
     }
 
     fn convert_to_native_endian(&self, bytes: &mut [u8]) -> Result<()> {
-        let count = checked_usize(self.num_elements(), "dataset element count")?;
+        let count = checked_usize(self.num_elements()?, "dataset element count")?;
         convert_datatype_to_native_endian(&self.datatype, self.vlen_reference_size(), bytes, count)
     }
 }
@@ -3030,7 +3024,7 @@ fn convert_datatype_to_native_endian(
                 for field in fields {
                     let field_offset = field.byte_offset as usize;
                     let field_size =
-                        raw_element_size_for_datatype(&field.datatype, vlen_reference_size);
+                        raw_element_size_for_datatype(&field.datatype, vlen_reference_size)?;
                     let field_start = checked_add_usize(
                         record_start,
                         field_offset,
@@ -3092,7 +3086,7 @@ fn attribute_from_message_storage(message: &AttributeMessage, context: &FileCont
             kind: VarLenKind::String,
             ..
         } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. })
-            && message.dataspace.num_elements() == 1 =>
+            && matches!(message.dataspace.num_elements(), Ok(1)) =>
         {
             resolve_vlen_bytes_storage(
                 &message.raw_data,
@@ -3141,28 +3135,31 @@ fn normalize_layout(layout: DataLayout, dataspace: &DataspaceMessage) -> DataLay
     }
 }
 
-fn raw_element_size_for_datatype(dtype: &Datatype, vlen_reference_size: usize) -> usize {
+fn raw_element_size_for_datatype(dtype: &Datatype, vlen_reference_size: usize) -> Result<usize> {
     match dtype {
         Datatype::String {
             size: StringSize::Variable,
             ..
         }
-        | Datatype::VarLen { .. } => vlen_reference_size,
+        | Datatype::VarLen { .. } => Ok(vlen_reference_size),
         Datatype::Array { base, dims } => {
-            let base_size = raw_element_size_for_datatype(base, vlen_reference_size);
-            let count: u64 = dims.iter().product();
-            base_size * count as usize
+            let base_size = raw_element_size_for_datatype(base, vlen_reference_size)?;
+            let count = dims.iter().try_fold(1usize, |acc, &dim| {
+                let dim = checked_usize(dim, "array datatype dimension")?;
+                checked_mul_usize(acc, dim, "array datatype element count")
+            })?;
+            checked_mul_usize(base_size, count, "array datatype byte size")
         }
         Datatype::Enum { base, .. } => raw_element_size_for_datatype(base, vlen_reference_size),
         Datatype::FixedPoint { size, .. }
         | Datatype::FloatingPoint { size, .. }
         | Datatype::Bitfield { size, .. }
-        | Datatype::Reference { size, .. } => *size as usize,
+        | Datatype::Reference { size, .. } => Ok(*size as usize),
         Datatype::String {
             size: StringSize::Fixed(len),
             ..
-        } => *len as usize,
-        Datatype::Compound { size, .. } | Datatype::Opaque { size, .. } => *size as usize,
+        } => Ok(*len as usize),
+        Datatype::Compound { size, .. } | Datatype::Opaque { size, .. } => Ok(*size as usize),
     }
 }
 
@@ -3894,7 +3891,7 @@ mod tests {
             padding: crate::messages::datatype::StringPadding::NullTerminate,
         };
 
-        assert_eq!(raw_element_size_for_datatype(&dtype, 12), 12);
+        assert_eq!(raw_element_size_for_datatype(&dtype, 12).unwrap(), 12);
         assert_eq!(
             raw_element_size_for_datatype(
                 &Datatype::Array {
@@ -3902,9 +3899,34 @@ mod tests {
                     dims: vec![2, 3],
                 },
                 12,
-            ),
+            )
+            .unwrap(),
             72
         );
+    }
+
+    #[test]
+    fn array_raw_element_size_rejects_overflow() {
+        let dtype = Datatype::Array {
+            base: Box::new(Datatype::FixedPoint {
+                size: 8,
+                signed: false,
+                byte_order: crate::error::ByteOrder::LittleEndian,
+            }),
+            dims: vec![u64::MAX, 2],
+        };
+
+        let err = raw_element_size_for_datatype(&dtype, 12).unwrap_err();
+        assert!(err.to_string().contains("array datatype"));
+    }
+
+    #[test]
+    fn dataset_num_elements_rejects_overflow() {
+        let mut dataset = fixed_u16_dataset(DataLayout::Compact { data: vec![] }, Vec::new());
+        dataset.dataspace.dims = vec![u64::MAX, 2];
+
+        let err = dataset.num_elements().unwrap_err();
+        assert!(err.to_string().contains("element count"));
     }
 
     #[test]

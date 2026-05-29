@@ -37,7 +37,7 @@ pub fn nc_type_from_code(code: u32) -> Result<NcType> {
 
 /// Size of one element for a classic NC type code.
 pub fn nc_type_size(code: u32) -> Result<usize> {
-    Ok(nc_type_from_code(code)?.size())
+    nc_type_from_code(code)?.size()
 }
 
 /// Compute the amount of padding needed to reach a 4-byte boundary.

@@ -1,3 +1,5 @@
+use crate::error::{Error, Result};
+
 /// A NetCDF dimension.
 #[derive(Debug, Clone)]
 pub struct NcDimension {
@@ -111,21 +113,40 @@ pub enum NcType {
 
 impl NcType {
     /// Size of a single element in bytes.
-    pub fn size(&self) -> usize {
+    pub fn size(&self) -> Result<usize> {
         match self {
-            NcType::Byte | NcType::Char | NcType::UByte => 1,
-            NcType::Short | NcType::UShort => 2,
-            NcType::Int | NcType::UInt | NcType::Float => 4,
-            NcType::Int64 | NcType::UInt64 | NcType::Double => 8,
+            NcType::Byte | NcType::Char | NcType::UByte => Ok(1),
+            NcType::Short | NcType::UShort => Ok(2),
+            NcType::Int | NcType::UInt | NcType::Float => Ok(4),
+            NcType::Int64 | NcType::UInt64 | NcType::Double => Ok(8),
             // Variable-length string; no fixed element size, but pointer-sized in memory.
-            NcType::String => std::mem::size_of::<usize>(),
+            NcType::String => Ok(std::mem::size_of::<usize>()),
             NcType::Enum { base, .. } => base.size(),
-            NcType::Compound { size, .. } => *size as usize,
-            NcType::Opaque { size, .. } => *size as usize,
+            NcType::Compound { size, .. } => Ok(*size as usize),
+            NcType::Opaque { size, .. } => Ok(*size as usize),
             NcType::Array { base, dims } => {
-                base.size() * dims.iter().map(|&d| d as usize).product::<usize>()
+                let base_size = base.size()?;
+                let count = dims.iter().try_fold(1usize, |acc, &dim| {
+                    let dim = usize::try_from(dim).map_err(|_| {
+                        Error::InvalidData(
+                            "NetCDF array type dimension exceeds platform usize capacity"
+                                .to_string(),
+                        )
+                    })?;
+                    acc.checked_mul(dim).ok_or_else(|| {
+                        Error::InvalidData(
+                            "NetCDF array type element count exceeds platform usize capacity"
+                                .to_string(),
+                        )
+                    })
+                })?;
+                base_size.checked_mul(count).ok_or_else(|| {
+                    Error::InvalidData(
+                        "NetCDF array type byte size exceeds platform usize capacity".to_string(),
+                    )
+                })
             }
-            NcType::VLen { .. } => std::mem::size_of::<usize>(), // pointer-sized
+            NcType::VLen { .. } => Ok(std::mem::size_of::<usize>()), // pointer-sized
         }
     }
 
@@ -321,11 +342,15 @@ impl NcVariable {
     }
 
     /// Total number of elements.
-    pub fn num_elements(&self) -> u64 {
+    pub fn num_elements(&self) -> Result<u64> {
         if self.dimensions.is_empty() {
-            return 1; // scalar
+            return Ok(1); // scalar
         }
-        self.dimensions.iter().map(|d| d.size).product()
+        self.dimensions.iter().try_fold(1u64, |acc, dim| {
+            acc.checked_mul(dim.size).ok_or_else(|| {
+                Error::InvalidData("NetCDF variable element count overflows u64".to_string())
+            })
+        })
     }
 }
 
@@ -648,5 +673,44 @@ mod tests {
     fn checked_shape_elements_overflow() {
         let err = checked_shape_elements(&[u64::MAX, 2], "test overflow").unwrap_err();
         assert!(matches!(err, crate::Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn array_type_size_rejects_overflow() {
+        let ty = NcType::Array {
+            base: Box::new(NcType::UInt64),
+            dims: vec![u64::MAX, 2],
+        };
+
+        let err = ty.size().unwrap_err();
+        assert!(err.to_string().contains("array type"));
+    }
+
+    #[test]
+    fn variable_num_elements_rejects_overflow() {
+        let var = NcVariable {
+            name: "huge".to_string(),
+            dimensions: vec![
+                NcDimension {
+                    name: "x".to_string(),
+                    size: u64::MAX,
+                    is_unlimited: false,
+                },
+                NcDimension {
+                    name: "y".to_string(),
+                    size: 2,
+                    is_unlimited: false,
+                },
+            ],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: false,
+            record_size: 4,
+        };
+
+        let err = var.num_elements().unwrap_err();
+        assert!(err.to_string().contains("element count"));
     }
 }

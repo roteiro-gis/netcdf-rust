@@ -8,7 +8,7 @@
 //! - Fixed array indexing (fixed_array module)
 //! - Extensible array indexing (extensible_array module)
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::storage::Storage;
 
 /// A resolved chunk location within the file.
@@ -40,12 +40,31 @@ fn chunk_overlaps_bounds(
     })
 }
 
-fn chunk_linear_index(chunk_indices: &[u64], chunks_per_dim: &[u64]) -> u64 {
+fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} overflows u64")))
+}
+
+fn checked_add_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} overflows u64")))
+}
+
+fn checked_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidData(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
+}
+
+fn chunk_linear_index(chunk_indices: &[u64], chunks_per_dim: &[u64]) -> Result<u64> {
     let mut linear = 0u64;
     for (dim, chunk_index) in chunk_indices.iter().enumerate() {
-        linear = linear * chunks_per_dim[dim] + chunk_index;
+        linear = checked_mul_u64(linear, chunks_per_dim[dim], "implicit chunk linear index")?;
+        linear = checked_add_u64(linear, *chunk_index, "implicit chunk linear index")?;
     }
-    linear
+    Ok(linear)
 }
 
 /// Collect chunk entries from a B-tree v2 chunk index.
@@ -176,22 +195,35 @@ pub fn collect_implicit_chunk_entries(
     chunk_dims: &[u32],
     elem_size: usize,
     chunk_bounds: Option<(&[u64], &[u64])>,
-) -> Vec<ChunkEntry> {
-    let chunk_bytes: u64 = chunk_dims.iter().map(|&d| d as u64).product::<u64>() * elem_size as u64;
+) -> Result<Vec<ChunkEntry>> {
+    let chunk_elements = chunk_dims.iter().try_fold(1u64, |acc, &dim| {
+        checked_mul_u64(acc, u64::from(dim), "implicit chunk element count")
+    })?;
+    let elem_size = u64::try_from(elem_size).map_err(|_| {
+        Error::InvalidData("implicit chunk element size exceeds u64 capacity".to_string())
+    })?;
+    let chunk_bytes = checked_mul_u64(chunk_elements, elem_size, "implicit chunk byte size")?;
     let ndim = dataset_shape.len();
 
     // Compute how many chunks along each dimension
-    let chunks_per_dim: Vec<u64> = (0..ndim)
-        .map(|i| dataset_shape[i].div_ceil(chunk_dims[i] as u64))
-        .collect();
+    let mut chunks_per_dim = Vec::with_capacity(ndim);
+    for i in 0..ndim {
+        let chunk_dim = u64::from(chunk_dims[i]);
+        if chunk_dim == 0 {
+            return Err(Error::InvalidData(format!(
+                "implicit chunk dimension {i} has zero extent"
+            )));
+        }
+        chunks_per_dim.push(dataset_shape[i].div_ceil(chunk_dim));
+    }
 
     if ndim == 0 {
-        return vec![ChunkEntry {
+        return Ok(vec![ChunkEntry {
             address: start_address,
             size: chunk_bytes,
             filter_mask: 0,
             offsets: Vec::new(),
-        }];
+        }]);
     }
 
     let (first_chunk, last_chunk): (Vec<u64>, Vec<u64>) = match chunk_bounds {
@@ -207,22 +239,41 @@ pub fn collect_implicit_chunk_entries(
 
     let mut chunk_counts = Vec::with_capacity(ndim);
     for dim in 0..ndim {
-        chunk_counts.push(last_chunk[dim] - first_chunk[dim] + 1);
+        let selected = last_chunk[dim]
+            .checked_sub(first_chunk[dim])
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                Error::InvalidData("implicit chunk selection bounds are invalid".to_string())
+            })?;
+        chunk_counts.push(selected);
     }
-    let total_selected_chunks: u64 = chunk_counts.iter().product();
-    let mut entries = Vec::with_capacity(total_selected_chunks as usize);
+    let total_selected_chunks = chunk_counts.iter().try_fold(1u64, |acc, &count| {
+        checked_mul_u64(acc, count, "implicit selected chunk count")
+    })?;
+    let mut entries = Vec::with_capacity(checked_usize(
+        total_selected_chunks,
+        "implicit selected chunk count",
+    )?);
     let mut chunk_indices = first_chunk.clone();
 
     loop {
-        let chunk_idx = chunk_linear_index(&chunk_indices, &chunks_per_dim);
+        let chunk_idx = chunk_linear_index(&chunk_indices, &chunks_per_dim)?;
         let offsets = chunk_indices
             .iter()
             .enumerate()
-            .map(|(dim, chunk_index)| chunk_index * u64::from(chunk_dims[dim]))
-            .collect();
+            .map(|(dim, chunk_index)| {
+                checked_mul_u64(
+                    *chunk_index,
+                    u64::from(chunk_dims[dim]),
+                    "implicit chunk offset",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let chunk_data_offset =
+            checked_mul_u64(chunk_idx, chunk_bytes, "implicit chunk byte offset")?;
 
         entries.push(ChunkEntry {
-            address: start_address + chunk_idx * chunk_bytes,
+            address: checked_add_u64(start_address, chunk_data_offset, "implicit chunk address")?,
             size: chunk_bytes,
             filter_mask: 0,
             offsets,
@@ -245,7 +296,7 @@ pub fn collect_implicit_chunk_entries(
         }
     }
 
-    entries
+    Ok(entries)
 }
 
 /// Resolve a single-chunk layout.
@@ -284,7 +335,7 @@ mod tests {
 
     #[test]
     fn implicit_chunk_entries() {
-        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None);
+        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None).unwrap();
         // 2 chunks along dim 0, 2 chunks along dim 1 = 4 total
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].address, 1000);
@@ -293,6 +344,20 @@ mod tests {
         assert_eq!(entries[1].offsets, vec![0, 10]);
         assert_eq!(entries[2].offsets, vec![5, 0]);
         assert_eq!(entries[3].offsets, vec![5, 10]);
+    }
+
+    #[test]
+    fn implicit_chunk_entries_reject_chunk_byte_overflow() {
+        let err = collect_implicit_chunk_entries(1000, &[10, 10], &[u32::MAX, u32::MAX], 2, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("implicit chunk byte size"));
+    }
+
+    #[test]
+    fn implicit_chunk_entries_reject_address_overflow() {
+        let err = collect_implicit_chunk_entries(u64::MAX, &[2], &[1], 1, Some((&[1], &[1])))
+            .unwrap_err();
+        assert!(err.to_string().contains("implicit chunk address"));
     }
 
     #[test]

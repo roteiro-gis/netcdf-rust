@@ -213,7 +213,7 @@ impl Group {
                 } if matches!(
                     base.as_ref(),
                     crate::messages::datatype::Datatype::FixedPoint { size: 1, .. }
-                ) && attr.dataspace.num_elements() == 1 =>
+                ) && matches!(attr.dataspace.num_elements(), Ok(1)) =>
                 {
                     resolve_vlen_bytes_storage(
                         &attr.raw_data,

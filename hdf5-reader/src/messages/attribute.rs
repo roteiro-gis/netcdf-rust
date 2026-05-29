@@ -81,7 +81,7 @@ fn parse_v1(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     }
 
     // Raw data — remaining bytes are the attribute data
-    let data_size = ds_msg.num_elements() as usize * dt_msg.size as usize;
+    let data_size = attribute_raw_data_size(&ds_msg, dt_msg.size)?;
     let raw_data = if data_size > 0 {
         cursor.read_bytes(data_size)?.to_vec()
     } else {
@@ -112,7 +112,7 @@ fn parse_v2(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let ds_msg = dataspace::parse(cursor, offset_size, length_size, dataspace_size)?;
 
     // Raw data
-    let data_size = ds_msg.num_elements() as usize * dt_msg.size as usize;
+    let data_size = attribute_raw_data_size(&ds_msg, dt_msg.size)?;
     let raw_data = if data_size > 0 {
         cursor.read_bytes(data_size)?.to_vec()
     } else {
@@ -150,7 +150,7 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
     let ds_msg = dataspace::parse(cursor, offset_size, length_size, dataspace_size)?;
 
     // Raw data
-    let data_size = ds_msg.num_elements() as usize * dt_msg.size as usize;
+    let data_size = attribute_raw_data_size(&ds_msg, dt_msg.size)?;
     let raw_data = if data_size > 0 {
         cursor.read_bytes(data_size)?.to_vec()
     } else {
@@ -162,6 +162,15 @@ fn parse_v3(cursor: &mut Cursor<'_>, offset_size: u8, length_size: u8) -> Result
         datatype: dt_msg.datatype,
         dataspace: ds_msg,
         raw_data,
+    })
+}
+
+fn attribute_raw_data_size(ds_msg: &dataspace::DataspaceMessage, dtype_size: u32) -> Result<usize> {
+    let elements = usize::try_from(ds_msg.num_elements()?).map_err(|_| {
+        Error::InvalidData("attribute element count exceeds platform usize capacity".to_string())
+    })?;
+    elements.checked_mul(dtype_size as usize).ok_or_else(|| {
+        Error::InvalidData("attribute raw data size exceeds platform usize capacity".to_string())
     })
 }
 

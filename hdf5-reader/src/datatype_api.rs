@@ -333,29 +333,44 @@ impl H5Type for f64 {
 }
 
 /// Get the element size from a datatype.
-pub fn dtype_element_size(dtype: &Datatype) -> usize {
+pub fn dtype_element_size(dtype: &Datatype) -> Result<usize> {
     match dtype {
-        Datatype::FixedPoint { size, .. } => *size as usize,
-        Datatype::FloatingPoint { size, .. } => *size as usize,
+        Datatype::FixedPoint { size, .. } => Ok(*size as usize),
+        Datatype::FloatingPoint { size, .. } => Ok(*size as usize),
         Datatype::String {
             size: StringSize::Fixed(n),
             ..
-        } => *n as usize,
+        } => Ok(*n as usize),
         Datatype::String {
             size: StringSize::Variable,
             ..
-        } => 16,
-        Datatype::Compound { size, .. } => *size as usize,
+        } => Ok(16),
+        Datatype::Compound { size, .. } => Ok(*size as usize),
         Datatype::Array { base, dims } => {
-            let base_size = dtype_element_size(base);
-            let count: u64 = dims.iter().product();
-            base_size * count as usize
+            let base_size = dtype_element_size(base)?;
+            let count = dims.iter().try_fold(1usize, |acc, &dim| {
+                let dim = usize::try_from(dim).map_err(|_| {
+                    Error::InvalidData(
+                        "array datatype dimension exceeds platform usize capacity".to_string(),
+                    )
+                })?;
+                acc.checked_mul(dim).ok_or_else(|| {
+                    Error::InvalidData(
+                        "array datatype element count exceeds platform usize capacity".to_string(),
+                    )
+                })
+            })?;
+            base_size.checked_mul(count).ok_or_else(|| {
+                Error::InvalidData(
+                    "array datatype byte size exceeds platform usize capacity".to_string(),
+                )
+            })
         }
         Datatype::Enum { base, .. } => dtype_element_size(base),
-        Datatype::VarLen { .. } => 16,
-        Datatype::Opaque { size, .. } => *size as usize,
-        Datatype::Reference { size, .. } => *size as usize,
-        Datatype::Bitfield { size, .. } => *size as usize,
+        Datatype::VarLen { .. } => Ok(16),
+        Datatype::Opaque { size, .. } => Ok(*size as usize),
+        Datatype::Reference { size, .. } => Ok(*size as usize),
+        Datatype::Bitfield { size, .. } => Ok(*size as usize),
     }
 }
 
@@ -385,5 +400,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(values, vec![1, 7]);
+    }
+
+    #[test]
+    fn dtype_element_size_rejects_array_overflow() {
+        let dtype = Datatype::Array {
+            base: Box::new(Datatype::FixedPoint {
+                size: 8,
+                signed: false,
+                byte_order: ByteOrder::LittleEndian,
+            }),
+            dims: vec![u64::MAX, 2],
+        };
+
+        let err = dtype_element_size(&dtype).unwrap_err();
+        assert!(err.to_string().contains("array datatype"));
     }
 }

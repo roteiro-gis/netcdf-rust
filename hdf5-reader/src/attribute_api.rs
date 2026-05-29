@@ -12,6 +12,14 @@ use crate::object_header::ObjectHeader;
 use crate::storage::Storage;
 use crate::{btree_v2, messages};
 
+fn checked_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidData(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
+}
+
 /// A parsed, high-level HDF5 attribute.
 #[derive(Debug, Clone)]
 pub struct Attribute {
@@ -60,11 +68,15 @@ impl Attribute {
     }
 
     /// Total number of elements.
-    pub fn num_elements(&self) -> u64 {
+    pub fn num_elements(&self) -> Result<u64> {
         if self.shape.is_empty() {
-            1 // scalar
+            Ok(1) // scalar
         } else {
-            self.shape.iter().product()
+            self.shape.iter().try_fold(1u64, |acc, &dim| {
+                acc.checked_mul(dim).ok_or_else(|| {
+                    Error::InvalidData("attribute element count overflows u64".to_string())
+                })
+            })
         }
     }
 
@@ -76,7 +88,7 @@ impl Attribute {
     /// Read the attribute as a 1-D vector of the given type.
     pub fn read_1d<T: crate::datatype_api::H5Type>(&self) -> Result<Vec<T>> {
         let elem_size = T::element_size(&self.datatype);
-        let n = self.num_elements() as usize;
+        let n = checked_usize(self.num_elements()?, "attribute element count")?;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             let start = i * elem_size;
@@ -199,7 +211,7 @@ impl Attribute {
                 padding,
             } => {
                 let ref_size = 4 + offset_size as usize + 4;
-                let n = self.num_elements() as usize;
+                let n = checked_usize(self.num_elements()?, "attribute string element count")?;
                 let mut result = Vec::with_capacity(n);
                 for i in 0..n {
                     let offset = i * ref_size;
@@ -237,7 +249,7 @@ impl Attribute {
                 padding,
             } => {
                 let len = *len as usize;
-                let n = self.num_elements() as usize;
+                let n = checked_usize(self.num_elements()?, "attribute string element count")?;
                 let mut result = Vec::with_capacity(n);
                 for i in 0..n {
                     let start = i * len;

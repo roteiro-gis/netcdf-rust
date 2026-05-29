@@ -136,7 +136,7 @@ fn convert_attribute_value(
             _ => Ok(None),
         },
         Datatype::String { .. } => {
-            if attr.num_elements() == 1 {
+            if attr.num_elements()? == 1 {
                 read_attr(attr.read_string().map(NcAttrValue::Chars))
             } else {
                 read_attr(attr.read_strings().map(NcAttrValue::Strings))
@@ -146,7 +146,7 @@ fn convert_attribute_value(
             base,
             kind: VarLenKind::String,
             ..
-        } if attr.num_elements() == 1
+        } if attr.num_elements()? == 1
             && matches!(
                 base.as_ref(),
                 Datatype::FixedPoint {

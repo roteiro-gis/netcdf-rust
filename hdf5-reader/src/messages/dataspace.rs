@@ -35,14 +35,18 @@ pub struct DataspaceMessage {
 
 impl DataspaceMessage {
     /// Total number of elements in the dataspace (product of current dimension sizes).
-    pub fn num_elements(&self) -> u64 {
+    pub fn num_elements(&self) -> Result<u64> {
         if self.dims.is_empty() {
-            return match self.dataspace_type {
+            return Ok(match self.dataspace_type {
                 DataspaceType::Scalar => 1,
                 _ => 0,
-            };
+            });
         }
-        self.dims.iter().product()
+        self.dims.iter().try_fold(1u64, |acc, &dim| {
+            acc.checked_mul(dim).ok_or_else(|| {
+                Error::InvalidData("dataspace element count overflows u64".to_string())
+            })
+        })
     }
 }
 
@@ -185,7 +189,7 @@ mod tests {
         assert_eq!(msg.dataspace_type, DataspaceType::Scalar);
         assert!(msg.dims.is_empty());
         assert!(msg.max_dims.is_none());
-        assert_eq!(msg.num_elements(), 1);
+        assert_eq!(msg.num_elements().unwrap(), 1);
     }
 
     #[test]
@@ -213,7 +217,7 @@ mod tests {
         assert_eq!(msg.dims, vec![10, 20]);
         assert_eq!(msg.max_dims.as_ref().unwrap(), &vec![100, UNLIMITED]);
         assert_eq!(msg.dataspace_type, DataspaceType::Simple);
-        assert_eq!(msg.num_elements(), 200);
+        assert_eq!(msg.num_elements().unwrap(), 200);
     }
 
     #[test]
@@ -247,7 +251,7 @@ mod tests {
         let mut cursor = Cursor::new(&data);
         let msg = parse(&mut cursor, 8, 8, data.len()).unwrap();
         assert_eq!(msg.dataspace_type, DataspaceType::Null);
-        assert_eq!(msg.num_elements(), 0);
+        assert_eq!(msg.num_elements().unwrap(), 0);
     }
 
     #[test]
@@ -273,7 +277,7 @@ mod tests {
         assert_eq!(msg.dims, vec![5, 10, 15]);
         let md = msg.max_dims.clone().unwrap();
         assert_eq!(md, vec![50, 100, UNLIMITED]);
-        assert_eq!(msg.num_elements(), 750);
+        assert_eq!(msg.num_elements().unwrap(), 750);
     }
 
     #[test]
@@ -281,5 +285,18 @@ mod tests {
         let data = [0x03, 0x00, 0x00, 0x00];
         let mut cursor = Cursor::new(&data);
         assert!(parse(&mut cursor, 8, 8, data.len()).is_err());
+    }
+
+    #[test]
+    fn num_elements_rejects_overflow() {
+        let msg = DataspaceMessage {
+            rank: 2,
+            dims: vec![u64::MAX, 2],
+            max_dims: None,
+            dataspace_type: DataspaceType::Simple,
+        };
+
+        let err = msg.num_elements().unwrap_err();
+        assert!(err.to_string().contains("element count"));
     }
 }
