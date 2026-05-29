@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Hardened HDF5 external raw data handling so filesystem resolution is opt-in
+  and confined to relative paths under the resolver base directory.
+
 ## 0.6.0 - 2026-05-28
 
 - Added internal Rayon parallelism for classic NetCDF CDF-1/2/5 full-variable
