@@ -8,6 +8,8 @@
   decoded size plus one byte before final size validation.
 - Replaced unchecked HDF5/NetCDF shape, array-type, and implicit chunk size
   products with fallible overflow checks.
+- Limited HDF5 extensible-array chunk index storage reads to exact block
+  lengths instead of reading metadata blocks through end-of-file.
 
 ## 0.6.0 - 2026-05-28
 
