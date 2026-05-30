@@ -343,14 +343,21 @@ impl NcVariable {
 
     /// Total number of elements.
     pub fn num_elements(&self) -> Result<u64> {
-        if self.dimensions.is_empty() {
-            return Ok(1); // scalar
+        match self.dimensions.as_slice() {
+            [] => Ok(1), // scalar
+            [dim] => Ok(dim.size),
+            dimensions => {
+                let mut total = 1u64;
+                for dim in dimensions {
+                    total = total.checked_mul(dim.size).ok_or_else(|| {
+                        Error::InvalidData(
+                            "NetCDF variable element count overflows u64".to_string(),
+                        )
+                    })?;
+                }
+                Ok(total)
+            }
         }
-        self.dimensions.iter().try_fold(1u64, |acc, dim| {
-            acc.checked_mul(dim.size).ok_or_else(|| {
-                Error::InvalidData("NetCDF variable element count overflows u64".to_string())
-            })
-        })
     }
 }
 
