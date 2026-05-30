@@ -333,7 +333,7 @@ fn read_attr_values(
     _format: NcFormat,
 ) -> Result<NcAttrValue> {
     let typ = nc_type_from_code(nc_type)?;
-    let elem_size = typ.size();
+    let elem_size = typ.size()?;
     let raw_bytes = nvalues.checked_mul(elem_size).ok_or_else(|| {
         Error::InvalidData("classic attribute byte count exceeds platform usize".to_string())
     })?;

@@ -291,7 +291,7 @@ where
     F: FnMut(NcValueView<'_>) -> Result<T>,
 {
     let raw = dataset.read_raw_bytes()?;
-    let count = checked_usize(dataset.num_elements(), "NetCDF-4 variable element count")?;
+    let count = checked_usize(dataset.num_elements()?, "NetCDF-4 variable element count")?;
     let elem_size = value_size(dataset, dataset.dtype())?;
     let total = checked_mul_usize(count, elem_size, "NetCDF-4 variable byte size")?;
     require_len(&raw, total, "NetCDF-4 variable data")?;

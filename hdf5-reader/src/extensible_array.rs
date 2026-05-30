@@ -149,6 +149,211 @@ fn compute_super_block_layout(header: &EaHeader) -> Vec<(u64, u64)> {
     layout
 }
 
+fn checked_add_usize(left: usize, right: usize, context: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
+fn checked_mul_usize(left: usize, right: usize, context: &str) -> Result<usize> {
+    left.checked_mul(right)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
+fn checked_add_u64(left: u64, right: u64, context: &str) -> Result<u64> {
+    left.checked_add(right)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds u64 capacity")))
+}
+
+fn checked_usize_from_u64(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidData(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
+}
+
+fn checked_u64_from_usize(value: usize, context: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| Error::InvalidData(format!("{context} exceeds u64 capacity")))
+}
+
+fn ea_block_header_len(offset_size: u8, sizeof_nelmts: usize) -> Result<usize> {
+    let len = checked_add_usize(4, 1, "extensible array block header length")?;
+    let len = checked_add_usize(len, 1, "extensible array block header length")?;
+    let len = checked_add_usize(
+        len,
+        usize::from(offset_size),
+        "extensible array block header length",
+    )?;
+    checked_add_usize(len, sizeof_nelmts, "extensible array block header length")
+}
+
+fn ea_page_nelmts(max_page_bits: u8) -> Result<usize> {
+    if max_page_bits == 0 {
+        return Ok(0);
+    }
+    1usize.checked_shl(u32::from(max_page_bits)).ok_or_else(|| {
+        Error::InvalidData("extensible array page element count exceeds usize capacity".into())
+    })
+}
+
+fn index_block_len(header: &EaHeader, sb_layout: &[(u64, u64)], offset_size: u8) -> Result<usize> {
+    let offset_size = usize::from(offset_size);
+    let inline_bytes = checked_mul_usize(
+        usize::from(header.idx_blk_elmts),
+        usize::from(header.element_size),
+        "extensible array index block inline entry bytes",
+    )?;
+    let direct_ptrs = checked_mul_usize(
+        2,
+        usize::from(header.sec_blk_min_data_ptrs),
+        "extensible array index block direct data block pointer count",
+    )?;
+    let direct_bytes = checked_mul_usize(
+        direct_ptrs,
+        offset_size,
+        "extensible array index block direct data block address bytes",
+    )?;
+    let secondary_ptrs = sb_layout.len().saturating_sub(direct_ptrs);
+    let secondary_bytes = checked_mul_usize(
+        secondary_ptrs,
+        offset_size,
+        "extensible array index block secondary block address bytes",
+    )?;
+
+    let mut len = 4usize;
+    for part in [
+        1,
+        1,
+        offset_size,
+        inline_bytes,
+        direct_bytes,
+        secondary_bytes,
+        4,
+    ] {
+        len = checked_add_usize(len, part, "extensible array index block length")?;
+    }
+    Ok(len)
+}
+
+fn secondary_page_bitmap_bytes(
+    max_page_bits: u8,
+    elmts_per_dblk: u64,
+    num_dblks: u64,
+) -> Result<usize> {
+    let page_nelmts = ea_page_nelmts(max_page_bits)?;
+    if page_nelmts == 0 {
+        return Ok(0);
+    }
+
+    let elmts_per_dblk =
+        checked_usize_from_u64(elmts_per_dblk, "extensible array data block element count")?;
+    if elmts_per_dblk <= page_nelmts {
+        return Ok(0);
+    }
+
+    let num_dblks = checked_usize_from_u64(
+        num_dblks,
+        "extensible array secondary block data block count",
+    )?;
+    let pages_per_dblk = elmts_per_dblk.div_ceil(page_nelmts);
+    let total_pages = checked_mul_usize(
+        num_dblks,
+        pages_per_dblk,
+        "extensible array secondary block page bitmap bit count",
+    )?;
+    Ok(total_pages.div_ceil(8))
+}
+
+fn secondary_block_len(
+    num_dblk_addrs: usize,
+    offset_size: u8,
+    sizeof_nelmts: usize,
+    page_bitmap_bytes: usize,
+) -> Result<usize> {
+    let offset_bytes = usize::from(offset_size);
+    let addr_bytes = checked_mul_usize(
+        num_dblk_addrs,
+        offset_bytes,
+        "extensible array secondary block data block address bytes",
+    )?;
+
+    let mut len = ea_block_header_len(offset_size, sizeof_nelmts)?;
+    for part in [page_bitmap_bytes, addr_bytes, 4] {
+        len = checked_add_usize(len, part, "extensible array secondary block length")?;
+    }
+    Ok(len)
+}
+
+fn data_block_len_from_bitmap(
+    num_entries: usize,
+    page_nelmts: usize,
+    entry_size: u8,
+    offset_size: u8,
+    sizeof_nelmts: usize,
+    page_bitmap: &[u8],
+) -> Result<usize> {
+    let num_pages = num_entries.div_ceil(page_nelmts);
+    let bitmap_bytes = num_pages.div_ceil(8);
+    let mut len = checked_add_usize(
+        ea_block_header_len(offset_size, sizeof_nelmts)?,
+        bitmap_bytes,
+        "extensible array data block length",
+    )?;
+
+    for page_idx in 0..num_pages {
+        let byte_idx = page_idx / 8;
+        let bit_idx = page_idx % 8;
+        let page_initialized =
+            byte_idx < page_bitmap.len() && (page_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+        if !page_initialized {
+            continue;
+        }
+
+        let entries_in_page = if page_idx == num_pages - 1 {
+            let remainder = num_entries % page_nelmts;
+            if remainder == 0 {
+                page_nelmts
+            } else {
+                remainder
+            }
+        } else {
+            page_nelmts
+        };
+        let entry_bytes = checked_mul_usize(
+            entries_in_page,
+            usize::from(entry_size),
+            "extensible array data block page entry bytes",
+        )?;
+        let page_bytes = checked_add_usize(
+            entry_bytes,
+            4,
+            "extensible array data block page byte length",
+        )?;
+        len = checked_add_usize(len, page_bytes, "extensible array data block length")?;
+    }
+
+    Ok(len)
+}
+
+fn unpaged_data_block_len(
+    num_entries: usize,
+    offset_size: u8,
+    entry_size: u8,
+    sizeof_nelmts: usize,
+) -> Result<usize> {
+    let entry_bytes = checked_mul_usize(
+        num_entries,
+        usize::from(entry_size),
+        "extensible array data block entry bytes",
+    )?;
+    let len = checked_add_usize(
+        ea_block_header_len(offset_size, sizeof_nelmts)?,
+        entry_bytes,
+        "extensible array data block length",
+    )?;
+    checked_add_usize(len, 4, "extensible array data block length")
+}
+
 /// A single raw entry.
 struct EaRawEntry {
     address: u64,
@@ -226,11 +431,7 @@ fn parse_data_block(
     cursor.skip(sizeof_nelmts)?;
 
     // Paging is used only when nelmts exceeds 2^page_bits.
-    let page_nelmts = if max_page_bits > 0 {
-        1usize << max_page_bits
-    } else {
-        0
-    };
+    let page_nelmts = ea_page_nelmts(max_page_bits)?;
 
     if page_nelmts > 0 && num_entries > page_nelmts {
         // Paged data block
@@ -345,19 +546,12 @@ fn parse_secondary_block_storage(
     sizeof_nelmts: usize,
     page_bitmap_bytes: usize,
 ) -> Result<Vec<u64>> {
-    let _len = 4
-        + 1
-        + 1
-        + usize::from(offset_size)
-        + sizeof_nelmts
-        + page_bitmap_bytes
-        + num_dblk_addrs * usize::from(offset_size)
-        + 4;
-    let read_len = usize::try_from(storage.len().saturating_sub(address)).map_err(|_| {
-        Error::InvalidData(
-            "extensible array secondary block exceeds platform usize capacity".into(),
-        )
-    })?;
+    let read_len = secondary_block_len(
+        num_dblk_addrs,
+        offset_size,
+        sizeof_nelmts,
+        page_bitmap_bytes,
+    )?;
     let bytes = storage.read_range(address, read_len)?;
     parse_secondary_block(
         bytes.as_ref(),
@@ -492,11 +686,7 @@ fn read_data_block_entry(
     let _header_address = cursor.read_offset(offset_size)?;
     cursor.skip(sizeof_nelmts)?;
 
-    let page_nelmts = if max_page_bits > 0 {
-        1usize << max_page_bits
-    } else {
-        0
-    };
+    let page_nelmts = ea_page_nelmts(max_page_bits)?;
 
     if page_nelmts > 0 && num_entries > page_nelmts {
         let num_pages = num_entries.div_ceil(page_nelmts);
@@ -582,21 +772,22 @@ fn read_data_block_entry_storage(
     let _header_address = cursor.read_offset(offset_size)?;
     cursor.skip(sizeof_nelmts)?;
 
-    let base =
-        address + u64::try_from(header_len).map_err(|_| Error::OffsetOutOfBounds(address))?;
-    let page_nelmts = if max_page_bits > 0 {
-        1usize << max_page_bits
-    } else {
-        0
-    };
+    let base = checked_add_u64(
+        address,
+        checked_u64_from_usize(header_len, "EA data block header length")?,
+        "EA data block entry base",
+    )?;
+    let page_nelmts = ea_page_nelmts(max_page_bits)?;
 
     if page_nelmts > 0 && num_entries > page_nelmts {
         let num_pages = num_entries.div_ceil(page_nelmts);
         let bitmap_bytes = num_pages.div_ceil(8);
         let page_bitmap = storage.read_range(base, bitmap_bytes)?;
-        let data_start = base
-            + u64::try_from(bitmap_bytes)
-                .map_err(|_| Error::InvalidData("EA bitmap size exceeds u64 capacity".into()))?;
+        let data_start = checked_add_u64(
+            base,
+            checked_u64_from_usize(bitmap_bytes, "EA bitmap size")?,
+            "EA data block page data start",
+        )?;
 
         let target_page = local_idx / page_nelmts;
         let within_page = local_idx % page_nelmts;
@@ -629,22 +820,85 @@ fn read_data_block_entry_storage(
             let initialized = page_byte_idx < page_bitmap.len()
                 && (page_bitmap[page_byte_idx] & (1 << page_bit_idx)) != 0;
             if initialized {
-                page_start += u64::try_from(entries_in_page * usize::from(entry_size) + 4)
-                    .map_err(|_| Error::InvalidData("EA page size exceeds u64 capacity".into()))?;
+                let entry_bytes = checked_mul_usize(
+                    entries_in_page,
+                    usize::from(entry_size),
+                    "EA page entry bytes",
+                )?;
+                let page_size = checked_add_usize(entry_bytes, 4, "EA page size")?;
+                page_start = checked_add_u64(
+                    page_start,
+                    checked_u64_from_usize(page_size, "EA page size")?,
+                    "EA page start",
+                )?;
             }
         }
 
-        let position = page_start
-            + u64::try_from(within_page * usize::from(entry_size)).map_err(|_| {
-                Error::InvalidData("EA page entry offset exceeds u64 capacity".into())
-            })?;
+        let within_page_offset =
+            checked_mul_usize(within_page, usize::from(entry_size), "EA page entry offset")?;
+        let position = checked_add_u64(
+            page_start,
+            checked_u64_from_usize(within_page_offset, "EA page entry offset")?,
+            "EA page entry position",
+        )?;
         return read_entry_at_storage(storage, position, is_filtered, offset_size, entry_size);
     }
 
-    let position = base
-        + u64::try_from(local_idx * usize::from(entry_size))
-            .map_err(|_| Error::InvalidData("EA entry offset exceeds u64 capacity".into()))?;
+    let local_offset = checked_mul_usize(local_idx, usize::from(entry_size), "EA entry offset")?;
+    let position = checked_add_u64(
+        base,
+        checked_u64_from_usize(local_offset, "EA entry offset")?,
+        "EA entry position",
+    )?;
     read_entry_at_storage(storage, position, is_filtered, offset_size, entry_size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_data_block_storage(
+    storage: &dyn Storage,
+    address: u64,
+    num_entries: usize,
+    is_filtered: bool,
+    max_page_bits: u8,
+    offset_size: u8,
+    entry_size: u8,
+    sizeof_nelmts: usize,
+) -> Result<Vec<EaRawEntry>> {
+    let page_nelmts = ea_page_nelmts(max_page_bits)?;
+    let read_len = if page_nelmts > 0 && num_entries > page_nelmts {
+        let header_len = ea_block_header_len(offset_size, sizeof_nelmts)?;
+        let num_pages = num_entries.div_ceil(page_nelmts);
+        let bitmap_bytes = num_pages.div_ceil(8);
+        let bitmap_end = checked_add_usize(
+            header_len,
+            bitmap_bytes,
+            "extensible array data block bitmap range",
+        )?;
+        let prefix = storage.read_range(address, bitmap_end)?;
+        let page_bitmap = &prefix.as_ref()[header_len..bitmap_end];
+        data_block_len_from_bitmap(
+            num_entries,
+            page_nelmts,
+            entry_size,
+            offset_size,
+            sizeof_nelmts,
+            page_bitmap,
+        )?
+    } else {
+        unpaged_data_block_len(num_entries, offset_size, entry_size, sizeof_nelmts)?
+    };
+
+    let block = storage.read_range(address, read_len)?;
+    parse_data_block(
+        block.as_ref(),
+        0,
+        num_entries,
+        is_filtered,
+        max_page_bits,
+        offset_size,
+        entry_size,
+        sizeof_nelmts,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -747,19 +1001,18 @@ fn collect_extensible_array_chunk_entries_bounded(
                         secondary_block_cache[sec_cache_idx] = Some(Vec::new());
                     } else {
                         let (_, num_dblks) = sb_layout[sb_idx];
-                        let page_bitmap_bytes = if header.max_dblk_page_nelmts_bits > 0
-                            && elmts_per_dblk > (1u64 << header.max_dblk_page_nelmts_bits)
-                        {
-                            let page_nelmts = 1usize << header.max_dblk_page_nelmts_bits;
-                            let pages_per_dblk = (elmts_per_dblk as usize).div_ceil(page_nelmts);
-                            (num_dblks as usize * pages_per_dblk).div_ceil(8)
-                        } else {
-                            0
-                        };
+                        let page_bitmap_bytes = secondary_page_bitmap_bytes(
+                            header.max_dblk_page_nelmts_bits,
+                            elmts_per_dblk,
+                            num_dblks,
+                        )?;
                         secondary_block_cache[sec_cache_idx] = Some(parse_secondary_block(
                             data,
                             sec_addr,
-                            num_dblks as usize,
+                            checked_usize_from_u64(
+                                num_dblks,
+                                "extensible array secondary block data block count",
+                            )?,
                             offset_size,
                             sizeof_nelmts,
                             page_bitmap_bytes,
@@ -964,19 +1217,18 @@ pub fn collect_extensible_array_chunk_entries(
         // Per HDF5 spec III.H "Extensible Array Secondary Block", the secondary
         // block contains a page initialization bitmap when data blocks are paged.
         // Bitmap size = ceil(num_dblks * pages_per_dblk / 8).
-        let page_bitmap_bytes = if header.max_dblk_page_nelmts_bits > 0
-            && elmts_per_dblk > (1u64 << header.max_dblk_page_nelmts_bits)
-        {
-            let page_nelmts = 1usize << header.max_dblk_page_nelmts_bits;
-            let pages_per_dblk = (elmts_per_dblk as usize).div_ceil(page_nelmts);
-            (num_dblks as usize * pages_per_dblk).div_ceil(8)
-        } else {
-            0
-        };
+        let page_bitmap_bytes = secondary_page_bitmap_bytes(
+            header.max_dblk_page_nelmts_bits,
+            elmts_per_dblk,
+            num_dblks,
+        )?;
         let dblk_addrs = parse_secondary_block(
             data,
             sec_addr,
-            num_dblks as usize,
+            checked_usize_from_u64(
+                num_dblks,
+                "extensible array secondary block data block count",
+            )?,
             offset_size,
             sizeof_nelmts,
             page_bitmap_bytes,
@@ -1069,26 +1321,9 @@ pub fn collect_extensible_array_chunk_entries_storage(
 
     if let Some(bounds) = chunk_bounds {
         let targets = linear_target_offsets(dataset_shape, chunk_dims, Some(bounds));
-        let _index_block_len = 4
-            + 1
-            + 1
-            + usize::from(offset_size)
-            + usize::from(header.idx_blk_elmts) * usize::from(header.element_size)
-            + (2 * usize::from(header.sec_blk_min_data_ptrs)) * usize::from(offset_size)
-            + sb_layout
-                .len()
-                .saturating_sub(2 * usize::from(header.sec_blk_min_data_ptrs))
-                * usize::from(offset_size)
-            + 4;
         let index_block = storage.read_range(
             header.index_block_address,
-            usize::try_from(storage.len().saturating_sub(header.index_block_address)).map_err(
-                |_| {
-                    Error::InvalidData(
-                        "extensible array index block exceeds platform usize capacity".into(),
-                    )
-                },
-            )?,
+            index_block_len(&header, &sb_layout, offset_size)?,
         )?;
         let mut cursor = Cursor::new(index_block.as_ref());
         let sig = cursor.read_bytes(4)?;
@@ -1178,21 +1413,19 @@ pub fn collect_extensible_array_chunk_entries_storage(
                             secondary_block_cache[sec_cache_idx] = Some(Vec::new());
                         } else {
                             let (_, num_dblks) = sb_layout[sb_idx];
-                            let page_bitmap_bytes = if header.max_dblk_page_nelmts_bits > 0
-                                && elmts_per_dblk > (1u64 << header.max_dblk_page_nelmts_bits)
-                            {
-                                let page_nelmts = 1usize << header.max_dblk_page_nelmts_bits;
-                                let pages_per_dblk =
-                                    (elmts_per_dblk as usize).div_ceil(page_nelmts);
-                                (num_dblks as usize * pages_per_dblk).div_ceil(8)
-                            } else {
-                                0
-                            };
+                            let page_bitmap_bytes = secondary_page_bitmap_bytes(
+                                header.max_dblk_page_nelmts_bits,
+                                elmts_per_dblk,
+                                num_dblks,
+                            )?;
                             secondary_block_cache[sec_cache_idx] =
                                 Some(parse_secondary_block_storage(
                                     storage,
                                     sec_addr,
-                                    num_dblks as usize,
+                                    checked_usize_from_u64(
+                                        num_dblks,
+                                        "extensible array secondary block data block count",
+                                    )?,
                                     offset_size,
                                     sizeof_nelmts,
                                     page_bitmap_bytes,
@@ -1214,7 +1447,10 @@ pub fn collect_extensible_array_chunk_entries_storage(
                 read_data_block_entry_storage(
                     storage,
                     dblk_addr,
-                    elmts_per_dblk as usize,
+                    checked_usize_from_u64(
+                        elmts_per_dblk,
+                        "extensible array data block element count",
+                    )?,
                     local_idx,
                     is_filtered,
                     header.max_dblk_page_nelmts_bits,
@@ -1239,17 +1475,7 @@ pub fn collect_extensible_array_chunk_entries_storage(
         return Ok(entries);
     }
 
-    let index_block_len = 4
-        + 1
-        + 1
-        + usize::from(offset_size)
-        + usize::from(header.idx_blk_elmts) * usize::from(header.element_size)
-        + (2 * usize::from(header.sec_blk_min_data_ptrs)) * usize::from(offset_size)
-        + sb_layout
-            .len()
-            .saturating_sub(2 * usize::from(header.sec_blk_min_data_ptrs))
-            * usize::from(offset_size)
-        + 4;
+    let index_block_len = index_block_len(&header, &sb_layout, offset_size)?;
     let data = storage.read_range(header.index_block_address, index_block_len)?;
     let mut cursor = Cursor::new(data.as_ref());
     cursor.set_position(0);
@@ -1320,59 +1546,19 @@ pub fn collect_extensible_array_chunk_entries_storage(
                     });
                 }
             } else {
-                let dblk_entries = {
-                    let page_nelmts = if header.max_dblk_page_nelmts_bits > 0 {
-                        1usize << header.max_dblk_page_nelmts_bits
-                    } else {
-                        0
-                    };
-                    let _dblk_len = if page_nelmts > 0 && elmts_per_dblk as usize > page_nelmts {
-                        let num_pages = (elmts_per_dblk as usize).div_ceil(page_nelmts);
-                        let bitmap_bytes = num_pages.div_ceil(8);
-                        let mut len =
-                            4 + 1 + 1 + usize::from(offset_size) + sizeof_nelmts + bitmap_bytes;
-                        for page_idx in 0..num_pages {
-                            let entries_in_page = if page_idx == num_pages - 1 {
-                                let remainder = elmts_per_dblk as usize % page_nelmts;
-                                if remainder == 0 {
-                                    page_nelmts
-                                } else {
-                                    remainder
-                                }
-                            } else {
-                                page_nelmts
-                            };
-                            len += entries_in_page * usize::from(header.element_size) + 4;
-                        }
-                        len
-                    } else {
-                        4 + 1
-                            + 1
-                            + usize::from(offset_size)
-                            + sizeof_nelmts
-                            + elmts_per_dblk as usize * usize::from(header.element_size)
-                            + 4
-                    };
-                    let block = storage.read_range(
-                        dblk_addr,
-                        usize::try_from(storage.len().saturating_sub(dblk_addr)).map_err(|_| {
-                            Error::InvalidData(
-                                "extensible array data block exceeds platform usize capacity"
-                                    .into(),
-                            )
-                        })?,
-                    )?;
-                    parse_data_block(
-                        block.as_ref(),
-                        0,
-                        elmts_per_dblk as usize,
-                        is_filtered,
-                        header.max_dblk_page_nelmts_bits,
-                        offset_size,
-                        header.element_size,
-                        sizeof_nelmts,
-                    )?
-                };
+                let dblk_entries = read_data_block_storage(
+                    storage,
+                    dblk_addr,
+                    checked_usize_from_u64(
+                        elmts_per_dblk,
+                        "extensible array data block element count",
+                    )?,
+                    is_filtered,
+                    header.max_dblk_page_nelmts_bits,
+                    offset_size,
+                    header.element_size,
+                    sizeof_nelmts,
+                )?;
                 all_entries.extend(dblk_entries);
             }
         }
@@ -1392,19 +1578,18 @@ pub fn collect_extensible_array_chunk_entries_storage(
             continue;
         }
 
-        let page_bitmap_bytes = if header.max_dblk_page_nelmts_bits > 0
-            && elmts_per_dblk > (1u64 << header.max_dblk_page_nelmts_bits)
-        {
-            let page_nelmts = 1usize << header.max_dblk_page_nelmts_bits;
-            let pages_per_dblk = (elmts_per_dblk as usize).div_ceil(page_nelmts);
-            (num_dblks as usize * pages_per_dblk).div_ceil(8)
-        } else {
-            0
-        };
+        let page_bitmap_bytes = secondary_page_bitmap_bytes(
+            header.max_dblk_page_nelmts_bits,
+            elmts_per_dblk,
+            num_dblks,
+        )?;
         let dblk_addrs = parse_secondary_block_storage(
             storage,
             sec_addr,
-            num_dblks as usize,
+            checked_usize_from_u64(
+                num_dblks,
+                "extensible array secondary block data block count",
+            )?,
             offset_size,
             sizeof_nelmts,
             page_bitmap_bytes,
@@ -1420,50 +1605,13 @@ pub fn collect_extensible_array_chunk_entries_storage(
                     });
                 }
             } else {
-                let page_nelmts = if header.max_dblk_page_nelmts_bits > 0 {
-                    1usize << header.max_dblk_page_nelmts_bits
-                } else {
-                    0
-                };
-                let _dblk_len = if page_nelmts > 0 && elmts_per_dblk as usize > page_nelmts {
-                    let num_pages = (elmts_per_dblk as usize).div_ceil(page_nelmts);
-                    let bitmap_bytes = num_pages.div_ceil(8);
-                    let mut len =
-                        4 + 1 + 1 + usize::from(offset_size) + sizeof_nelmts + bitmap_bytes;
-                    for page_idx in 0..num_pages {
-                        let entries_in_page = if page_idx == num_pages - 1 {
-                            let remainder = elmts_per_dblk as usize % page_nelmts;
-                            if remainder == 0 {
-                                page_nelmts
-                            } else {
-                                remainder
-                            }
-                        } else {
-                            page_nelmts
-                        };
-                        len += entries_in_page * usize::from(header.element_size) + 4;
-                    }
-                    len
-                } else {
-                    4 + 1
-                        + 1
-                        + usize::from(offset_size)
-                        + sizeof_nelmts
-                        + elmts_per_dblk as usize * usize::from(header.element_size)
-                        + 4
-                };
-                let block = storage.read_range(
+                let dblk_entries = read_data_block_storage(
+                    storage,
                     dblk_addr,
-                    usize::try_from(storage.len().saturating_sub(dblk_addr)).map_err(|_| {
-                        Error::InvalidData(
-                            "extensible array data block exceeds platform usize capacity".into(),
-                        )
-                    })?,
-                )?;
-                let dblk_entries = parse_data_block(
-                    block.as_ref(),
-                    0,
-                    elmts_per_dblk as usize,
+                    checked_usize_from_u64(
+                        elmts_per_dblk,
+                        "extensible array data block element count",
+                    )?,
                     is_filtered,
                     header.max_dblk_page_nelmts_bits,
                     offset_size,
@@ -1517,6 +1665,142 @@ pub fn collect_extensible_array_chunk_entries_storage(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{Storage, StorageBuffer};
+    use std::sync::Mutex;
+
+    const TEST_OFFSET_SIZE: u8 = 8;
+    const TEST_LENGTH_SIZE: u8 = 8;
+    const TEST_HEADER_ADDR: u64 = 0;
+    const TEST_INDEX_ADDR: u64 = 128;
+    const TEST_SECONDARY_ADDR: u64 = 512;
+    const TEST_DATA_BLOCK_ADDR: u64 = 768;
+
+    struct RecordingStorage {
+        data: Vec<u8>,
+        ranges: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl RecordingStorage {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn ranges(&self) -> Vec<(u64, usize)> {
+            self.ranges.lock().unwrap().clone()
+        }
+
+        fn clear_ranges(&self) {
+            self.ranges.lock().unwrap().clear();
+        }
+    }
+
+    impl Storage for RecordingStorage {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
+            let start = usize::try_from(offset).map_err(|_| Error::OffsetOutOfBounds(offset))?;
+            let end = start.checked_add(len).ok_or(Error::UnexpectedEof {
+                offset,
+                needed: len as u64,
+                available: self.data.len().saturating_sub(start) as u64,
+            })?;
+            if end > self.data.len() {
+                return Err(Error::UnexpectedEof {
+                    offset,
+                    needed: len as u64,
+                    available: self.data.len().saturating_sub(start) as u64,
+                });
+            }
+            self.ranges.lock().unwrap().push((offset, len));
+            Ok(StorageBuffer::from_vec(self.data[start..end].to_vec()))
+        }
+    }
+
+    fn put(data: &mut [u8], offset: u64, bytes: &[u8]) {
+        let start = offset as usize;
+        data[start..start + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn push_u64(buf: &mut Vec<u8>, value: u64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_offset(buf: &mut Vec<u8>, value: u64) {
+        push_u64(buf, value);
+    }
+
+    fn ea_header_bytes(nelmts: u64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&EAHD_SIGNATURE);
+        buf.push(0); // version
+        buf.push(0); // unfiltered raw chunk client
+        buf.push(8); // element size: address only
+        buf.push(8); // max_nelmts_bits, so sizeof_nelmts is 1
+        buf.push(0); // inline elements
+        buf.push(1); // minimum data block elements
+        buf.push(1); // minimum secondary block data pointers
+        buf.push(0); // unpaged data blocks
+        for value in [0, 0, 0, 0, 0, nelmts] {
+            push_u64(&mut buf, value);
+        }
+        push_offset(&mut buf, TEST_INDEX_ADDR);
+        let checksum = jenkins_lookup3(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    fn index_block_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&EAIB_SIGNATURE);
+        buf.push(0); // version
+        buf.push(0); // client id
+        push_offset(&mut buf, TEST_HEADER_ADDR);
+        push_offset(&mut buf, u64::MAX); // first direct data block
+        push_offset(&mut buf, u64::MAX); // second direct data block
+        push_offset(&mut buf, TEST_SECONDARY_ADDR);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    fn secondary_block_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&EASB_SIGNATURE);
+        buf.push(0); // version
+        buf.push(0); // client id
+        push_offset(&mut buf, TEST_HEADER_ADDR);
+        buf.push(0); // block offset, sizeof_nelmts = 1
+        push_offset(&mut buf, TEST_DATA_BLOCK_ADDR);
+        push_offset(&mut buf, u64::MAX);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    fn data_block_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&EADB_SIGNATURE);
+        buf.push(0); // version
+        buf.push(0); // client id
+        push_offset(&mut buf, TEST_HEADER_ADDR);
+        buf.push(0); // block offset, sizeof_nelmts = 1
+        push_offset(&mut buf, 0x2000);
+        push_offset(&mut buf, 0x2010);
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf
+    }
+
+    fn storage_fixture() -> RecordingStorage {
+        let mut data = vec![0u8; 4096];
+        put(&mut data, TEST_HEADER_ADDR, &ea_header_bytes(7));
+        put(&mut data, TEST_INDEX_ADDR, &index_block_bytes());
+        put(&mut data, TEST_SECONDARY_ADDR, &secondary_block_bytes());
+        put(&mut data, TEST_DATA_BLOCK_ADDR, &data_block_bytes());
+        RecordingStorage::new(data)
+    }
 
     #[test]
     fn eahd_bad_signature() {
@@ -1548,5 +1832,54 @@ mod tests {
         assert_eq!(layout[2], (4, 4));
         // sb 3: elmts_per_dblk = 2 * 2^1 = 4, num_dblks = 2 * 2^2 = 8  (cap = 32 elements)
         assert_eq!(layout[3], (4, 8));
+    }
+
+    #[test]
+    fn storage_full_scan_reads_exact_secondary_and_data_block_lengths() {
+        let storage = storage_fixture();
+
+        let entries = collect_extensible_array_chunk_entries_storage(
+            &storage,
+            TEST_HEADER_ADDR,
+            TEST_OFFSET_SIZE,
+            TEST_LENGTH_SIZE,
+            &[7],
+            &[1],
+            None,
+        )
+        .unwrap();
+
+        assert!(!entries.is_empty());
+        let ranges = storage.ranges();
+        assert!(ranges.contains(&(TEST_HEADER_ADDR, 72)));
+        assert!(ranges.contains(&(TEST_INDEX_ADDR, 42)));
+        assert!(ranges.contains(&(TEST_SECONDARY_ADDR, 35)));
+        assert!(ranges.contains(&(TEST_DATA_BLOCK_ADDR, 35)));
+        assert!(ranges.iter().all(|(_, len)| *len <= 72), "{ranges:?}");
+    }
+
+    #[test]
+    fn storage_bounded_scan_reads_exact_index_block_length() {
+        let storage = storage_fixture();
+        storage.clear_ranges();
+
+        let entries = collect_extensible_array_chunk_entries_storage(
+            &storage,
+            TEST_HEADER_ADDR,
+            TEST_OFFSET_SIZE,
+            TEST_LENGTH_SIZE,
+            &[7],
+            &[1],
+            Some((&[3], &[3])),
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].address, 0x2000);
+        let ranges = storage.ranges();
+        assert!(ranges.contains(&(TEST_HEADER_ADDR, 72)));
+        assert!(ranges.contains(&(TEST_INDEX_ADDR, 42)));
+        assert!(ranges.contains(&(TEST_SECONDARY_ADDR, 35)));
+        assert!(ranges.iter().all(|(_, len)| *len <= 72), "{ranges:?}");
     }
 }

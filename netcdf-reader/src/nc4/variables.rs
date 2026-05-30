@@ -102,8 +102,9 @@ pub fn extract_variable(
     };
     let is_unlimited = var_dims.iter().any(|d| d.is_unlimited);
     let shape = ds.shape();
-    let (data_size, record_size) =
-        compute_storage_sizes(shape, nc_type.size() as u64, is_unlimited)?;
+    let elem_size = u64::try_from(nc_type.size()?)
+        .map_err(|_| Error::InvalidData("NetCDF-4 type size exceeds u64 capacity".to_string()))?;
+    let (data_size, record_size) = compute_storage_sizes(shape, elem_size, is_unlimited)?;
     let var_attrs = attributes::extract_variable_attributes(ds, metadata_mode)?;
 
     Ok(Some(NcVariable {

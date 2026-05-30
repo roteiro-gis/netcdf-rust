@@ -678,7 +678,7 @@ fn walk_netcdf_rust_group(group: &NcGroup) -> usize {
     for variable in &group.variables {
         total += variable.name().len();
         total += variable.ndim();
-        total += variable.num_elements() as usize;
+        total += usize::try_from(variable.num_elements().unwrap()).unwrap();
         total += variable.attributes().len();
         for dimension in variable.dimensions() {
             total += dimension.name.len();
