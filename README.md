@@ -161,7 +161,8 @@ netcdf-reader = { version = "0.6", default-features = false }  # CDF-1/2/5 only
 HDF5 external raw data files are not resolved by default. To allow them for
 trusted files, opt in with a resolver rooted at the directory that should
 contain the external data. The filesystem resolver rejects absolute paths,
-`..`, and canonical paths that escape that root.
+`..`, and canonical paths that escape that root. The same confinement is
+applied by `FilesystemExternalLinkResolver` when external links are enabled.
 
 ```rust
 use std::path::Path;

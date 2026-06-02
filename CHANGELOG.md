@@ -2,16 +2,18 @@
 
 ## Unreleased
 
-- Hardened HDF5 external raw data handling so filesystem resolution is opt-in
-  and confined to relative paths under the resolver base directory.
+## 0.6.0 - 2026-05-30
+
+- Hardened HDF5 external raw data and external-link handling so raw data
+  filesystem resolution is opt-in and both filesystem resolvers are confined to
+  relative paths under the resolver base directory.
 - Limited filtered HDF5 chunk and fractal-heap decompression to the expected
   decoded size plus one byte before final size validation.
-- Replaced unchecked HDF5/NetCDF shape, array-type, and implicit chunk size
-  products with fallible overflow checks.
+- Changed public HDF5/NetCDF element-count and type-size helpers to return
+  fallible results, replacing unchecked shape, array-type, and implicit chunk
+  size products with overflow checks.
 - Limited HDF5 extensible-array chunk index storage reads to exact block
   lengths instead of reading metadata blocks through end-of-file.
-
-## 0.6.0 - 2026-05-28
 
 - Added internal Rayon parallelism for classic NetCDF CDF-1/2/5 full-variable
   reads and hyperslab slices.

@@ -196,22 +196,16 @@ impl FilesystemExternalLinkResolver {
         }
     }
 
-    fn path_for(&self, filename: &str) -> PathBuf {
-        let path = Path::new(filename);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.base_dir.join(path)
-        }
+    fn path_for(&self, filename: &str) -> Result<Option<PathBuf>> {
+        resolve_path_within_base(&self.base_dir, filename, "external link")
     }
 }
 
 impl ExternalLinkResolver for FilesystemExternalLinkResolver {
     fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>> {
-        let path = self.path_for(filename);
-        if !path.exists() {
+        let Some(path) = self.path_for(filename)? else {
             return Ok(None);
-        }
+        };
 
         if let Some(file) = self.cache.lock().get(&path).cloned() {
             return Ok(Some(file));
@@ -618,6 +612,51 @@ mod tests {
 
         let resolver = FilesystemExternalFileResolver::new(dir.path());
         let err = match resolver.resolve_external_file("raw.bin") {
+            Ok(_) => panic!("symlink escape should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn filesystem_external_link_resolver_rejects_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("linked.h5");
+        std::fs::write(&path, b"not really hdf5").unwrap();
+
+        let resolver = FilesystemExternalLinkResolver::new(dir.path());
+        let err = match resolver.resolve_external_link(path.to_str().unwrap()) {
+            Ok(_) => panic!("absolute external link path should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("must be relative"));
+    }
+
+    #[test]
+    fn filesystem_external_link_resolver_rejects_parent_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = FilesystemExternalLinkResolver::new(dir.path());
+
+        let err = match resolver.resolve_external_link("../linked.h5") {
+            Ok(_) => panic!("parent external link path should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("resolver base directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_external_link_resolver_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("linked.h5");
+        std::fs::write(&outside_path, b"not really hdf5").unwrap();
+        symlink(&outside_path, dir.path().join("linked.h5")).unwrap();
+
+        let resolver = FilesystemExternalLinkResolver::new(dir.path());
+        let err = match resolver.resolve_external_link("linked.h5") {
             Ok(_) => panic!("symlink escape should be rejected"),
             Err(err) => err,
         };
