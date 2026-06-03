@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.6.0 - 2026-06-02
+## 0.6.0 - 2026-06-03
 
 - require an explicit HDF5 external raw-data resolver, and make filesystem external raw/link resolvers reject absolute paths, parent components, and canonical paths outside the resolver base directory
 - stop filtered HDF5 chunk and fractal-heap decompression at the expected decoded size plus one byte before final size validation
