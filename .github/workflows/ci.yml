@@ -20,75 +20,78 @@ env:
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.81
+      - name: Install Rust
+        run: rustup toolchain install 1.81.0 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo check --workspace --all-features --locked
+        run: cargo +1.81.0 check --workspace --all-features --locked
 
   no-default-features:
     name: Test without default features
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Test hdf5-reader no defaults
-        run: cargo test -p hdf5-reader --no-default-features
+        run: cargo test -p hdf5-reader --no-default-features --locked
 
       - name: Test netcdf-reader no defaults
-        run: cargo test -p netcdf-reader --no-default-features
+        run: cargo test -p netcdf-reader --no-default-features --locked
 
   cf-feature:
     name: Test CF feature
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Test netcdf-reader with cf
-        run: cargo test -p netcdf-reader --features cf
+        run: cargo test -p netcdf-reader --features cf --locked
 
   release-checks:
     name: Release checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Fetch package dependencies
         run: cargo fetch --locked
 
       - name: Package hdf5-reader offline
-        run: cargo package -p hdf5-reader --offline
+        run: cargo package -p hdf5-reader --offline --locked
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --version 0.22.1
+        run: cargo install cargo-audit --version 0.22.1 --locked
 
       # cargo-audit currently reports a dev-only rand 0.9.2 warning through
       # proptest; keep it visible here until proptest/rand ships the fix.
@@ -97,27 +100,29 @@ jobs:
 
   asan-fuzz-check:
     name: ASan fuzz check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install Rust
+        run: rustup toolchain install nightly-2026-06-02 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.1
+        run: cargo +nightly-2026-06-02 install cargo-fuzz --version 0.13.1 --locked
 
       - name: Run chunked read fuzz check under ASan
         working-directory: hdf5-reader
-        run: cargo +nightly fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
+        run: cargo +nightly-2026-06-02 fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
 
   fixtures:
     name: Integration tests with fixtures
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - uses: actions/setup-python@v5
@@ -128,11 +133,11 @@ jobs:
         run: scripts/generate-fixtures.sh
 
       - name: Test with fixtures
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   bench-regression-check:
     name: Benchmark regression CI check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/bench-regression
@@ -148,7 +153,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:

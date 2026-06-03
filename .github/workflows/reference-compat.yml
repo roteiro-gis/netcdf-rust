@@ -17,7 +17,7 @@ env:
 jobs:
   reference-benchmarks:
     name: Reference compatibility benchmarks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/reference-compat
       BENCH_THREAD_LIST: "1,2,4,8"
@@ -25,7 +25,8 @@ jobs:
       BENCHMARK_SUMMARY_PATH: ${{ github.workspace }}/benchmark-summary.md
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
