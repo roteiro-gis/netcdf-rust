@@ -46,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: cargo +1.81.0 check --workspace --all-features --locked
+        run: rustup run 1.81.0 cargo check --workspace --all-features --locked
 
   no-default-features:
     name: Test without default features
@@ -105,16 +105,18 @@ jobs:
       RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
+      - name: Install Rust for cargo-fuzz
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
       - name: Install Rust
         run: rustup toolchain install nightly-2026-06-02 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-fuzz
-        run: cargo +nightly-2026-06-02 install cargo-fuzz --version 0.13.1 --locked
+        run: rustup run 1.85.0 cargo install cargo-fuzz --version 0.13.1 --locked
 
       - name: Run chunked read fuzz check under ASan
         working-directory: hdf5-reader
-        run: cargo +nightly-2026-06-02 fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
+        run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
 
   fixtures:
     name: Integration tests with fixtures
