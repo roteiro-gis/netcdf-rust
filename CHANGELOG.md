@@ -9,6 +9,8 @@
 - require benchmark regression CI failures to exceed both the percentage
   threshold and a minimum absolute slowdown, reducing false positives for
   low-microsecond workloads on shared runners
+- stop hard-gating CI on the end-to-end parallel open-and-read benchmark, which
+  is dominated by thread scheduling and filesystem/cache noise on shared runners
 
 ## 0.6.0 - 2026-06-03
 
