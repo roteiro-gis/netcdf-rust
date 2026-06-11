@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- fix version 1 B-tree raw-data chunk keys to read each per-dimension chunk
+  offset as a fixed 8-byte value instead of `size_of_offsets` bytes, so chunked
+  datasets in 32-bit-superblock files (`size_of_offsets = 4`) locate their chunk
+  addresses correctly instead of failing to decompress
+
 ## 0.6.0 - 2026-06-03
 
 - require an explicit HDF5 external raw-data resolver, and make filesystem external raw/link resolvers reject absolute paths, parent components, and canonical paths outside the resolver base directory
