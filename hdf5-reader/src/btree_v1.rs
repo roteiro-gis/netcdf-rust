@@ -94,7 +94,7 @@ impl BTreeV1Node {
         for i in 0..num_keys {
             let key = match node_type {
                 0 => parse_group_key(cursor, length_size)?,
-                1 => parse_raw_data_key(cursor, offset_size, ndims)?,
+                1 => parse_raw_data_key(cursor, ndims)?,
                 _ => {
                     return Err(Error::InvalidData(format!(
                         "unknown v1 B-tree node type: {node_type}"
@@ -133,13 +133,16 @@ fn parse_group_key(cursor: &mut Cursor, length_size: u8) -> Result<BTreeV1Key> {
 /// Format:
 /// - chunk_size (u32 LE) — size of the chunk in bytes after filters
 /// - filter_mask (u32 LE) — bit mask of filters to skip
-/// - (ndims + 1) offsets, each `offset_size` bytes — chunk offsets per dimension
-///   plus an extra trailing offset (dataset element offset, typically 0)
-fn parse_raw_data_key(
-    cursor: &mut Cursor,
-    offset_size: u8,
-    ndims: Option<u32>,
-) -> Result<BTreeV1Key> {
+/// - (ndims + 1) chunk-offset values per dimension (plus the trailing element
+///   offset, typically 0)
+///
+/// Each chunk-offset value is **always 8 bytes**, independent of the
+/// superblock's "size of offsets" field. The HDF5 format spec fixes these key
+/// dimension offsets at 64 bits (see the "Version 1 B-trees" / raw-data chunk
+/// key layout); reading them as `size_of_offsets` bytes corrupts the cursor
+/// position on 32-bit-superblock files (`size_of_offsets = 4`), yielding a
+/// garbage chunk address and a failed chunk decode.
+fn parse_raw_data_key(cursor: &mut Cursor, ndims: Option<u32>) -> Result<BTreeV1Key> {
     let nd = ndims.ok_or_else(|| {
         Error::InvalidData("ndims required for raw data chunk B-tree keys".into())
     })?;
@@ -150,7 +153,8 @@ fn parse_raw_data_key(
     let num_offsets = nd as usize + 1;
     let mut offsets = Vec::with_capacity(num_offsets);
     for _ in 0..num_offsets {
-        offsets.push(cursor.read_offset(offset_size)?);
+        // Fixed 64-bit dimension offset per the HDF5 spec — NOT size_of_offsets.
+        offsets.push(cursor.read_u64_le()?);
     }
 
     Ok(BTreeV1Key::RawData {
@@ -322,10 +326,12 @@ fn collect_recursive_storage(
             let ndims = context.ndims.ok_or_else(|| {
                 Error::InvalidData("ndims required for raw data chunk B-tree keys".into())
             })?;
+            // chunk_size (4) + filter_mask (4), then (ndims + 1) dimension
+            // offsets at a fixed 8 bytes each — NOT size_of_offsets (HDF5 spec).
             8 + (usize::try_from(ndims).map_err(|_| {
                 Error::InvalidData("B-tree v1 ndims exceeds platform usize capacity".into())
             })? + 1)
-                * usize::from(context.offset_size)
+                * 8
         }
         _ => {
             return Err(Error::InvalidData(format!(
@@ -439,7 +445,10 @@ mod tests {
             buf.extend_from_slice(&cs.to_le_bytes());
             buf.extend_from_slice(&fm.to_le_bytes());
             for &o in offs {
-                push_offset(&mut buf, o, offset_size);
+                // Chunk-key dimension offsets are ALWAYS 8 bytes, independent of
+                // the superblock's size_of_offsets (HDF5 format spec). Child
+                // pointers below remain offset_size-byte file addresses.
+                buf.extend_from_slice(&o.to_le_bytes());
             }
             if i < children.len() {
                 push_offset(&mut buf, children[i], offset_size);
@@ -544,6 +553,11 @@ mod tests {
         assert_eq!(node.children[0], 0x5000);
     }
 
+    /// Regression test for 32-bit-superblock files (`size_of_offsets = 4`):
+    /// chunk-key dimension offsets are fixed 8-byte values, so the child chunk
+    /// address (a 4-byte file offset here) must be read at the correct cursor
+    /// position. Reading the dimension offsets as 4 bytes (the old bug)
+    /// misaligns the cursor and yields a garbage child address.
     #[test]
     fn parse_rawdata_leaf_4byte() {
         let undef4 = 0xFFFF_FFFFu64;
@@ -553,7 +567,7 @@ mod tests {
             undef4,
             undef4,
             &[
-                (512, 0x03, vec![0, 0]), // ndims=1, key has 2 offsets
+                (512, 0x03, vec![0, 0]), // ndims=1, key has 2 offsets (each 8 bytes)
                 (512, 0, vec![100, 0]),
             ],
             &[0x3000],
@@ -566,15 +580,19 @@ mod tests {
         assert_eq!(node.node_type, 1);
         match &node.keys[0] {
             BTreeV1Key::RawData {
+                chunk_size,
                 filter_mask,
                 offsets,
-                ..
             } => {
+                assert_eq!(*chunk_size, 512);
                 assert_eq!(*filter_mask, 0x03);
                 assert_eq!(offsets, &[0, 0]);
             }
             _ => panic!("expected RawData key"),
         }
+        // The load-bearing assertion: the child chunk address is located only
+        // when the 8-byte dimension offsets are parsed at full width.
+        assert_eq!(node.children[0], 0x3000);
     }
 
     #[test]
