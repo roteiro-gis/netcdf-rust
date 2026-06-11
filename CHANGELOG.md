@@ -6,6 +6,9 @@
   offset as a fixed 8-byte value instead of `size_of_offsets` bytes, so chunked
   datasets in 32-bit-superblock files (`size_of_offsets = 4`) locate their chunk
   addresses correctly instead of failing to decompress
+- require benchmark regression CI failures to exceed both the percentage
+  threshold and a minimum absolute slowdown, reducing false positives for
+  low-microsecond workloads on shared runners
 
 ## 0.6.0 - 2026-06-03
 
