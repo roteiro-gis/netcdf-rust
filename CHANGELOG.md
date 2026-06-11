@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 - 2026-06-11
 
 - fix version 1 B-tree raw-data chunk keys to read each per-dimension chunk
   offset as a fixed 8-byte value instead of `size_of_offsets` bytes, so chunked
   datasets in 32-bit-superblock files (`size_of_offsets = 4`) locate their chunk
   addresses correctly instead of failing to decompress
+- require benchmark regression CI failures to exceed both the percentage
+  threshold and a minimum absolute slowdown, reducing false positives for
+  low-microsecond workloads on shared runners
+- stop hard-gating CI on the end-to-end parallel open-and-read benchmark, which
+  is dominated by thread scheduling and filesystem/cache noise on shared runners
 
 ## 0.6.0 - 2026-06-03
 

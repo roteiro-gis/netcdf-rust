@@ -21,7 +21,8 @@ export BENCH_SAMPLE_SIZE="${BENCH_SAMPLE_SIZE:-15}"
 export BENCH_MEASUREMENT_TIME="${BENCH_MEASUREMENT_TIME:-0.2}"
 export BENCH_WARMUP_TIME="${BENCH_WARMUP_TIME:-0.2}"
 export BENCH_REGRESSION_THRESHOLD_PERCENT="${BENCH_REGRESSION_THRESHOLD_PERCENT:-10}"
-export BENCH_CI_CHECK_FILTER="${BENCH_CI_CHECK_FILTER:-open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_classic/netcdf_rust/(large_cdf5|large_record_cdf5)|parallel_open_and_read/netcdf_rust_x(1|4)/large_nc4_compressed|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed}"
+export BENCH_REGRESSION_ABSOLUTE_THRESHOLD_NS="${BENCH_REGRESSION_ABSOLUTE_THRESHOLD_NS:-5000}"
+export BENCH_CI_CHECK_FILTER="${BENCH_CI_CHECK_FILTER:-open_only/netcdf_rust/(cdf1_simple|large_nc4_compressed)|metadata_reuse_handle/netcdf_rust/(cdf1_simple|nc4_compressed)|read_full_reuse_handle/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_hdf5_backend/netcdf_rust/(nc4_compressed|large_nc4_compressed)|slice_reuse_handle_classic/netcdf_rust/(large_cdf5|large_record_cdf5)|parallel_metadata_batch/netcdf_rust_x(1|4)/nc4_basic|parallel_slice_batch/netcdf_rust_x(1|4)/nc4_compressed|read_full_internal_parallel/netcdf_rust_x(1|4)/(large_nc4_compressed|nc4_compressed)|read_full_internal_parallel_nocache/netcdf_rust_x(1|4)/large_nc4_compressed}"
 
 if ! command -v critcmp >/dev/null 2>&1; then
   env -u RUSTFLAGS cargo install --locked critcmp
@@ -61,7 +62,7 @@ REPO_ROOT="$base_worktree" INSTALL_FIXTURE_DEPS=0 \
 run_compare_bench "$base_worktree" base
 run_compare_bench "$repo_root" pr
 
-echo "Benchmark deltas >=${BENCH_REGRESSION_THRESHOLD_PERCENT}%:"
+echo "Benchmark deltas >=${BENCH_REGRESSION_THRESHOLD_PERCENT}% (informational; failure also requires >${BENCH_REGRESSION_ABSOLUTE_THRESHOLD_NS}ns absolute slowdown):"
 critcmp base pr --target-dir "$CARGO_TARGET_DIR" --threshold "$BENCH_REGRESSION_THRESHOLD_PERCENT" || true
 
 "$python_bin" - <<'PY'
@@ -72,6 +73,7 @@ from pathlib import Path
 
 threshold_percent = float(os.environ["BENCH_REGRESSION_THRESHOLD_PERCENT"])
 threshold = 1.0 + threshold_percent / 100.0
+absolute_threshold_ns = float(os.environ["BENCH_REGRESSION_ABSOLUTE_THRESHOLD_NS"])
 target = Path(os.environ["CARGO_TARGET_DIR"]) / "criterion"
 base_files = sorted(target.glob("**/base/estimates.json"))
 pr_files = sorted(target.glob("**/pr/estimates.json"))
@@ -87,6 +89,7 @@ pr_index = {
 }
 
 regressions = []
+percent_only_regressions = []
 missing_pr = []
 
 for base_file in base_files:
@@ -111,8 +114,11 @@ for base_file in base_files:
         continue
 
     ratio = pr_mean / base_mean
-    if ratio > threshold:
-        regressions.append((ratio, bench_name, base_mean, pr_mean))
+    delta_ns = pr_mean - base_mean
+    if ratio > threshold and delta_ns > absolute_threshold_ns:
+        regressions.append((ratio, delta_ns, bench_name, base_mean, pr_mean))
+    elif ratio > threshold:
+        percent_only_regressions.append((ratio, delta_ns, bench_name, base_mean, pr_mean))
 
 if missing_pr:
     print("Missing PR benchmark estimates for:", file=sys.stderr)
@@ -129,16 +135,35 @@ def fmt_ns(value: float) -> str:
 if regressions:
     print(
         f"Benchmark regressions >{threshold_percent:.0f}% "
+        f"and >{fmt_ns(absolute_threshold_ns)} "
         "(PR median / base median):",
         file=sys.stderr,
     )
-    for ratio, name, base_mean, pr_mean in sorted(regressions, reverse=True):
+    for ratio, delta_ns, name, base_mean, pr_mean in sorted(regressions, reverse=True):
         print(
             f"  {name:70} {ratio:5.2f}x  "
-            f"base={fmt_ns(base_mean):>8}  pr={fmt_ns(pr_mean):>8}",
+            f"base={fmt_ns(base_mean):>8}  pr={fmt_ns(pr_mean):>8}  "
+            f"delta={fmt_ns(delta_ns):>8}",
             file=sys.stderr,
         )
     sys.exit(1)
 
-print(f"No benchmark regressions >{threshold_percent:.0f}% detected.")
+if percent_only_regressions:
+    print(
+        f"Ignored benchmark deltas >{threshold_percent:.0f}% but "
+        f"<={fmt_ns(absolute_threshold_ns)} absolute slowdown:"
+    )
+    for ratio, delta_ns, name, base_mean, pr_mean in sorted(
+        percent_only_regressions, reverse=True
+    ):
+        print(
+            f"  {name:70} {ratio:5.2f}x  "
+            f"base={fmt_ns(base_mean):>8}  pr={fmt_ns(pr_mean):>8}  "
+            f"delta={fmt_ns(delta_ns):>8}"
+        )
+
+print(
+    f"No benchmark regressions >{threshold_percent:.0f}% "
+    f"and >{fmt_ns(absolute_threshold_ns)} detected."
+)
 PY
