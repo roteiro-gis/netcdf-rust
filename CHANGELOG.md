@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 - 2026-06-11
 
 - fix version 1 B-tree raw-data chunk keys to read each per-dimension chunk
   offset as a fixed 8-byte value instead of `size_of_offsets` bytes, so chunked
