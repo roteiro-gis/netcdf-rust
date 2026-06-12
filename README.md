@@ -5,7 +5,11 @@
 [![netcdf-reader crates.io](https://img.shields.io/crates/v/netcdf-reader.svg)](https://crates.io/crates/netcdf-reader)
 [![netcdf-reader docs.rs](https://docs.rs/netcdf-reader/badge.svg)](https://docs.rs/netcdf-reader)
 
-Pure-Rust, read-only decoders for HDF5 and NetCDF. No C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
+Pure-Rust, read-only decoders for HDF5 and NetCDF. The published library dependency graph has no C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
+
+Reference tests, benchmarks, fixture generators, and fuzz targets may use native
+tooling such as NetCDF-C/HDF5 through dev-only dependencies. Those paths are not
+part of the library runtime dependency graph.
 
 ## Crates
 
