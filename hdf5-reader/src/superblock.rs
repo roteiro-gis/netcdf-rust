@@ -212,13 +212,16 @@ fn find_magic(cursor: &Cursor<'_>) -> Result<u64> {
 
     // Check 512, 1024, 2048, ...
     let mut offset: u64 = 512;
-    while offset + 8 <= cursor.len() {
+    while offset.checked_add(8).is_some_and(|end| end <= cursor.len()) {
         let c = cursor.at_offset(offset)?;
         let bytes = c.peek_bytes(8)?;
         if bytes == HDF5_MAGIC {
             return Ok(offset);
         }
-        offset *= 2;
+        let Some(next_offset) = offset.checked_mul(2) else {
+            break;
+        };
+        offset = next_offset;
     }
 
     Err(Error::InvalidMagic)
@@ -233,12 +236,18 @@ fn find_magic_in_storage(storage: &dyn Storage) -> Result<u64> {
     }
 
     let mut offset: u64 = 512;
-    while offset + 8 <= storage.len() {
+    while offset
+        .checked_add(8)
+        .is_some_and(|end| end <= storage.len())
+    {
         let bytes = storage.read_range(offset, 8)?;
         if bytes.as_ref() == HDF5_MAGIC {
             return Ok(offset);
         }
-        offset *= 2;
+        let Some(next_offset) = offset.checked_mul(2) else {
+            break;
+        };
+        offset = next_offset;
     }
 
     Err(Error::InvalidMagic)
@@ -247,6 +256,7 @@ fn find_magic_in_storage(storage: &dyn Storage) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::RangeRequestStorage;
 
     #[test]
     fn magic_detection() {
@@ -262,5 +272,14 @@ mod tests {
         let data = [0u8; 100];
         let cursor = Cursor::new(&data);
         assert!(find_magic(&cursor).is_err());
+    }
+
+    #[test]
+    fn storage_magic_search_handles_huge_length_without_overflow() {
+        let storage = RangeRequestStorage::new(u64::MAX, |_offset, len| Ok(vec![0; len]));
+
+        let err = find_magic_in_storage(&storage).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidMagic));
     }
 }
