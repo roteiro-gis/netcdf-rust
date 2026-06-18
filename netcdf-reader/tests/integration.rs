@@ -52,6 +52,26 @@ fn assert_close(actual: f64, expected: f64, tolerance: f64) {
 }
 
 #[cfg(feature = "netcdf4")]
+fn hdf5_error_contains_type_mismatch(err: &hdf5_reader::error::Error) -> bool {
+    match err {
+        hdf5_reader::error::Error::TypeMismatch { .. } => true,
+        hdf5_reader::error::Error::Context { source, .. } => {
+            hdf5_error_contains_type_mismatch(source)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn error_contains_type_mismatch(err: &netcdf_reader::Error) -> bool {
+    match err {
+        netcdf_reader::Error::TypeMismatch { .. } => true,
+        netcdf_reader::Error::Hdf5(source) => hdf5_error_contains_type_mismatch(source),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "netcdf4")]
 fn create_sparse_huge_nc4_fixture(path: &Path) {
     const DIM: usize = 1 << 20;
 
@@ -131,6 +151,17 @@ fn create_nc4_dimension_only_fixture(path: &Path) {
 
     let mut temp = file.variable_mut("temp").unwrap();
     temp.put_values(&[1.0_f32, 2.0, 3.0], (..,)).unwrap();
+}
+
+#[cfg(feature = "netcdf4")]
+fn create_nc4_unsigned_short_fixture(path: &Path) {
+    let mut file = netcdf::create_with(path, netcdf::Options::NETCDF4).unwrap();
+    file.add_dimension("x", 2).unwrap();
+    file.add_variable::<u16>("unsigned", &["x"]).unwrap();
+    file.enddef().unwrap();
+
+    let mut variable = file.variable_mut("unsigned").unwrap();
+    variable.put_values(&[0_u16, u16::MAX], (..,)).unwrap();
 }
 
 #[cfg(feature = "netcdf4")]
@@ -836,6 +867,31 @@ fn nc4_dimension_only_scale_is_not_variable_metadata() {
     let temp = file.variable("temp").unwrap();
     let dim_names: Vec<&str> = temp.dimensions().iter().map(|d| d.name.as_str()).collect();
     assert_eq!(dim_names, vec!["x"]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn nc4_unsigned_integer_variable_rejects_signed_read_type() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("unsigned_short.nc");
+    create_nc4_unsigned_short_fixture(&path);
+
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+    let values: ndarray::ArrayD<u16> = file.read_variable("unsigned").unwrap();
+    assert_eq!(values.as_slice().unwrap(), &[0, u16::MAX]);
+
+    let err = file.read_variable::<i16>("unsigned").unwrap_err();
+    assert!(
+        error_contains_type_mismatch(&err),
+        "expected type mismatch, got {err:?}"
+    );
+
+    let mut dst = [0_i16; 2];
+    let err = file.read_variable_into("unsigned", &mut dst).unwrap_err();
+    assert!(
+        error_contains_type_mismatch(&err),
+        "expected type mismatch, got {err:?}"
+    );
 }
 
 #[cfg(feature = "netcdf4")]

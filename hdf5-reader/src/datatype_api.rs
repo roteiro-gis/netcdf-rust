@@ -89,12 +89,14 @@ macro_rules! impl_h5type_int {
             fn from_bytes(bytes: &[u8], dtype: &Datatype) -> Result<Self> {
                 match dtype {
                     Datatype::FixedPoint {
-                        size, byte_order, ..
+                        size,
+                        signed,
+                        byte_order,
                     } => {
-                        if *size as usize != std::mem::size_of::<$ty>() {
+                        if *size as usize != std::mem::size_of::<$ty>() || *signed != $signed {
                             return Err(Error::TypeMismatch {
                                 expected: stringify!($ty).into(),
-                                actual: format!("FixedPoint(size={})", size),
+                                actual: format!("FixedPoint(size={}, signed={})", size, signed),
                             });
                         }
                         let arr = read_numeric::<$size>(bytes, *byte_order)?;
@@ -114,8 +116,10 @@ macro_rules! impl_h5type_int {
             fn decode_vec(raw: &[u8], dtype: &Datatype, count: usize) -> Option<Result<Vec<Self>>> {
                 match dtype {
                     Datatype::FixedPoint {
-                        size, byte_order, ..
-                    } if *size as usize == $size => {
+                        size,
+                        signed,
+                        byte_order,
+                    } if *size as usize == $size && *signed == $signed => {
                         let total_bytes = count.checked_mul($size)?;
                         if raw.len() < total_bytes {
                             return None;
@@ -154,9 +158,11 @@ macro_rules! impl_h5type_int {
                     dtype,
                     Datatype::FixedPoint {
                         size,
+                        signed,
                         byte_order,
-                        ..
-                    } if *size as usize == $size && byte_order_is_native(*byte_order)
+                    } if *size as usize == $size
+                        && *signed == $signed
+                        && byte_order_is_native(*byte_order)
                 )
             }
         }
@@ -400,6 +406,68 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(values, vec![1, 7]);
+    }
+
+    #[test]
+    fn integer_from_bytes_rejects_signedness_mismatch() {
+        let dtype = Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        };
+
+        let err = <i16 as H5Type>::from_bytes(&u16::MAX.to_le_bytes(), &dtype).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::TypeMismatch {
+                expected,
+                actual
+            } if expected == "i16" && actual.contains("signed=false")
+        ));
+    }
+
+    #[test]
+    fn integer_bulk_decode_rejects_signedness_mismatch() {
+        let unsigned_dtype = Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        };
+        let signed_dtype = Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            byte_order: ByteOrder::LittleEndian,
+        };
+
+        assert!(<i16 as H5Type>::decode_vec(&[0, 0], &unsigned_dtype, 1).is_none());
+        assert!(<u16 as H5Type>::decode_vec(&[0, 0], &signed_dtype, 1).is_none());
+    }
+
+    #[test]
+    fn integer_native_copy_compatible_rejects_signedness_mismatch() {
+        let unsigned_dtype = Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            byte_order: if cfg!(target_endian = "little") {
+                ByteOrder::LittleEndian
+            } else {
+                ByteOrder::BigEndian
+            },
+        };
+        let signed_dtype = Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            byte_order: if cfg!(target_endian = "little") {
+                ByteOrder::LittleEndian
+            } else {
+                ByteOrder::BigEndian
+            },
+        };
+
+        assert!(!<i16 as H5Type>::native_copy_compatible(&unsigned_dtype));
+        assert!(!<u16 as H5Type>::native_copy_compatible(&signed_dtype));
+        assert!(<u16 as H5Type>::native_copy_compatible(&unsigned_dtype));
+        assert!(<i16 as H5Type>::native_copy_compatible(&signed_dtype));
     }
 
     #[test]
