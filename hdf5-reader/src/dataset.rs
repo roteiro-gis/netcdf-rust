@@ -15,7 +15,7 @@ use crate::attribute_api::{
 };
 use crate::cache::{ChunkCache, ChunkCacheStats, ChunkKey};
 use crate::chunk_index;
-use crate::datatype_api::{dtype_element_size, H5Type};
+use crate::datatype_api::H5Type;
 use crate::error::{ByteOrder, Error, Result};
 use crate::filters::{self, FilterRegistry};
 use crate::io::Cursor;
@@ -2189,7 +2189,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype)?;
+        let elem_size = self.raw_element_size()?;
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
@@ -2425,7 +2425,7 @@ impl Dataset {
 
         let ndim = self.ndim();
         let shape = &self.dataspace.dims;
-        let elem_size = dtype_element_size(&self.datatype)?;
+        let elem_size = self.raw_element_size()?;
         let chunk_shape: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
         validate_chunk_shape(shape, &chunk_shape)?;
         let mut first_chunk = vec![0u64; ndim];
@@ -2930,7 +2930,7 @@ impl Dataset {
         element_count: usize,
         shape: &[usize],
     ) -> Result<ArrayD<T>> {
-        let elem_size = dtype_element_size(&self.datatype)?;
+        let elem_size = self.raw_element_size()?;
         let total_bytes = checked_mul_usize(element_count, elem_size, "fill result size in bytes")?;
         let fill = self.make_output_buffer(total_bytes);
         self.decode_buffer_with_shape::<T>(&fill, element_count, shape)
@@ -3809,13 +3809,13 @@ mod tests {
     use crate::superblock::Superblock;
     use std::collections::HashMap;
 
-    fn test_context(bytes: Vec<u8>) -> Arc<FileContext> {
+    fn test_context_with_offset_size(bytes: Vec<u8>, offset_size: u8) -> Arc<FileContext> {
         let storage: DynStorage = Arc::new(BytesStorage::new(bytes));
         Arc::new(FileContext {
             storage,
             superblock: Superblock {
                 version: 2,
-                offset_size: 8,
+                offset_size,
                 length_size: 8,
                 group_leaf_node_k: 0,
                 group_internal_node_k: 0,
@@ -3839,6 +3839,10 @@ mod tests {
             sohm_table: OnceLock::new(),
             full_file_cache: OnceLock::new(),
         })
+    }
+
+    fn test_context(bytes: Vec<u8>) -> Arc<FileContext> {
+        test_context_with_offset_size(bytes, 8)
     }
 
     fn fixed_u16_dataset(layout: DataLayout, storage_bytes: Vec<u8>) -> Dataset {
@@ -3869,6 +3873,62 @@ mod tests {
             full_dataset_bytes: Arc::new(OnceLock::new()),
             external_slots: Arc::new(OnceLock::new()),
             filter_registry: context.filter_registry.clone(),
+        }
+    }
+
+    fn vlen_string_dataset(
+        layout: DataLayout,
+        storage_bytes: Vec<u8>,
+        offset_size: u8,
+        fill_value: Option<FillValueMessage>,
+    ) -> Dataset {
+        let context = test_context_with_offset_size(storage_bytes, offset_size);
+        Dataset {
+            context: context.clone(),
+            name: "vlen".to_string(),
+            data_address: 0,
+            dataspace: DataspaceMessage {
+                rank: 1,
+                dims: vec![2],
+                max_dims: None,
+                dataspace_type: DataspaceType::Simple,
+            },
+            datatype: Datatype::String {
+                size: StringSize::Variable,
+                encoding: crate::messages::datatype::StringEncoding::Ascii,
+                padding: crate::messages::datatype::StringPadding::NullTerminate,
+            },
+            layout,
+            fill_value,
+            filters: None,
+            external_files: None,
+            attributes: Vec::new(),
+            chunk_cache: context.chunk_cache.clone(),
+            chunk_entry_cache: Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap()))),
+            full_chunk_entries: Arc::new(OnceLock::new()),
+            full_dataset_bytes: Arc::new(OnceLock::new()),
+            external_slots: Arc::new(OnceLock::new()),
+            filter_registry: context.filter_registry.clone(),
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RawElement(Vec<u8>);
+
+    impl H5Type for RawElement {
+        fn hdf5_type() -> Datatype {
+            Datatype::Opaque {
+                size: 0,
+                tag: "raw".to_string(),
+            }
+        }
+
+        fn from_bytes(bytes: &[u8], _dtype: &Datatype) -> Result<Self> {
+            Ok(Self(bytes.to_vec()))
+        }
+
+        fn element_size(dtype: &Datatype) -> usize {
+            crate::datatype_api::dtype_element_size(dtype).unwrap_or(0)
         }
     }
 
@@ -3903,6 +3963,108 @@ mod tests {
             .unwrap(),
             72
         );
+    }
+
+    #[test]
+    fn chunked_vlen_slice_uses_file_reference_width() {
+        for (offset_size, ref_size) in [(2u8, 10usize), (4u8, 12usize)] {
+            let chunk_bytes: Vec<u8> = (0..(2 * ref_size)).map(|i| (i + 1) as u8).collect();
+            let dataset = vlen_string_dataset(
+                DataLayout::Chunked {
+                    address: 0,
+                    dims: vec![2],
+                    element_size: 16,
+                    chunk_indexing: Some(ChunkIndexing::Implicit),
+                },
+                chunk_bytes.clone(),
+                offset_size,
+                None,
+            );
+
+            let selection = SliceInfo {
+                selections: vec![SliceInfoElem::Slice {
+                    start: 0,
+                    end: 2,
+                    step: 1,
+                }],
+            };
+            let array = dataset.read_slice::<RawElement>(&selection).unwrap();
+            let values: Vec<_> = array.iter().cloned().collect();
+
+            assert_eq!(values[0].0, chunk_bytes[..ref_size]);
+            assert_eq!(values[1].0, chunk_bytes[ref_size..2 * ref_size]);
+        }
+    }
+
+    #[cfg(feature = "rayon")]
+    #[test]
+    fn parallel_chunked_vlen_slice_uses_file_reference_width() {
+        for (offset_size, ref_size) in [(2u8, 10usize), (4u8, 12usize)] {
+            let chunk_bytes: Vec<u8> = (0..(2 * ref_size)).map(|i| (i + 1) as u8).collect();
+            let dataset = vlen_string_dataset(
+                DataLayout::Chunked {
+                    address: 0,
+                    dims: vec![2],
+                    element_size: 16,
+                    chunk_indexing: Some(ChunkIndexing::Implicit),
+                },
+                chunk_bytes.clone(),
+                offset_size,
+                None,
+            );
+
+            let selection = SliceInfo {
+                selections: vec![SliceInfoElem::Slice {
+                    start: 0,
+                    end: 2,
+                    step: 1,
+                }],
+            };
+            let array = dataset
+                .read_slice_parallel::<RawElement>(&selection)
+                .unwrap();
+            let values: Vec<_> = array.iter().cloned().collect();
+
+            assert_eq!(values[0].0, chunk_bytes[..ref_size]);
+            assert_eq!(values[1].0, chunk_bytes[ref_size..2 * ref_size]);
+        }
+    }
+
+    #[test]
+    fn undefined_chunked_vlen_slice_fill_uses_file_reference_width() {
+        for (offset_size, ref_size, undefined_address) in
+            [(2u8, 10usize, 0xFFFF), (4u8, 12usize, 0xFFFF_FFFF)]
+        {
+            let fill_bytes = vec![0xA5; ref_size];
+            let dataset = vlen_string_dataset(
+                DataLayout::Chunked {
+                    address: undefined_address,
+                    dims: vec![2],
+                    element_size: 16,
+                    chunk_indexing: Some(ChunkIndexing::Implicit),
+                },
+                Vec::new(),
+                offset_size,
+                Some(FillValueMessage {
+                    defined: true,
+                    fill_time: FillTime::IfSet,
+                    value: Some(fill_bytes.clone()),
+                }),
+            );
+
+            let selection = SliceInfo {
+                selections: vec![SliceInfoElem::Slice {
+                    start: 0,
+                    end: 2,
+                    step: 1,
+                }],
+            };
+            let array = dataset.read_slice::<RawElement>(&selection).unwrap();
+            let values: Vec<_> = array.iter().cloned().collect();
+
+            assert_eq!(values[0].0, fill_bytes);
+            assert_eq!(values[1].0, fill_bytes);
+        }
     }
 
     #[test]
