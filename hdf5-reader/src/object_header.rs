@@ -33,6 +33,19 @@ const MSG_TYPE_CONTINUATION: u16 = 0x0010;
 /// Nil (padding) message type id.
 const MSG_TYPE_NIL: u16 = 0x0000;
 
+fn checked_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidData(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
+}
+
+fn checked_add_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidData(format!("{context} exceeds platform usize capacity")))
+}
+
 /// Parsed object header with all its messages.
 #[derive(Debug, Clone)]
 pub struct ObjectHeader {
@@ -73,11 +86,11 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Self> {
-        let prefix = storage.read_range(address, 64)?;
-        if prefix.len() < 5 {
+        let prefix = storage.read_range(address, 4)?;
+        if prefix.len() < 4 {
             return Err(Error::UnexpectedEof {
                 offset: address,
-                needed: 5,
+                needed: 4,
                 available: prefix.len() as u64,
             });
         }
@@ -293,7 +306,10 @@ impl ObjectHeader {
         let header_data_size = cursor.read_u32_le()? as u64;
         let _reserved2 = cursor.read_u32_le()?;
 
-        let first_chunk = storage.read_range(address, (16 + header_data_size) as usize)?;
+        let header_data_size = checked_usize(header_data_size, "v1 object header data size")?;
+        let first_chunk_len =
+            checked_add_usize(16, header_data_size, "v1 object header chunk length")?;
+        let first_chunk = storage.read_range(address, first_chunk_len)?;
         let mut messages = Vec::with_capacity(num_messages as usize);
         let mut continuations = Vec::new();
         Self::read_v1_messages_from_slice(
@@ -305,7 +321,8 @@ impl ObjectHeader {
         )?;
 
         while let Some((cont_offset, cont_length)) = continuations.pop() {
-            let chunk = storage.read_range(cont_offset, cont_length as usize)?;
+            let cont_length = checked_usize(cont_length, "v1 object header continuation length")?;
+            let chunk = storage.read_range(cont_offset, cont_length)?;
             Self::read_v1_messages_from_slice(
                 chunk.as_ref(),
                 offset_size,
@@ -517,9 +534,35 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Self> {
-        let prefix = storage.read_range(address, 64)?;
-        let mut cursor = Cursor::new(prefix.as_ref());
+        let fixed_prefix = storage.read_range(address, 6)?;
+        let mut cursor = Cursor::new(fixed_prefix.as_ref());
 
+        let sig = cursor.read_bytes(4)?;
+        if sig != OHDR_SIGNATURE {
+            return Err(Error::InvalidObjectHeaderSignature);
+        }
+        let version = cursor.read_u8()?;
+        if version != 2 {
+            return Err(Error::UnsupportedObjectHeaderVersion(version));
+        }
+        let flags = cursor.read_u8()?;
+
+        let size_field_width = 1usize << (flags & 0x03);
+        let mut prefix_len = 6usize;
+        if (flags & 0x20) != 0 {
+            prefix_len = checked_add_usize(prefix_len, 16, "v2 object header prefix length")?;
+        }
+        if (flags & 0x10) != 0 {
+            prefix_len = checked_add_usize(prefix_len, 4, "v2 object header prefix length")?;
+        }
+        prefix_len = checked_add_usize(
+            prefix_len,
+            size_field_width,
+            "v2 object header prefix length",
+        )?;
+
+        let prefix = storage.read_range(address, prefix_len)?;
+        let mut cursor = Cursor::new(prefix.as_ref());
         let sig = cursor.read_bytes(4)?;
         if sig != OHDR_SIGNATURE {
             return Err(Error::InvalidObjectHeaderSignature);
@@ -545,13 +588,19 @@ impl ObjectHeader {
             let _min_dense = cursor.read_u16_le()?;
         }
 
-        let size_field_width = 1usize << (flags & 0x03);
         let chunk0_data_size = cursor.read_uvar(size_field_width)?;
         let creation_order_tracked = (flags & 0x04) != 0;
-        let messages_start = cursor.position() as usize;
-        let chunk0_end = messages_start + chunk0_data_size as usize;
+        let messages_start = checked_usize(cursor.position(), "v2 object header message start")?;
+        let chunk0_data_size = checked_usize(chunk0_data_size, "v2 object header chunk0 size")?;
+        let chunk0_end = checked_add_usize(
+            messages_start,
+            chunk0_data_size,
+            "v2 object header chunk0 end",
+        )?;
 
-        let chunk = storage.read_range(address, chunk0_end + 4)?;
+        let chunk_with_checksum_len =
+            checked_add_usize(chunk0_end, 4, "v2 object header chunk0 checksum end")?;
+        let chunk = storage.read_range(address, chunk_with_checksum_len)?;
         let stored_checksum = u32::from_le_bytes(
             chunk.as_ref()[chunk0_end..chunk0_end + 4]
                 .try_into()
@@ -827,7 +876,8 @@ impl ObjectHeader {
         messages: &mut Vec<HdfMessage>,
         continuations: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
-        let chunk = storage.read_range(cont_offset, cont_length as usize)?;
+        let cont_length = checked_usize(cont_length, "v2 object header continuation length")?;
+        let chunk = storage.read_range(cont_offset, cont_length)?;
         if chunk.len() < 8 || chunk.as_ref()[..4] != OCHK_SIGNATURE {
             return Err(Error::InvalidObjectHeaderSignature);
         }
@@ -964,6 +1014,7 @@ fn message_matches_type(message: &HdfMessage, message_type: u16) -> bool {
 mod tests {
     use super::*;
     use crate::checksum::jenkins_lookup3;
+    use crate::storage::BytesStorage;
 
     // ------------------------------------------------------------------
     // Helpers
@@ -1095,6 +1146,49 @@ mod tests {
         buf.extend_from_slice(&ck.to_le_bytes());
 
         buf
+    }
+
+    #[test]
+    fn parse_v1_storage_accepts_header_near_eof() {
+        let header = build_v1_header(&[], 7);
+        let mut file_data = vec![0xAA; 3];
+        let address = file_data.len() as u64;
+        file_data.extend_from_slice(&header);
+        let storage = BytesStorage::new(file_data);
+
+        let hdr = ObjectHeader::parse_at_storage(&storage, address, 8, 8).unwrap();
+
+        assert_eq!(hdr.version, 1);
+        assert_eq!(hdr.reference_count, 7);
+        assert!(hdr.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_storage_accepts_header_near_eof() {
+        let header = build_v2_header(0x00, &[], None, None);
+        let mut file_data = vec![0xAA; 5];
+        let address = file_data.len() as u64;
+        file_data.extend_from_slice(&header);
+        let storage = BytesStorage::new(file_data);
+
+        let hdr = ObjectHeader::parse_at_storage(&storage, address, 8, 8).unwrap();
+
+        assert_eq!(hdr.version, 2);
+        assert!(hdr.messages.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_storage_rejects_oversized_chunk0_size() {
+        let mut header = Vec::new();
+        header.extend_from_slice(&OHDR_SIGNATURE);
+        header.push(2);
+        header.push(0x03);
+        header.extend_from_slice(&u64::MAX.to_le_bytes());
+        let storage = BytesStorage::new(header);
+
+        let err = ObjectHeader::parse_at_storage(&storage, 0, 8, 8).unwrap_err();
+
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     // ------------------------------------------------------------------
