@@ -409,24 +409,14 @@ pub fn read_record_variable<T: NcReadType>(
     let elem_size = T::element_size();
     let base_offset =
         crate::types::checked_usize_from_u64(var.data_offset, "record variable data offset")?;
-    let numrecs_usize = crate::types::checked_usize_from_u64(numrecs, "record count")?;
     let record_stride_usize = crate::types::checked_usize_from_u64(record_stride, "record stride")?;
 
     // Shape: the first dimension is the unlimited dimension, replaced by numrecs.
-    let mut shape: Vec<usize> = var
-        .shape()
-        .iter()
-        .map(|&s| crate::types::checked_usize_from_u64(s, "record variable dimension"))
-        .collect::<Result<Vec<_>>>()?;
-    if shape.is_empty() {
-        return Err(Error::InvalidData(
-            "record variable must have at least one dimension".to_string(),
-        ));
-    }
-    shape[0] = numrecs_usize;
+    let shape = checked_record_shape(var, numrecs)?;
+    let numrecs_usize = shape[0];
 
     // Number of elements per record (product of all dims except the first).
-    let elements_per_record: usize = shape[1..].iter().product::<usize>().max(1);
+    let elements_per_record = checked_record_elements_per_record(var)?;
     let bytes_per_record = elements_per_record.checked_mul(elem_size).ok_or_else(|| {
         Error::InvalidData(format!(
             "record variable '{}' bytes per record exceed platform usize",
@@ -752,21 +742,28 @@ pub(crate) fn read_record_variable_into_from_storage<T: NcReadType>(
 ///
 /// Each record variable's per-record contribution is its `record_size` (already stored
 /// as vsize from the header), padded to 4-byte boundary.
-pub fn compute_record_stride(variables: &[NcVariable]) -> u64 {
+pub fn compute_record_stride(variables: &[NcVariable]) -> Result<u64> {
     variables
         .iter()
         .filter(|v| v.is_record_var)
-        .map(|v| {
+        .try_fold(0u64, |stride, v| {
             let size = v.record_size;
             // Pad each variable's per-record size to 4-byte boundary.
             let rem = size % 4;
-            if rem == 0 {
+            let padded = if rem == 0 {
                 size
             } else {
-                size + (4 - rem)
-            }
+                size.checked_add(4 - rem).ok_or_else(|| {
+                    Error::InvalidData(format!(
+                        "record variable '{}' padded record size exceeds u64",
+                        v.name
+                    ))
+                })?
+            };
+            stride
+                .checked_add(padded)
+                .ok_or_else(|| Error::InvalidData("record stride exceeds u64".to_string()))
         })
-        .sum()
 }
 
 fn checked_non_record_element_count(var: &NcVariable) -> Result<usize> {
@@ -1118,7 +1115,53 @@ mod tests {
             },
         ];
         // a: 20 (already 4-aligned), b: 6 -> 8 = total 28
-        assert_eq!(compute_record_stride(&vars), 28);
+        assert_eq!(compute_record_stride(&vars).unwrap(), 28);
+    }
+
+    #[test]
+    fn record_stride_rejects_padded_size_overflow() {
+        let vars = vec![NcVariable {
+            name: "huge".to_string(),
+            dimensions: vec![],
+            dtype: NcType::Byte,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: true,
+            record_size: u64::MAX,
+        }];
+
+        let err = compute_record_stride(&vars).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn record_stride_rejects_sum_overflow() {
+        let vars = vec![
+            NcVariable {
+                name: "a".to_string(),
+                dimensions: vec![],
+                dtype: NcType::Byte,
+                attributes: vec![],
+                data_offset: 0,
+                _data_size: 0,
+                is_record_var: true,
+                record_size: u64::MAX - 7,
+            },
+            NcVariable {
+                name: "b".to_string(),
+                dimensions: vec![],
+                dtype: NcType::Byte,
+                attributes: vec![],
+                data_offset: 0,
+                _data_size: 0,
+                is_record_var: true,
+                record_size: 8,
+            },
+        ];
+
+        let err = compute_record_stride(&vars).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
     }
 
     #[test]
@@ -1259,6 +1302,39 @@ mod tests {
         };
 
         let err = read_non_record_variable::<f32>(&[], &var).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn read_record_variable_rejects_elements_per_record_overflow() {
+        let var = NcVariable {
+            name: "huge_record".to_string(),
+            dimensions: vec![
+                NcDimension {
+                    name: "time".to_string(),
+                    size: 0,
+                    is_unlimited: true,
+                },
+                NcDimension {
+                    name: "y".to_string(),
+                    size: usize::MAX as u64,
+                    is_unlimited: false,
+                },
+                NcDimension {
+                    name: "x".to_string(),
+                    size: 2,
+                    is_unlimited: false,
+                },
+            ],
+            dtype: NcType::Float,
+            attributes: vec![],
+            data_offset: 0,
+            _data_size: 0,
+            is_record_var: true,
+            record_size: 4,
+        };
+
+        let err = read_record_variable::<f32>(&[], &var, 1, 4).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));
     }
 

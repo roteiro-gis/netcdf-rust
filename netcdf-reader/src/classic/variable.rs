@@ -100,7 +100,7 @@ impl ClassicFile {
         }
 
         if var.is_record_var {
-            let record_stride = compute_record_stride(&self.root_group.variables);
+            let record_stride = compute_record_stride(&self.root_group.variables)?;
             data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
         } else {
             data::read_non_record_variable_from_storage(&self.storage, var)
@@ -121,7 +121,7 @@ impl ClassicFile {
         }
 
         if var.is_record_var {
-            let record_stride = compute_record_stride(&self.root_group.variables);
+            let record_stride = compute_record_stride(&self.root_group.variables)?;
             data::read_record_variable_parallel_from_storage(
                 &self.storage,
                 var,
@@ -146,7 +146,7 @@ impl ClassicFile {
         }
 
         if var.is_record_var {
-            let record_stride = compute_record_stride(&self.root_group.variables);
+            let record_stride = compute_record_stride(&self.root_group.variables)?;
             data::read_record_variable_into_from_storage(
                 &self.storage,
                 var,
@@ -280,7 +280,7 @@ impl ClassicFile {
             return read_non_record_variable_slice_direct(&self.storage, var, &resolved);
         }
 
-        let record_stride = compute_record_stride(&self.root_group.variables);
+        let record_stride = compute_record_stride(&self.root_group.variables)?;
         read_record_variable_slice_direct(
             &self.storage,
             var,
@@ -315,7 +315,7 @@ impl ClassicFile {
             return read_non_record_variable_slice_parallel(&self.storage, var, &resolved);
         }
 
-        let record_stride = compute_record_stride(&self.root_group.variables);
+        let record_stride = compute_record_stride(&self.root_group.variables)?;
         read_record_variable_slice_parallel(
             &self.storage,
             var,
@@ -374,7 +374,7 @@ impl ClassicFile {
     /// Internal: read a variable with the correct record handling.
     fn read_typed_variable<T: NcReadType>(&self, var: &NcVariable) -> Result<ArrayD<T>> {
         if var.is_record_var {
-            let record_stride = compute_record_stride(&self.root_group.variables);
+            let record_stride = compute_record_stride(&self.root_group.variables)?;
             data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
         } else {
             data::read_non_record_variable_from_storage(&self.storage, var)
