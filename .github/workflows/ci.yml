@@ -114,6 +114,10 @@ jobs:
       - name: Install cargo-fuzz
         run: rustup run 1.85.0 cargo install cargo-fuzz --version 0.13.1 --locked
 
+      - name: Run open fuzz check under ASan
+        working-directory: hdf5-reader
+        run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_hdf5_open --sanitizer address -- -runs=256
+
       - name: Run chunked read fuzz check under ASan
         working-directory: hdf5-reader
         run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
