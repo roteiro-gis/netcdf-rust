@@ -97,11 +97,21 @@ impl Default for OpenOptions {
 }
 
 /// Resolves file names from HDF5 External Data Files messages to storage.
+///
+/// Implementations are responsible for their own path security policy. The
+/// built-in [`FilesystemExternalFileResolver`] confines normal paths to a base
+/// directory, but its root must be trusted and not attacker-writable because it
+/// does not use capability-style `openat` path traversal.
 pub trait ExternalFileResolver: Send + Sync {
     fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>>;
 }
 
 /// Resolves HDF5 external links to another opened file.
+///
+/// Implementations are responsible for their own path security policy. The
+/// built-in [`FilesystemExternalLinkResolver`] confines normal paths to a base
+/// directory, but its root must be trusted and not attacker-writable because it
+/// does not use capability-style `openat` path traversal.
 pub trait ExternalLinkResolver: Send + Sync {
     fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>>;
 }
@@ -155,6 +165,13 @@ fn resolve_path_within_base(
 }
 
 /// Filesystem resolver for external raw data files.
+///
+/// The resolver rejects absolute paths, `..` components, and paths whose
+/// canonical target is outside `base_dir`. This is intended for trusted
+/// resolver roots. If `base_dir` or its descendants can be modified by an
+/// attacker concurrently, a symlink swap between validation and open can race
+/// this resolver. Use a custom resolver backed by capability-style path APIs
+/// for attacker-writable roots.
 #[derive(Debug, Clone)]
 pub struct FilesystemExternalFileResolver {
     base_dir: PathBuf,
@@ -183,6 +200,13 @@ impl ExternalFileResolver for FilesystemExternalFileResolver {
 
 /// Filesystem resolver for external links. Linked files are cached after the
 /// first successful open.
+///
+/// The resolver rejects absolute paths, `..` components, and paths whose
+/// canonical target is outside `base_dir`. This is intended for trusted
+/// resolver roots. If `base_dir` or its descendants can be modified by an
+/// attacker concurrently, a symlink swap between validation and open can race
+/// this resolver. Use a custom resolver backed by capability-style path APIs
+/// for attacker-writable roots.
 pub struct FilesystemExternalLinkResolver {
     base_dir: PathBuf,
     cache: parking_lot::Mutex<HashMap<PathBuf, Hdf5File>>,

@@ -167,6 +167,11 @@ trusted files, opt in with a resolver rooted at the directory that should
 contain the external data. The filesystem resolver rejects absolute paths,
 `..`, and canonical paths that escape that root. The same confinement is
 applied by `FilesystemExternalLinkResolver` when external links are enabled.
+Use these filesystem resolvers only with trusted resolver roots that are not
+attacker-writable; they validate paths before opening and do not provide
+capability-style protection against concurrent symlink swaps. For
+attacker-writable roots, provide a custom resolver backed by `openat` or another
+capability-style path API.
 
 ```rust
 use std::path::Path;
