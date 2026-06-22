@@ -219,7 +219,8 @@ fn parse_record(
     record_size: u16,
     offset_size: u8,
     length_size: u8,
-    _ndims: Option<u32>,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
     heap_id_len: usize,
 ) -> Result<BTreeV2Record> {
     let record_start = cursor.position();
@@ -331,12 +332,15 @@ fn parse_record(
             // Chunk offsets are encoded as scaled 64-bit values.
             // The number of offset dimensions is calculated from the record size.
             // Each offset is 8 bytes in a type-10 record.
-            let offset_bytes_available = record_size as usize - offset_size as usize;
+            let offset_bytes_available = (record_size as usize)
+                .checked_sub(offset_size as usize)
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "B-tree v2 type-10 chunk record is shorter than its address".into(),
+                    )
+                })?;
             let num_offsets = offset_bytes_available / 8;
-            let mut offsets = Vec::with_capacity(num_offsets);
-            for _ in 0..num_offsets {
-                offsets.push(cursor.read_u64_le()?);
-            }
+            let offsets = read_scaled_chunk_offsets(cursor, num_offsets, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedNonFiltered { address, offsets }
         }
 
@@ -347,12 +351,17 @@ fn parse_record(
             let nbytes_size = length_size as usize;
             let chunk_size = cursor.read_length(length_size)?;
             let filter_mask = cursor.read_u32_le()?;
-            let remaining = record_size as usize - offset_size as usize - nbytes_size - 4; // filter_mask
+            let remaining = (record_size as usize)
+                .checked_sub(offset_size as usize)
+                .and_then(|remaining| remaining.checked_sub(nbytes_size))
+                .and_then(|remaining| remaining.checked_sub(4))
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "B-tree v2 type-11 chunk record is shorter than its fixed fields".into(),
+                    )
+                })?;
             let num_offsets = remaining / 8;
-            let mut offsets = Vec::with_capacity(num_offsets);
-            for _ in 0..num_offsets {
-                offsets.push(cursor.read_u64_le()?);
-            }
+            let offsets = read_scaled_chunk_offsets(cursor, num_offsets, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedFiltered {
                 address,
                 chunk_size,
@@ -378,6 +387,41 @@ fn parse_record(
     }
 
     Ok(record)
+}
+
+fn read_scaled_chunk_offsets(
+    cursor: &mut Cursor,
+    num_offsets: usize,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+) -> Result<Vec<u64>> {
+    if let Some(ndims) = ndims {
+        let ndims = usize::try_from(ndims)
+            .map_err(|_| Error::InvalidData("B-tree v2 chunk rank exceeds usize".into()))?;
+        if num_offsets != ndims {
+            return Err(Error::InvalidData(format!(
+                "B-tree v2 chunk record has {num_offsets} offsets for {ndims} dimensions"
+            )));
+        }
+    }
+
+    if !chunk_dims.is_empty() && num_offsets != chunk_dims.len() {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 chunk record has {num_offsets} offsets but {} chunk dimensions",
+            chunk_dims.len()
+        )));
+    }
+
+    let mut offsets = Vec::with_capacity(num_offsets);
+    for dim in 0..num_offsets {
+        let scaled = cursor.read_u64_le()?;
+        let chunk_extent = chunk_dims.get(dim).copied().unwrap_or(1);
+        let offset = scaled
+            .checked_mul(u64::from(chunk_extent))
+            .ok_or_else(|| Error::InvalidData("B-tree v2 chunk offset overflows u64".into()))?;
+        offsets.push(offset);
+    }
+    Ok(offsets)
 }
 
 fn record_matches_chunk_bounds(
@@ -569,6 +613,7 @@ fn parse_leaf_node(
             offset_size,
             length_size,
             ndims,
+            chunk_dims,
             heap_id_len,
         )?;
         if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
@@ -664,6 +709,7 @@ fn parse_internal_node(
             offset_size,
             length_size,
             ndims,
+            chunk_dims,
             heap_id_len,
         )?;
         if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
@@ -980,6 +1026,7 @@ fn parse_internal_node_storage(
             offset_size,
             length_size,
             ndims,
+            chunk_dims,
             heap_id_len,
         )?;
         if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
@@ -1223,7 +1270,7 @@ mod tests {
         data.extend_from_slice(&7u64.to_le_bytes());
         let mut cursor = Cursor::new(&data);
 
-        let record = parse_record(&mut cursor, 1, data.len() as u16, 8, 8, None, 0).unwrap();
+        let record = parse_record(&mut cursor, 1, data.len() as u16, 8, 8, None, &[], 0).unwrap();
         match record {
             BTreeV2Record::HugeIndirectNonFiltered {
                 address,
@@ -1248,7 +1295,7 @@ mod tests {
         data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         let mut cursor = Cursor::new(&data);
 
-        let record = parse_record(&mut cursor, 7, data.len() as u16, 8, 8, None, 0).unwrap();
+        let record = parse_record(&mut cursor, 7, data.len() as u16, 8, 8, None, &[], 0).unwrap();
         match record {
             BTreeV2Record::SharedMessageHeap {
                 hash,
@@ -1260,6 +1307,71 @@ mod tests {
                 assert_eq!(heap_id, vec![1, 2, 3, 4, 5, 6, 7, 8]);
             }
             other => panic!("expected shared heap record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chunk_record_scales_offsets_by_chunk_dimensions() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(
+            &mut cursor,
+            10,
+            data.len() as u16,
+            8,
+            8,
+            Some(2),
+            &[5, 7],
+            0,
+        )
+        .unwrap();
+        match record {
+            BTreeV2Record::ChunkedNonFiltered { address, offsets } => {
+                assert_eq!(address, 0x1234);
+                assert_eq!(offsets, vec![10, 7]);
+            }
+            other => panic!("expected non-filtered chunk record, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_filtered_chunk_record_scales_offsets_by_chunk_dimensions() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        data.extend_from_slice(&99u64.to_le_bytes());
+        data.extend_from_slice(&0xAu32.to_le_bytes());
+        data.extend_from_slice(&3u64.to_le_bytes());
+        data.extend_from_slice(&4u64.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(
+            &mut cursor,
+            11,
+            data.len() as u16,
+            8,
+            8,
+            Some(2),
+            &[5, 7],
+            0,
+        )
+        .unwrap();
+        match record {
+            BTreeV2Record::ChunkedFiltered {
+                address,
+                chunk_size,
+                filter_mask,
+                offsets,
+            } => {
+                assert_eq!(address, 0x1234);
+                assert_eq!(chunk_size, 99);
+                assert_eq!(filter_mask, 0xA);
+                assert_eq!(offsets, vec![15, 28]);
+            }
+            other => panic!("expected filtered chunk record, got {:?}", other),
         }
     }
 

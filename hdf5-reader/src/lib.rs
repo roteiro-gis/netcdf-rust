@@ -744,6 +744,30 @@ mod tests {
     }
 
     #[test]
+    fn btree_v2_chunked_fixture_uses_btree_v2_index() {
+        use crate::messages::layout::{ChunkIndexing, DataLayout};
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("testdata/hdf5/btree_v2_chunked.h5");
+        if !path.exists() {
+            eprintln!("SKIPPED: fixture btree_v2_chunked.h5 not found");
+            return;
+        }
+
+        let file = Hdf5File::open(path).unwrap();
+        let dataset = file.dataset("/data").unwrap();
+        assert!(matches!(
+            dataset.layout,
+            DataLayout::Chunked {
+                chunk_indexing: Some(ChunkIndexing::BTreeV2),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn filesystem_external_file_resolver_reads_relative_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("raw.bin");

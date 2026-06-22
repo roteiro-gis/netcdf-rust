@@ -263,7 +263,23 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(40, dtype=np.float64).reshape(5, 8)
         ds[:] = data
 
-    # ---- 21. climate_4d.h5 ----
+    # ---- 21. btree_v2_chunked.h5 ----
+    # Tests: v2 B-tree chunk indexing. HDF5 uses this for chunked datasets
+    # with more than one unlimited dimension when libver='latest'.
+    path = os.path.join(hdf5_dir, "btree_v2_chunked.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        data = np.zeros((4, 6), dtype=np.int32)
+        for r in range(data.shape[0]):
+            for c in range(data.shape[1]):
+                data[r, c] = r * 10 + c
+        ds = f.create_dataset(
+            "data", shape=data.shape, maxshape=(None, None), dtype=np.int32,
+            chunks=(2, 3)
+        )
+        ds[:] = data
+
+    # ---- 22. climate_4d.h5 ----
     # Tests: 4D dataset (time x level x lat x lon) with coordinate variables,
     # chunked + deflate. Critical for climate/netcdf-rust integration testing.
     path = os.path.join(hdf5_dir, "climate_4d.h5")

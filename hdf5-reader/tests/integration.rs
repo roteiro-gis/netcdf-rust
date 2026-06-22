@@ -587,6 +587,45 @@ fn extensible_array_chunked() {
 }
 
 #[test]
+fn btree_v2_chunked() {
+    let path = skip_if_missing!("btree_v2_chunked.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/data").unwrap();
+    assert_eq!(ds.shape(), &[4, 6]);
+
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[4, 6]);
+    for r in 0..4 {
+        for c in 0..6 {
+            assert_eq!(data[[r, c]], (r * 10 + c) as i32);
+        }
+    }
+
+    let slice = ds
+        .read_slice::<i32>(&hdf5_reader::SliceInfo {
+            selections: vec![
+                hdf5_reader::SliceInfoElem::Slice {
+                    start: 1,
+                    end: 4,
+                    step: 1,
+                },
+                hdf5_reader::SliceInfoElem::Slice {
+                    start: 2,
+                    end: 6,
+                    step: 1,
+                },
+            ],
+        })
+        .unwrap();
+    assert_eq!(slice.shape(), &[3, 4]);
+    assert_eq!(
+        slice.as_slice().unwrap(),
+        &[12, 13, 14, 15, 22, 23, 24, 25, 32, 33, 34, 35]
+    );
+}
+
+#[test]
 fn vlen_string_dataset() {
     let path = skip_if_missing!("vlen_strings.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
