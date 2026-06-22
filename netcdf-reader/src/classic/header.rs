@@ -231,11 +231,8 @@ pub fn parse_header(data: &[u8], format: NcFormat) -> Result<ClassicHeader> {
 
     // numrecs: 4 bytes for CDF-1/2, 8 bytes for CDF-5.
     let numrecs_raw = cur.read_count(format)?;
-    let numrecs = if format != NcFormat::Cdf5 && (numrecs_raw as u32) == STREAMING {
-        0 // Treat streaming as 0 records (will be updated when data is read)
-    } else {
-        numrecs_raw
-    };
+    let is_streaming = format != NcFormat::Cdf5 && (numrecs_raw as u32) == STREAMING;
+    let numrecs = if is_streaming { 0 } else { numrecs_raw };
 
     // dim_list
     let mut dimensions = parse_dim_list(&mut cur, format)?;
@@ -256,6 +253,18 @@ pub fn parse_header(data: &[u8], format: NcFormat) -> Result<ClassicHeader> {
         variables,
         numrecs,
     })
+}
+
+pub(crate) fn has_streaming_numrecs(data: &[u8], format: NcFormat) -> bool {
+    if format == NcFormat::Cdf5 {
+        return false;
+    }
+
+    let Some(bytes) = data.get(4..8) else {
+        return false;
+    };
+
+    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == STREAMING
 }
 
 /// Parse the dimension list.
@@ -520,7 +529,7 @@ fn parse_var_list(
     Ok(vars)
 }
 
-fn apply_unlimited_dimension_size(
+pub(crate) fn apply_unlimited_dimension_size(
     dimensions: &mut [NcDimension],
     variables: &mut [NcVariable],
     numrecs: u64,

@@ -1138,6 +1138,41 @@ mod tests {
         buf
     }
 
+    fn streaming_cdf1_record_fixture(values: &[i32], trailing: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "time");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "temp");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        let offset_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        let data_offset = buf.len() as u32;
+        buf[offset_pos..offset_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
+
+        for value in values {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+        buf.extend_from_slice(trailing);
+        buf
+    }
+
     #[test]
     fn cdf5_huge_dimension_can_slice_but_full_read_errors_cleanly() {
         let file = NcFile::from_bytes(&cdf5_huge_dimension_fixture()).unwrap();
@@ -1162,6 +1197,30 @@ mod tests {
             err,
             Error::UnsupportedFeature(message) if message.contains("PnetCDF subfiling")
         ));
+    }
+
+    #[test]
+    fn streaming_cdf1_numrecs_are_derived_from_file_length() {
+        let file = NcFile::from_bytes(&streaming_cdf1_record_fixture(&[10, 20, 30], &[])).unwrap();
+
+        assert_eq!(file.as_classic().unwrap().numrecs(), 3);
+        assert_eq!(file.dimension("time").unwrap().size, 3);
+        assert_eq!(file.variable("temp").unwrap().shape(), vec![3]);
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn streaming_cdf1_numrecs_ignore_trailing_partial_record() {
+        let file =
+            NcFile::from_bytes(&streaming_cdf1_record_fixture(&[10, 20], &[0xAA, 0xBB])).unwrap();
+
+        assert_eq!(file.as_classic().unwrap().numrecs(), 2);
+        assert_eq!(file.variable("temp").unwrap().shape(), vec![2]);
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20]);
     }
 
     #[cfg(feature = "netcdf4")]

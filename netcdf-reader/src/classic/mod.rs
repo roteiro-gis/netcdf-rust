@@ -34,67 +34,46 @@ impl ClassicFile {
         let file = File::open(path)?;
         // SAFETY: read-only mapping; caller must not modify the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
+        let is_streaming = header::has_streaming_numrecs(&mmap, format);
         let header = header::parse_header(&mmap, format)?;
-        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_mmap(mmap);
-
-        let root_group = NcGroup {
-            name: "/".to_string(),
-            dimensions: header.dimensions,
-            variables: header.variables,
-            attributes: header.global_attributes,
-            groups: Vec::new(), // Classic format has no sub-groups.
-        };
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
 
         Ok(ClassicFile {
             format,
             root_group,
             storage,
-            numrecs: header.numrecs,
+            numrecs,
         })
     }
 
     /// Open a classic NetCDF file from in-memory bytes.
     pub fn from_bytes(bytes: &[u8], format: NcFormat) -> Result<Self> {
+        let is_streaming = header::has_streaming_numrecs(bytes, format);
         let header = header::parse_header(bytes, format)?;
-        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_bytes(bytes.to_vec());
-
-        let root_group = NcGroup {
-            name: "/".to_string(),
-            dimensions: header.dimensions,
-            variables: header.variables,
-            attributes: header.global_attributes,
-            groups: Vec::new(),
-        };
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
 
         Ok(ClassicFile {
             format,
             root_group,
             storage,
-            numrecs: header.numrecs,
+            numrecs,
         })
     }
 
     /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
     pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
+        let is_streaming = header::has_streaming_numrecs(&mmap, format);
         let header = header::parse_header(&mmap, format)?;
-        reject_unsupported_classic_features(&header)?;
         let storage = ClassicStorage::from_mmap(mmap);
-
-        let root_group = NcGroup {
-            name: "/".to_string(),
-            dimensions: header.dimensions,
-            variables: header.variables,
-            attributes: header.global_attributes,
-            groups: Vec::new(),
-        };
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
 
         Ok(ClassicFile {
             format,
             root_group,
             storage,
-            numrecs: header.numrecs,
+            numrecs,
         })
     }
 
@@ -105,22 +84,14 @@ impl ClassicFile {
         format: NcFormat,
     ) -> Result<Self> {
         let storage = ClassicStorage::from_range(storage);
-        let header = parse_header_from_storage(&storage, format)?;
-        reject_unsupported_classic_features(&header)?;
-
-        let root_group = NcGroup {
-            name: "/".to_string(),
-            dimensions: header.dimensions,
-            variables: header.variables,
-            attributes: header.global_attributes,
-            groups: Vec::new(),
-        };
+        let (header, is_streaming) = parse_header_from_storage(&storage, format)?;
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
 
         Ok(ClassicFile {
             format,
             root_group,
             storage,
-            numrecs: header.numrecs,
+            numrecs,
         })
     }
 
@@ -138,6 +109,53 @@ impl ClassicFile {
     pub fn numrecs(&self) -> u64 {
         self.numrecs
     }
+}
+
+fn finalize_header(
+    mut header: header::ClassicHeader,
+    storage_len: u64,
+    is_streaming: bool,
+) -> Result<(NcGroup, u64)> {
+    reject_unsupported_classic_features(&header)?;
+
+    if is_streaming {
+        header.numrecs = infer_streaming_numrecs(&header, storage_len)?;
+        header::apply_unlimited_dimension_size(
+            &mut header.dimensions,
+            &mut header.variables,
+            header.numrecs,
+        );
+    }
+
+    let numrecs = header.numrecs;
+    let root_group = NcGroup {
+        name: "/".to_string(),
+        dimensions: header.dimensions,
+        variables: header.variables,
+        attributes: header.global_attributes,
+        groups: Vec::new(), // Classic format has no sub-groups.
+    };
+
+    Ok((root_group, numrecs))
+}
+
+fn infer_streaming_numrecs(header: &header::ClassicHeader, storage_len: u64) -> Result<u64> {
+    let Some(record_data_start) = header
+        .variables
+        .iter()
+        .filter(|var| var.is_record_var)
+        .map(|var| var.data_offset)
+        .min()
+    else {
+        return Ok(0);
+    };
+
+    let record_stride = data::compute_record_stride(&header.variables)?;
+    if record_stride == 0 || storage_len <= record_data_start {
+        return Ok(0);
+    }
+
+    Ok((storage_len - record_data_start) / record_stride)
 }
 
 fn reject_unsupported_classic_features(header: &header::ClassicHeader) -> Result<()> {
@@ -169,13 +187,16 @@ fn is_subfiling_attribute_name(name: &str) -> bool {
 fn parse_header_from_storage(
     storage: &ClassicStorage,
     format: NcFormat,
-) -> Result<header::ClassicHeader> {
+) -> Result<(header::ClassicHeader, bool)> {
     let mut len = storage.initial_header_len();
 
     loop {
         let prefix = storage.read_header_prefix(len)?;
         match header::parse_header(prefix.as_ref(), format) {
-            Ok(header) => return Ok(header),
+            Ok(header) => {
+                let is_streaming = header::has_streaming_numrecs(prefix.as_ref(), format);
+                return Ok((header, is_streaming));
+            }
             Err(crate::Error::UnexpectedEof { .. }) if (prefix.len() as u64) < storage.len() => {
                 let current = prefix.len().max(1);
                 len = current.saturating_mul(2);

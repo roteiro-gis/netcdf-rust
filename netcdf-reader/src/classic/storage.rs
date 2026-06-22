@@ -103,7 +103,6 @@ impl ClassicStorage {
         }
     }
 
-    #[cfg(feature = "netcdf4")]
     pub(crate) fn len(&self) -> u64 {
         self.len
     }
