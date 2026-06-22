@@ -427,6 +427,7 @@ name = "hdf5-reader"
 version = "0.7.0"
 dependencies = [
  "flate2",
+ "libc",
  "lru",
  "lz4_flex",
  "memmap2",

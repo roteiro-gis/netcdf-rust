@@ -184,6 +184,10 @@ pub struct FileStorage {
 impl FileStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let file = File::open(path)?;
+        Self::from_file(file)
+    }
+
+    pub fn from_file(file: File) -> Result<Self> {
         let len = file.metadata()?.len();
         Ok(Self {
             file: Arc::new(file),
