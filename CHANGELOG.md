@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.0 - 2026-06-22
+
+- breaking: change `netcdf_reader::classic::data::compute_record_stride` to return
+  `Result<u64>` and reject padded record-size and record-stride overflows instead
+  of wrapping
+- on Unix, open filesystem external raw-data and external-link resolver paths
+  with directory-relative `openat` traversal so path validation and file opening
+  share the same trusted root, closing symlink-swap races in attacker-writable
+  trees
+- infer classic CDF-1/2 streaming record counts from storage length, update the
+  unlimited dimension size accordingly, and ignore trailing partial records
+- fix chunked HDF5 variable-length string/sequence slices and fill values to use
+  the file's actual vlen reference width instead of the fixed 16-byte datatype
+  API size
+- reject HDF5 integer reads when the Rust signedness does not match the file
+  datatype, including bulk decode and native-copy paths
+- bound HDF5 object-header storage reads by the parsed prefix/chunk sizes and
+  reject oversized continuation or chunk lengths before platform casts
+- check HDF5 superblock magic-search offset arithmetic for overflow on huge
+  range-backed storage
+- add CodeQL analysis and run the HDF5 open fuzz target in CI
+- clarify README dependency-scope wording for the published pure-Rust crates
+
 ## 0.6.1 - 2026-06-11
 
 - fix version 1 B-tree raw-data chunk keys to read each per-dimension chunk

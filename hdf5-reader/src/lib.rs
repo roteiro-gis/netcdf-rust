@@ -36,7 +36,14 @@ pub mod filters;
 pub mod cache;
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::{CString, OsStr};
+use std::fs::File;
 use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
@@ -100,8 +107,10 @@ impl Default for OpenOptions {
 ///
 /// Implementations are responsible for their own path security policy. The
 /// built-in [`FilesystemExternalFileResolver`] confines normal paths to a base
-/// directory, but its root must be trusted and not attacker-writable because it
-/// does not use capability-style `openat` path traversal.
+/// directory and, on Unix, opens paths through an anchored directory handle
+/// without following symlinks. On non-Unix platforms it falls back to
+/// canonicalize-then-open, so attacker-writable resolver roots are out of
+/// scope there.
 pub trait ExternalFileResolver: Send + Sync {
     fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>>;
 }
@@ -110,17 +119,15 @@ pub trait ExternalFileResolver: Send + Sync {
 ///
 /// Implementations are responsible for their own path security policy. The
 /// built-in [`FilesystemExternalLinkResolver`] confines normal paths to a base
-/// directory, but its root must be trusted and not attacker-writable because it
-/// does not use capability-style `openat` path traversal.
+/// directory and, on Unix, opens paths through an anchored directory handle
+/// without following symlinks. On non-Unix platforms it falls back to
+/// canonicalize-then-open, so attacker-writable resolver roots are out of
+/// scope there.
 pub trait ExternalLinkResolver: Send + Sync {
     fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>>;
 }
 
-fn resolve_path_within_base(
-    base_dir: &Path,
-    filename: &str,
-    description: &str,
-) -> Result<Option<PathBuf>> {
+fn normalize_resolver_path(filename: &str, description: &str) -> Result<PathBuf> {
     let path = Path::new(filename);
     if path.as_os_str().is_empty() {
         return Err(Error::InvalidData(format!("{description} path is empty")));
@@ -132,23 +139,39 @@ fn resolve_path_within_base(
         )));
     }
 
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir
-        )
-    }) {
-        return Err(Error::InvalidData(format!(
-            "{description} path must stay within the resolver base directory: {filename}"
-        )));
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(Error::InvalidData(format!(
+                    "{description} path must stay within the resolver base directory: {filename}"
+                )));
+            }
+        }
     }
 
+    if normalized.as_os_str().is_empty() {
+        return Err(Error::InvalidData(format!("{description} path is empty")));
+    }
+
+    Ok(normalized)
+}
+
+#[cfg(not(unix))]
+fn open_external_file_within_base(
+    base_dir: &Path,
+    relative_path: &Path,
+    description: &str,
+    filename: &str,
+) -> Result<Option<File>> {
     let base = match base_dir.canonicalize() {
         Ok(path) => path,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err.into()),
     };
-    let candidate = base.join(path);
+    let candidate = base.join(relative_path);
     let resolved = match candidate.canonicalize() {
         Ok(path) => path,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
@@ -161,17 +184,142 @@ fn resolve_path_within_base(
         )));
     }
 
-    Ok(Some(resolved))
+    Ok(Some(File::open(resolved)?))
+}
+
+#[cfg(unix)]
+fn open_external_file_within_base(
+    base_dir: &Path,
+    relative_path: &Path,
+    description: &str,
+    filename: &str,
+) -> Result<Option<File>> {
+    let mut dir = match open_unix_path(
+        base_dir,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    ) {
+        Ok(file) => file,
+        Err(err) if path_lookup_is_missing(&err) => return Ok(None),
+        Err(err) if path_lookup_is_symlink(&err) => {
+            return Err(Error::InvalidData(format!(
+                "{description} resolver base directory must not be a symlink"
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if !dir.metadata()?.is_dir() {
+        return Ok(None);
+    }
+
+    let parts: Vec<&OsStr> = relative_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+
+    let Some((leaf, parents)) = parts.split_last() else {
+        return Err(Error::InvalidData(format!("{description} path is empty")));
+    };
+
+    for parent in parents {
+        dir = match open_unix_child(
+            &dir,
+            parent,
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        ) {
+            Ok(file) => file,
+            Err(err) if path_lookup_is_missing(&err) => return Ok(None),
+            Err(err) if path_lookup_is_symlink(&err) => {
+                return Err(symlink_resolver_error(description, filename));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if !dir.metadata()?.is_dir() {
+            return Ok(None);
+        }
+    }
+
+    let file = match open_unix_child(
+        &dir,
+        leaf,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+    ) {
+        Ok(file) => file,
+        Err(err) if path_lookup_is_missing(&err) => return Ok(None),
+        Err(err) if path_lookup_is_symlink(&err) => {
+            return Err(symlink_resolver_error(description, filename));
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    if file.metadata()?.is_dir() {
+        return Err(Error::InvalidData(format!(
+            "{description} path resolves to a directory: {filename}"
+        )));
+    }
+
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn open_unix_path(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "filesystem path contains an interior NUL byte",
+        )
+    })?;
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    file_from_unix_fd(fd)
+}
+
+#[cfg(unix)]
+fn open_unix_child(dir: &File, name: &OsStr, flags: libc::c_int) -> std::io::Result<File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "filesystem path contains an interior NUL byte",
+        )
+    })?;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+    file_from_unix_fd(fd)
+}
+
+#[cfg(unix)]
+fn file_from_unix_fd(fd: libc::c_int) -> std::io::Result<File> {
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn path_lookup_is_missing(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::NotFound
+        || matches!(err.raw_os_error(), Some(code) if code == libc::ENOTDIR)
+}
+
+#[cfg(unix)]
+fn path_lookup_is_symlink(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(code) if code == libc::ELOOP)
+}
+
+#[cfg(unix)]
+fn symlink_resolver_error(description: &str, filename: &str) -> Error {
+    Error::InvalidData(format!(
+        "{description} path escapes the resolver base directory or uses a symlink: {filename}"
+    ))
 }
 
 /// Filesystem resolver for external raw data files.
 ///
-/// The resolver rejects absolute paths, `..` components, and paths whose
-/// canonical target is outside `base_dir`. This is intended for trusted
-/// resolver roots. If `base_dir` or its descendants can be modified by an
-/// attacker concurrently, a symlink swap between validation and open can race
-/// this resolver. Use a custom resolver backed by capability-style path APIs
-/// for attacker-writable roots.
+/// The resolver rejects absolute paths and `..` components. On Unix, it opens
+/// paths relative to `base_dir` using `openat` and `O_NOFOLLOW`, so symlinks
+/// are rejected instead of being followed. On non-Unix platforms,
+/// attacker-writable resolver roots are out of scope.
 #[derive(Debug, Clone)]
 pub struct FilesystemExternalFileResolver {
     base_dir: PathBuf,
@@ -184,29 +332,34 @@ impl FilesystemExternalFileResolver {
         }
     }
 
-    fn path_for(&self, filename: &str) -> Result<Option<PathBuf>> {
-        resolve_path_within_base(&self.base_dir, filename, "external raw data file")
+    fn relative_path_for(&self, filename: &str) -> Result<PathBuf> {
+        normalize_resolver_path(filename, "external raw data file")
     }
 }
 
 impl ExternalFileResolver for FilesystemExternalFileResolver {
     fn resolve_external_file(&self, filename: &str) -> Result<Option<DynStorage>> {
-        let Some(path) = self.path_for(filename)? else {
+        let relative_path = self.relative_path_for(filename)?;
+        let Some(file) = open_external_file_within_base(
+            &self.base_dir,
+            &relative_path,
+            "external raw data file",
+            filename,
+        )?
+        else {
             return Ok(None);
         };
-        Ok(Some(Arc::new(FileStorage::open(path)?)))
+        Ok(Some(Arc::new(FileStorage::from_file(file)?)))
     }
 }
 
 /// Filesystem resolver for external links. Linked files are cached after the
 /// first successful open.
 ///
-/// The resolver rejects absolute paths, `..` components, and paths whose
-/// canonical target is outside `base_dir`. This is intended for trusted
-/// resolver roots. If `base_dir` or its descendants can be modified by an
-/// attacker concurrently, a symlink swap between validation and open can race
-/// this resolver. Use a custom resolver backed by capability-style path APIs
-/// for attacker-writable roots.
+/// The resolver rejects absolute paths and `..` components. On Unix, it opens
+/// paths relative to `base_dir` using `openat` and `O_NOFOLLOW`, so symlinks
+/// are rejected instead of being followed. On non-Unix platforms,
+/// attacker-writable resolver roots are out of scope.
 pub struct FilesystemExternalLinkResolver {
     base_dir: PathBuf,
     cache: parking_lot::Mutex<HashMap<PathBuf, Hdf5File>>,
@@ -220,23 +373,31 @@ impl FilesystemExternalLinkResolver {
         }
     }
 
-    fn path_for(&self, filename: &str) -> Result<Option<PathBuf>> {
-        resolve_path_within_base(&self.base_dir, filename, "external link")
+    fn relative_path_for(&self, filename: &str) -> Result<PathBuf> {
+        normalize_resolver_path(filename, "external link")
     }
 }
 
 impl ExternalLinkResolver for FilesystemExternalLinkResolver {
     fn resolve_external_link(&self, filename: &str) -> Result<Option<Hdf5File>> {
-        let Some(path) = self.path_for(filename)? else {
-            return Ok(None);
-        };
+        let relative_path = self.relative_path_for(filename)?;
 
-        if let Some(file) = self.cache.lock().get(&path).cloned() {
+        if let Some(file) = self.cache.lock().get(&relative_path).cloned() {
             return Ok(Some(file));
         }
 
-        let file = Hdf5File::open(&path)?;
-        self.cache.lock().insert(path, file.clone());
+        let Some(opened) = open_external_file_within_base(
+            &self.base_dir,
+            &relative_path,
+            "external link",
+            filename,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let file = Hdf5File::from_storage(Arc::new(FileStorage::from_file(opened)?))?;
+        self.cache.lock().insert(relative_path, file.clone());
         Ok(Some(file))
     }
 }
@@ -640,6 +801,42 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("escapes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_external_file_resolver_rejects_symlink_inside_base() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("raw.bin"), b"abcdef").unwrap();
+        symlink("raw.bin", dir.path().join("link.bin")).unwrap();
+
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+        let err = match resolver.resolve_external_file("link.bin") {
+            Ok(_) => panic!("symlinks should be rejected even when they point inside the base"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_external_file_resolver_rejects_symlink_directory_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::write(real_dir.join("raw.bin"), b"abcdef").unwrap();
+        symlink("real", dir.path().join("linkdir")).unwrap();
+
+        let resolver = FilesystemExternalFileResolver::new(dir.path());
+        let err = match resolver.resolve_external_file("linkdir/raw.bin") {
+            Ok(_) => panic!("symlinked directory components should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("symlink"));
     }
 
     #[test]

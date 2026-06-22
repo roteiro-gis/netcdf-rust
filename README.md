@@ -149,8 +149,8 @@ Minimum supported Rust version: 1.81.
 
 ```toml
 [dependencies]
-netcdf-reader = "0.6.1"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.6.1", default-features = false }  # CDF-1/2/5 only
+netcdf-reader = "0.7.0"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.7.0", default-features = false }  # CDF-1/2/5 only
 ```
 
 | Flag | Default | Description |
@@ -164,14 +164,12 @@ netcdf-reader = { version = "0.6.1", default-features = false }  # CDF-1/2/5 onl
 
 HDF5 external raw data files are not resolved by default. To allow them for
 trusted files, opt in with a resolver rooted at the directory that should
-contain the external data. The filesystem resolver rejects absolute paths,
-`..`, and canonical paths that escape that root. The same confinement is
-applied by `FilesystemExternalLinkResolver` when external links are enabled.
-Use these filesystem resolvers only with trusted resolver roots that are not
-attacker-writable; they validate paths before opening and do not provide
-capability-style protection against concurrent symlink swaps. For
-attacker-writable roots, provide a custom resolver backed by `openat` or another
-capability-style path API.
+contain the external data. The filesystem resolver rejects absolute paths and
+`..` components. On Unix, it opens paths relative to the resolver root with
+`openat` and `O_NOFOLLOW`, so symlinks are rejected rather than followed. The
+same confinement is applied by `FilesystemExternalLinkResolver` when external
+links are enabled. On non-Unix platforms, the filesystem resolvers fall back to
+canonicalize-then-open and attacker-writable resolver roots are out of scope.
 
 ```rust
 use std::path::Path;

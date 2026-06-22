@@ -1173,6 +1173,89 @@ mod tests {
         buf
     }
 
+    fn streaming_cdf2_record_fixture(values: &[i32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x02");
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "time");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "temp");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        let offset_pos = buf.len();
+        buf.extend_from_slice(&0u64.to_be_bytes());
+
+        let data_offset = buf.len() as u64;
+        buf[offset_pos..offset_pos + 8].copy_from_slice(&data_offset.to_be_bytes());
+
+        for value in values {
+            buf.extend_from_slice(&value.to_be_bytes());
+        }
+        buf
+    }
+
+    fn streaming_cdf1_two_record_var_fixture(records: &[(i32, i16)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CDF\x01");
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Au32.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        write_cdf1_name(&mut buf, "time");
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        buf.extend_from_slice(&0x0000_000Bu32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+
+        write_cdf1_name(&mut buf, "temp");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        buf.extend_from_slice(&4u32.to_be_bytes());
+        let temp_offset_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        write_cdf1_name(&mut buf, "flag");
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        let flag_offset_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_be_bytes());
+
+        let data_offset = buf.len() as u32;
+        let flag_offset = data_offset + 4;
+        buf[temp_offset_pos..temp_offset_pos + 4].copy_from_slice(&data_offset.to_be_bytes());
+        buf[flag_offset_pos..flag_offset_pos + 4].copy_from_slice(&flag_offset.to_be_bytes());
+
+        for &(temp, flag) in records {
+            buf.extend_from_slice(&temp.to_be_bytes());
+            buf.extend_from_slice(&flag.to_be_bytes());
+            buf.extend_from_slice(&[0, 0]);
+        }
+        buf
+    }
+
     #[test]
     fn cdf5_huge_dimension_can_slice_but_full_read_errors_cleanly() {
         let file = NcFile::from_bytes(&cdf5_huge_dimension_fixture()).unwrap();
@@ -1221,6 +1304,53 @@ mod tests {
 
         let values: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
         assert_eq!(values.as_slice().unwrap(), &[10, 20]);
+    }
+
+    #[test]
+    fn streaming_cdf2_numrecs_are_derived_from_file_length() {
+        let file = NcFile::from_bytes(&streaming_cdf2_record_fixture(&[10, 20, 30])).unwrap();
+
+        assert_eq!(file.format(), NcFormat::Offset64);
+        assert_eq!(file.as_classic().unwrap().numrecs(), 3);
+        assert_eq!(file.dimension("time").unwrap().size, 3);
+        assert_eq!(file.variable("temp").unwrap().shape(), vec![3]);
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn streaming_cdf1_numrecs_use_full_stride_for_multiple_record_variables() {
+        let file = NcFile::from_bytes(&streaming_cdf1_two_record_var_fixture(&[
+            (10, 1),
+            (20, 2),
+            (30, 3),
+        ]))
+        .unwrap();
+
+        assert_eq!(file.as_classic().unwrap().numrecs(), 3);
+        assert_eq!(file.variable("temp").unwrap().shape(), vec![3]);
+        assert_eq!(file.variable("flag").unwrap().shape(), vec![3]);
+
+        let temps: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
+        let flags: ndarray::ArrayD<i16> = file.read_variable("flag").unwrap();
+        assert_eq!(temps.as_slice().unwrap(), &[10, 20, 30]);
+        assert_eq!(flags.as_slice().unwrap(), &[1, 2, 3]);
+    }
+
+    #[cfg(feature = "netcdf4")]
+    #[test]
+    fn streaming_cdf1_from_storage_derives_numrecs() {
+        let file = NcFile::from_storage(Arc::new(BytesStorage::new(
+            streaming_cdf1_record_fixture(&[10, 20, 30], &[]),
+        )))
+        .unwrap();
+
+        assert_eq!(file.as_classic().unwrap().numrecs(), 3);
+        assert_eq!(file.dimension("time").unwrap().size, 3);
+
+        let values: ndarray::ArrayD<i32> = file.read_variable("temp").unwrap();
+        assert_eq!(values.as_slice().unwrap(), &[10, 20, 30]);
     }
 
     #[cfg(feature = "netcdf4")]
