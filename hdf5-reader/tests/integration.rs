@@ -461,6 +461,25 @@ fn dense_groups() {
 }
 
 #[test]
+fn dense_group_dataset_lookup_from_storage() {
+    let path = skip_if_missing!("dense_groups.h5");
+    let storage = Arc::new(CountingStorage::new(std::fs::read(path).unwrap()));
+    let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
+    let root = file.root_group().unwrap();
+    storage.clear_ranges();
+
+    let ds = root.dataset("ds_000").unwrap();
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.as_slice().unwrap(), &[0]);
+    let ranges = storage.ranges();
+    assert!(
+        ranges.len() < 25,
+        "dense lookup should not read every dense-link heap object; read {} ranges",
+        ranges.len()
+    );
+}
+
+#[test]
 fn committed_datatype_is_not_exposed_as_group() {
     let path = skip_if_missing!("committed_dtype.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

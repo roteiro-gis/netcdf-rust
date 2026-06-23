@@ -163,7 +163,7 @@ def generate_hdf5_fixtures(base_dir):
     # Tests: dense link storage (fractal heap + B-tree v2), triggered by 20+ children.
     path = os.path.join(hdf5_dir, "dense_groups.h5")
     print(f"  Generating {path}")
-    with h5py.File(path, "w") as f:
+    with h5py.File(path, "w", libver="latest") as f:
         for i in range(25):
             f.create_dataset(f"ds_{i:03d}", data=np.array([i], dtype=np.int32))
 

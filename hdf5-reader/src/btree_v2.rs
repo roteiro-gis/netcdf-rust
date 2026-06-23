@@ -452,6 +452,48 @@ fn record_matches_chunk_bounds(
     })
 }
 
+fn record_matches_link_name_hash(record: &BTreeV2Record, target_hash: Option<u32>) -> bool {
+    match target_hash {
+        Some(target_hash) => {
+            matches!(record, BTreeV2Record::LinkNameHash { hash, .. } if *hash == target_hash)
+        }
+        None => true,
+    }
+}
+
+fn record_matches_query(
+    record: &BTreeV2Record,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
+) -> bool {
+    record_matches_link_name_hash(record, link_name_hash)
+        && record_matches_chunk_bounds(record, chunk_dims, chunk_bounds)
+}
+
+fn link_name_hash(record: &BTreeV2Record) -> Option<u32> {
+    match record {
+        BTreeV2Record::LinkNameHash { hash, .. } => Some(*hash),
+        _ => None,
+    }
+}
+
+fn child_may_match_link_name_hash(
+    records: &[BTreeV2Record],
+    child_index: usize,
+    target_hash: Option<u32>,
+) -> bool {
+    let Some(target_hash) = target_hash else {
+        return true;
+    };
+
+    let lower_matches = child_index == 0
+        || link_name_hash(&records[child_index - 1]).map_or(true, |hash| target_hash >= hash);
+    let upper_matches = child_index == records.len()
+        || link_name_hash(&records[child_index]).map_or(true, |hash| target_hash <= hash);
+    lower_matches && upper_matches
+}
+
 // ---------------------------------------------------------------------------
 // Node parsing
 // ---------------------------------------------------------------------------
@@ -586,6 +628,7 @@ fn parse_leaf_node(
     ndims: Option<u32>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
     num_records: u16,
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
@@ -623,7 +666,7 @@ fn parse_leaf_node(
             chunk_dims,
             heap_id_len,
         )?;
-        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
+        if record_matches_query(&record, chunk_dims, chunk_bounds, link_name_hash) {
             records.push(record);
         }
     }
@@ -650,6 +693,7 @@ fn parse_internal_node(
     ndims: Option<u32>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
     num_records: u16,
     depth: u16,
     heap_id_len: usize,
@@ -719,9 +763,7 @@ fn parse_internal_node(
             chunk_dims,
             heap_id_len,
         )?;
-        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
-            node_records.push(record);
-        }
+        node_records.push(record);
     }
 
     // Read child node pointers (num_records + 1 of them).
@@ -767,12 +809,20 @@ fn parse_internal_node(
     // Only leaf records are collected.
     // (Actually, in HDF5 v2 B-trees, records in internal nodes are real
     // records too, not just separators. We should collect them.)
-    records.extend(node_records);
+    records.extend(
+        node_records
+            .iter()
+            .filter(|record| record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash))
+            .cloned(),
+    );
 
     // Recurse into children.
     let child_depth = depth - 1;
     for (i, &child_addr) in child_addresses.iter().enumerate() {
         if Cursor::is_undefined_offset(child_addr, offset_size) {
+            continue;
+        }
+        if !child_may_match_link_name_hash(&node_records, i, link_name_hash) {
             continue;
         }
         let child_nrec = child_nrecords[i];
@@ -788,6 +838,7 @@ fn parse_internal_node(
                 ndims,
                 chunk_dims,
                 chunk_bounds,
+                link_name_hash,
                 child_nrec,
                 heap_id_len,
                 records,
@@ -803,6 +854,7 @@ fn parse_internal_node(
                 ndims,
                 chunk_dims,
                 chunk_bounds,
+                link_name_hash,
                 child_nrec,
                 child_depth,
                 heap_id_len,
@@ -831,6 +883,29 @@ pub fn collect_btree_v2_records(
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<BTreeV2Record>> {
+    collect_btree_v2_records_with_link_hash(
+        data,
+        header,
+        offset_size,
+        length_size,
+        ndims,
+        chunk_dims,
+        chunk_bounds,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_btree_v2_records_with_link_hash(
+    data: &[u8],
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
+) -> Result<Vec<BTreeV2Record>> {
     if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
         return Ok(Vec::new());
     }
@@ -856,6 +931,7 @@ pub fn collect_btree_v2_records(
             ndims,
             chunk_dims,
             chunk_bounds,
+            link_name_hash,
             header.num_records_in_root,
             heap_id_len,
             &mut records,
@@ -871,6 +947,7 @@ pub fn collect_btree_v2_records(
             ndims,
             chunk_dims,
             chunk_bounds,
+            link_name_hash,
             header.num_records_in_root,
             header.depth,
             heap_id_len,
@@ -879,6 +956,27 @@ pub fn collect_btree_v2_records(
     }
 
     Ok(records)
+}
+
+/// Collect link-name records whose stored hash matches `target_hash`.
+#[cfg(test)]
+pub(crate) fn collect_btree_v2_link_name_hash_records(
+    data: &[u8],
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    target_hash: u32,
+) -> Result<Vec<BTreeV2Record>> {
+    collect_btree_v2_records_with_link_hash(
+        data,
+        header,
+        offset_size,
+        length_size,
+        None,
+        &[],
+        None,
+        Some(target_hash),
+    )
 }
 
 /// Collect all records from a B-tree v2 using random-access storage.
@@ -890,6 +988,29 @@ pub fn collect_btree_v2_records_storage(
     ndims: Option<u32>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
+) -> Result<Vec<BTreeV2Record>> {
+    collect_btree_v2_records_storage_with_link_hash(
+        storage,
+        header,
+        offset_size,
+        length_size,
+        ndims,
+        chunk_dims,
+        chunk_bounds,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_btree_v2_records_storage_with_link_hash(
+    storage: &dyn Storage,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    ndims: Option<u32>,
+    chunk_dims: &[u32],
+    chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
 ) -> Result<Vec<BTreeV2Record>> {
     if Cursor::is_undefined_offset(header.root_node_address, offset_size) {
         return Ok(Vec::new());
@@ -912,6 +1033,7 @@ pub fn collect_btree_v2_records_storage(
             ndims,
             chunk_dims,
             chunk_bounds,
+            link_name_hash,
             header.num_records_in_root,
             heap_id_len,
             &mut records,
@@ -926,6 +1048,7 @@ pub fn collect_btree_v2_records_storage(
             ndims,
             chunk_dims,
             chunk_bounds,
+            link_name_hash,
             header.num_records_in_root,
             header.depth,
             heap_id_len,
@@ -934,6 +1057,26 @@ pub fn collect_btree_v2_records_storage(
     }
 
     Ok(records)
+}
+
+/// Collect link-name records whose stored hash matches `target_hash`.
+pub(crate) fn collect_btree_v2_link_name_hash_records_storage(
+    storage: &dyn Storage,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+    target_hash: u32,
+) -> Result<Vec<BTreeV2Record>> {
+    collect_btree_v2_records_storage_with_link_hash(
+        storage,
+        header,
+        offset_size,
+        length_size,
+        None,
+        &[],
+        None,
+        Some(target_hash),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,6 +1089,7 @@ fn parse_leaf_node_storage(
     ndims: Option<u32>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
     num_records: u16,
     heap_id_len: usize,
     records: &mut Vec<BTreeV2Record>,
@@ -963,6 +1107,7 @@ fn parse_leaf_node_storage(
         ndims,
         chunk_dims,
         chunk_bounds,
+        link_name_hash,
         num_records,
         heap_id_len,
         records,
@@ -979,6 +1124,7 @@ fn parse_internal_node_storage(
     ndims: Option<u32>,
     chunk_dims: &[u32],
     chunk_bounds: Option<(&[u64], &[u64])>,
+    link_name_hash: Option<u32>,
     num_records: u16,
     depth: u16,
     heap_id_len: usize,
@@ -1036,9 +1182,7 @@ fn parse_internal_node_storage(
             chunk_dims,
             heap_id_len,
         )?;
-        if record_matches_chunk_bounds(&record, chunk_dims, chunk_bounds) {
-            node_records.push(record);
-        }
+        node_records.push(record);
     }
 
     let num_children = usize::from(num_records) + 1;
@@ -1068,11 +1212,19 @@ fn parse_internal_node_storage(
         "internal node",
     )?;
 
-    records.extend(node_records);
+    records.extend(
+        node_records
+            .iter()
+            .filter(|record| record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash))
+            .cloned(),
+    );
 
     let child_depth = depth - 1;
     for (i, &child_addr) in child_addresses.iter().enumerate() {
         if Cursor::is_undefined_offset(child_addr, offset_size) {
+            continue;
+        }
+        if !child_may_match_link_name_hash(&node_records, i, link_name_hash) {
             continue;
         }
         let child_nrec = child_nrecords[i];
@@ -1086,6 +1238,7 @@ fn parse_internal_node_storage(
                 ndims,
                 chunk_dims,
                 chunk_bounds,
+                link_name_hash,
                 child_nrec,
                 heap_id_len,
                 records,
@@ -1100,6 +1253,7 @@ fn parse_internal_node_storage(
                 ndims,
                 chunk_dims,
                 chunk_bounds,
+                link_name_hash,
                 child_nrec,
                 child_depth,
                 heap_id_len,
@@ -1473,6 +1627,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             2,
             8, // heap_id_len
             &mut records,
@@ -1494,5 +1649,65 @@ mod tests {
             }
             _ => panic!("expected LinkNameHash"),
         }
+    }
+
+    #[test]
+    fn collect_link_name_hash_records_filters_leaf_records() {
+        let record_size: u16 = 12;
+        let node_size: u32 = 4096;
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size,
+            record_size,
+            depth: 0,
+            split_percent: 75,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 2,
+            total_records: 2,
+        };
+
+        let mut leaf = Vec::new();
+        leaf.extend_from_slice(b"BTLF");
+        leaf.push(0);
+        leaf.push(5);
+        leaf.extend_from_slice(&0x1111_1111u32.to_le_bytes());
+        leaf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        leaf.extend_from_slice(&0x2222_2222u32.to_le_bytes());
+        leaf.extend_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let checksum = jenkins_lookup3(&leaf);
+        leaf.extend_from_slice(&checksum.to_le_bytes());
+        leaf.resize(node_size as usize, 0);
+
+        let records =
+            collect_btree_v2_link_name_hash_records(&leaf, &header, 8, 8, 0x2222_2222).unwrap();
+        assert_eq!(records.len(), 1);
+        match &records[0] {
+            BTreeV2Record::LinkNameHash { hash, heap_id } => {
+                assert_eq!(*hash, 0x2222_2222);
+                assert_eq!(heap_id, &[9, 10, 11, 12, 13, 14, 15, 16]);
+            }
+            other => panic!("expected LinkNameHash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_link_hash_filter_prunes_disjoint_hash_ranges() {
+        let records = vec![
+            BTreeV2Record::LinkNameHash {
+                hash: 10,
+                heap_id: vec![],
+            },
+            BTreeV2Record::LinkNameHash {
+                hash: 20,
+                heap_id: vec![],
+            },
+        ];
+
+        assert!(child_may_match_link_name_hash(&records, 0, Some(10)));
+        assert!(!child_may_match_link_name_hash(&records, 0, Some(15)));
+        assert!(child_may_match_link_name_hash(&records, 1, Some(15)));
+        assert!(!child_may_match_link_name_hash(&records, 2, Some(15)));
+        assert!(child_may_match_link_name_hash(&records, 2, Some(20)));
     }
 }
