@@ -328,17 +328,15 @@ fn parse_record(
 
         // Type 10: non-filtered chunk
         10 => {
-            let address = cursor.read_offset(offset_size)?;
             // Chunk offsets are encoded as scaled 64-bit values.
             // The number of offset dimensions is calculated from the record size.
             // Each offset is 8 bytes in a type-10 record.
-            let offset_bytes_available = (record_size as usize)
-                .checked_sub(offset_size as usize)
-                .ok_or_else(|| {
-                    Error::InvalidData(
-                        "B-tree v2 type-10 chunk record is shorter than its address".into(),
-                    )
-                })?;
+            let offset_bytes_available = record_payload_len(
+                record_size,
+                offset_size as usize,
+                "B-tree v2 type-10 chunk record is shorter than its address",
+            )?;
+            let address = cursor.read_offset(offset_size)?;
             let num_offsets = offset_bytes_available / 8;
             let offsets = read_scaled_chunk_offsets(cursor, num_offsets, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedNonFiltered { address, offsets }
@@ -346,20 +344,17 @@ fn parse_record(
 
         // Type 11: filtered chunk
         11 => {
-            let address = cursor.read_offset(offset_size)?;
             // nbytes (chunk size on disk) is encoded using length_size bytes.
             let nbytes_size = length_size as usize;
+            let fixed_size = offset_size as usize + nbytes_size + 4; // filter_mask
+            let remaining = record_payload_len(
+                record_size,
+                fixed_size,
+                "B-tree v2 type-11 chunk record is shorter than its fixed fields",
+            )?;
+            let address = cursor.read_offset(offset_size)?;
             let chunk_size = cursor.read_length(length_size)?;
             let filter_mask = cursor.read_u32_le()?;
-            let remaining = (record_size as usize)
-                .checked_sub(offset_size as usize)
-                .and_then(|remaining| remaining.checked_sub(nbytes_size))
-                .and_then(|remaining| remaining.checked_sub(4))
-                .ok_or_else(|| {
-                    Error::InvalidData(
-                        "B-tree v2 type-11 chunk record is shorter than its fixed fields".into(),
-                    )
-                })?;
             let num_offsets = remaining / 8;
             let offsets = read_scaled_chunk_offsets(cursor, num_offsets, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedFiltered {
@@ -380,13 +375,25 @@ fn parse_record(
         }
     };
 
-    // Ensure we consumed exactly record_size bytes (skip any remaining).
-    let consumed = (cursor.position() - record_start) as usize;
-    if consumed < record_size as usize {
-        cursor.skip(record_size as usize - consumed)?;
+    // Ensure we consumed no more than record_size bytes, then skip padding.
+    let consumed = cursor.position() - record_start;
+    let record_size = u64::from(record_size);
+    if consumed > record_size {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 type-{btree_type} record consumed {consumed} bytes but record size is {record_size}"
+        )));
+    }
+    if consumed < record_size {
+        cursor.skip((record_size - consumed) as usize)?;
     }
 
     Ok(record)
+}
+
+fn record_payload_len(record_size: u16, fixed_size: usize, error_message: &str) -> Result<usize> {
+    (record_size as usize)
+        .checked_sub(fixed_size)
+        .ok_or_else(|| Error::InvalidData(error_message.into()))
 }
 
 fn read_scaled_chunk_offsets(
@@ -1308,6 +1315,48 @@ mod tests {
             }
             other => panic!("expected shared heap record, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn parse_record_rejects_known_record_that_exceeds_record_size() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        data.extend_from_slice(&99u64.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let err = parse_record(&mut cursor, 1, 16, 8, 8, None, &[], 0).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(message) if message.contains("consumed 24 bytes but record size is 16"))
+        );
+    }
+
+    #[test]
+    fn parse_chunk_record_rejects_size_shorter_than_address() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let err = parse_record(&mut cursor, 10, 4, 8, 8, None, &[], 0).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(message) if message.contains("shorter than its address"))
+        );
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn parse_filtered_chunk_record_rejects_size_shorter_than_fixed_fields() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x1234u64.to_le_bytes());
+        data.extend_from_slice(&99u64.to_le_bytes());
+        data.extend_from_slice(&0xAu32.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let err = parse_record(&mut cursor, 11, 16, 8, 8, None, &[], 0).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(message) if message.contains("shorter than its fixed fields"))
+        );
+        assert_eq!(cursor.position(), 0);
     }
 
     #[test]
