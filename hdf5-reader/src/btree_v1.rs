@@ -9,12 +9,15 @@
 //! type 0 or raw data chunk addresses for type 1. Internal nodes point to
 //! child B-tree nodes.
 
+use std::collections::HashSet;
+
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::storage::Storage;
 
 /// Signature bytes for a v1 B-tree node: ASCII `TREE`.
 const BTREE_V1_SIGNATURE: [u8; 4] = *b"TREE";
+const MAX_BTREE_V1_RECURSION_DEPTH: usize = 256;
 
 /// A key within a v1 B-tree node.
 #[derive(Debug, Clone)]
@@ -182,6 +185,7 @@ pub fn collect_btree_v1_leaves(
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<(BTreeV1Key, u64)>> {
     let mut results = Vec::new();
+    let mut visited = HashSet::new();
     collect_recursive(
         BTreeV1CollectContext {
             data,
@@ -192,6 +196,8 @@ pub fn collect_btree_v1_leaves(
             chunk_bounds,
         },
         root_address,
+        MAX_BTREE_V1_RECURSION_DEPTH,
+        &mut visited,
         &mut results,
     )?;
     Ok(results)
@@ -208,6 +214,7 @@ pub fn collect_btree_v1_leaves_storage(
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<(BTreeV1Key, u64)>> {
     let mut results = Vec::new();
+    let mut visited = HashSet::new();
     collect_recursive_storage(
         BTreeV1CollectContextStorage {
             storage,
@@ -218,6 +225,8 @@ pub fn collect_btree_v1_leaves_storage(
             chunk_bounds,
         },
         root_address,
+        MAX_BTREE_V1_RECURSION_DEPTH,
+        &mut visited,
         &mut results,
     )?;
     Ok(results)
@@ -247,10 +256,22 @@ struct BTreeV1CollectContextStorage<'a> {
 fn collect_recursive(
     context: BTreeV1CollectContext<'_>,
     address: u64,
+    depth_remaining: usize,
+    visited: &mut HashSet<u64>,
     results: &mut Vec<(BTreeV1Key, u64)>,
 ) -> Result<()> {
     if Cursor::is_undefined_offset(address, context.offset_size) {
         return Ok(());
+    }
+    if depth_remaining == 0 {
+        return Err(Error::InvalidData(
+            "B-tree v1 traversal exceeded recursion limit".into(),
+        ));
+    }
+    if !visited.insert(address) {
+        return Err(Error::InvalidData(format!(
+            "B-tree v1 traversal revisits node at offset {address:#x}"
+        )));
     }
 
     if address as usize >= context.data.len() {
@@ -293,7 +314,7 @@ fn collect_recursive(
     } else {
         // Internal node — recurse into each child.
         for child_addr in &node.children {
-            collect_recursive(context, *child_addr, results)?;
+            collect_recursive(context, *child_addr, depth_remaining - 1, visited, results)?;
         }
     }
 
@@ -303,10 +324,22 @@ fn collect_recursive(
 fn collect_recursive_storage(
     context: BTreeV1CollectContextStorage<'_>,
     address: u64,
+    depth_remaining: usize,
+    visited: &mut HashSet<u64>,
     results: &mut Vec<(BTreeV1Key, u64)>,
 ) -> Result<()> {
     if Cursor::is_undefined_offset(address, context.offset_size) {
         return Ok(());
+    }
+    if depth_remaining == 0 {
+        return Err(Error::InvalidData(
+            "B-tree v1 traversal exceeded recursion limit".into(),
+        ));
+    }
+    if !visited.insert(address) {
+        return Err(Error::InvalidData(format!(
+            "B-tree v1 traversal revisits node at offset {address:#x}"
+        )));
     }
 
     let header_len = 4 + 1 + 1 + 2 + 2 * usize::from(context.offset_size);
@@ -375,7 +408,7 @@ fn collect_recursive_storage(
         }
     } else {
         for child_addr in &node.children {
-            collect_recursive_storage(context, *child_addr, results)?;
+            collect_recursive_storage(context, *child_addr, depth_remaining - 1, visited, results)?;
         }
     }
 
@@ -659,6 +692,28 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].1, 0xA00);
         assert_eq!(results[1].1, 0xB00);
+    }
+
+    #[test]
+    fn collect_rejects_revisited_node() {
+        let undef8 = u64::MAX;
+        let root = build_group_node(
+            1,
+            1,
+            undef8,
+            undef8,
+            &[0, 8],
+            &[0], // corrupt: child points back to the root node
+            8,
+            8,
+        );
+
+        let err = collect_btree_v1_leaves(&root, 0, 8, 8, None, &[], None).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(message) if message.contains("revisits node")));
+
+        let storage = crate::storage::BytesStorage::new(root);
+        let err = collect_btree_v1_leaves_storage(&storage, 0, 8, 8, None, &[], None).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(message) if message.contains("revisits node")));
     }
 
     #[test]

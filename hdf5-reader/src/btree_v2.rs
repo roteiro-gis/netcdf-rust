@@ -8,6 +8,8 @@
 //! This module provides the header parse, record types, and a traversal
 //! function that collects all records from a tree.
 
+use std::collections::HashSet;
+
 use crate::checksum::jenkins_lookup3;
 use crate::error::{Error, Result};
 use crate::io::Cursor;
@@ -20,6 +22,7 @@ use crate::storage::Storage;
 const BTHD_SIGNATURE: [u8; 4] = *b"BTHD";
 const BTIN_SIGNATURE: [u8; 4] = *b"BTIN";
 const BTLF_SIGNATURE: [u8; 4] = *b"BTLF";
+const MAX_BTREE_V2_DEPTH: u16 = 64;
 
 // ---------------------------------------------------------------------------
 // Header
@@ -494,6 +497,24 @@ fn child_may_match_link_name_hash(
     lower_matches && upper_matches
 }
 
+fn validate_btree_v2_depth(depth: u16) -> Result<()> {
+    if depth > MAX_BTREE_V2_DEPTH {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 depth {depth} exceeds traversal limit {MAX_BTREE_V2_DEPTH}"
+        )));
+    }
+    Ok(())
+}
+
+fn enter_btree_v2_node(visited: &mut HashSet<u64>, address: u64) -> Result<()> {
+    if !visited.insert(address) {
+        return Err(Error::InvalidData(format!(
+            "B-tree v2 traversal revisits node at offset {address:#x}"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Node parsing
 // ---------------------------------------------------------------------------
@@ -697,8 +718,16 @@ fn parse_internal_node(
     num_records: u16,
     depth: u16,
     heap_id_len: usize,
+    visited: &mut HashSet<u64>,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
+    if depth == 0 {
+        return Err(Error::InvalidData(
+            "B-tree v2 internal node traversal reached depth zero".into(),
+        ));
+    }
+    enter_btree_v2_node(visited, address)?;
+
     let mut cursor = Cursor::new(data);
     cursor.set_position(address);
 
@@ -814,6 +843,7 @@ fn parse_internal_node(
         {
             let child_nrec = child_nrecords[i];
             if child_depth == 0 {
+                enter_btree_v2_node(visited, child_addr)?;
                 let mut child_cursor = Cursor::new(data);
                 child_cursor.set_position(child_addr);
                 parse_leaf_node(
@@ -843,6 +873,7 @@ fn parse_internal_node(
                     child_nrec,
                     child_depth,
                     heap_id_len,
+                    visited,
                     records,
                 )?;
             }
@@ -860,6 +891,7 @@ fn parse_internal_node(
     {
         let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
+            enter_btree_v2_node(visited, final_child_addr)?;
             let mut child_cursor = Cursor::new(data);
             child_cursor.set_position(final_child_addr);
             parse_leaf_node(
@@ -889,6 +921,7 @@ fn parse_internal_node(
                 child_nrec,
                 child_depth,
                 heap_id_len,
+                visited,
                 records,
             )?;
         }
@@ -944,14 +977,17 @@ fn collect_btree_v2_records_with_link_hash(
     if header.total_records == 0 || header.num_records_in_root == 0 {
         return Ok(Vec::new());
     }
+    validate_btree_v2_depth(header.depth)?;
 
     // Determine heap_id_len from the record_size and btree_type.
     let heap_id_len = compute_heap_id_len(header);
 
     let mut records = Vec::new();
+    let mut visited = HashSet::new();
 
     if header.depth == 0 {
         // Root is a leaf node.
+        enter_btree_v2_node(&mut visited, header.root_node_address)?;
         let mut cursor = Cursor::new(data);
         cursor.set_position(header.root_node_address);
         parse_leaf_node(
@@ -982,6 +1018,7 @@ fn collect_btree_v2_records_with_link_hash(
             header.num_records_in_root,
             header.depth,
             heap_id_len,
+            &mut visited,
             &mut records,
         )?;
     }
@@ -1050,11 +1087,14 @@ fn collect_btree_v2_records_storage_with_link_hash(
     if header.total_records == 0 || header.num_records_in_root == 0 {
         return Ok(Vec::new());
     }
+    validate_btree_v2_depth(header.depth)?;
 
     let heap_id_len = compute_heap_id_len(header);
     let mut records = Vec::new();
+    let mut visited = HashSet::new();
 
     if header.depth == 0 {
+        enter_btree_v2_node(&mut visited, header.root_node_address)?;
         parse_leaf_node_storage(
             storage,
             header.root_node_address,
@@ -1083,6 +1123,7 @@ fn collect_btree_v2_records_storage_with_link_hash(
             header.num_records_in_root,
             header.depth,
             heap_id_len,
+            &mut visited,
             &mut records,
         )?;
     }
@@ -1159,8 +1200,16 @@ fn parse_internal_node_storage(
     num_records: u16,
     depth: u16,
     heap_id_len: usize,
+    visited: &mut HashSet<u64>,
     records: &mut Vec<BTreeV2Record>,
 ) -> Result<()> {
+    if depth == 0 {
+        return Err(Error::InvalidData(
+            "B-tree v2 internal node traversal reached depth zero".into(),
+        ));
+    }
+    enter_btree_v2_node(visited, address)?;
+
     let node_len = usize::try_from(header.node_size).map_err(|_| {
         Error::InvalidData("B-tree v2 node size exceeds platform usize capacity".into())
     })?;
@@ -1251,6 +1300,7 @@ fn parse_internal_node_storage(
         {
             let child_nrec = child_nrecords[i];
             if child_depth == 0 {
+                enter_btree_v2_node(visited, child_addr)?;
                 parse_leaf_node_storage(
                     storage,
                     child_addr,
@@ -1279,6 +1329,7 @@ fn parse_internal_node_storage(
                     child_nrec,
                     child_depth,
                     heap_id_len,
+                    visited,
                     records,
                 )?;
             }
@@ -1296,6 +1347,7 @@ fn parse_internal_node_storage(
     {
         let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
+            enter_btree_v2_node(visited, final_child_addr)?;
             parse_leaf_node_storage(
                 storage,
                 final_child_addr,
@@ -1324,6 +1376,7 @@ fn parse_internal_node_storage(
                 child_nrec,
                 child_depth,
                 heap_id_len,
+                visited,
                 records,
             )?;
         }
@@ -1813,6 +1866,63 @@ mod tests {
         let records =
             collect_btree_v2_records_storage(&storage, &header, 8, 8, None, &[], None).unwrap();
         assert_eq!(link_hashes(&records), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn collect_rejects_depth_above_traversal_limit() {
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size: 128,
+            record_size: 12,
+            depth: MAX_BTREE_V2_DEPTH + 1,
+            split_percent: 75,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 1,
+            total_records: 1,
+        };
+        let data = vec![0; 128];
+
+        let err = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(message) if message.contains("exceeds traversal limit"))
+        );
+    }
+
+    #[test]
+    fn collect_rejects_revisited_leaf_node() {
+        let node_size = 128usize;
+        let leaf_addr = node_size as u64;
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size: node_size as u32,
+            record_size: 12,
+            depth: 1,
+            split_percent: 75,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 1,
+            total_records: 3,
+        };
+
+        let root = build_type5_internal(
+            &[(20, [20; 8])],
+            &[(leaf_addr, 1), (leaf_addr, 1)],
+            node_size,
+        );
+        let leaf = build_type5_leaf(&[(10, [10; 8])], node_size);
+
+        let mut data = vec![0; node_size * 2];
+        data[0..node_size].copy_from_slice(&root);
+        data[node_size..node_size * 2].copy_from_slice(&leaf);
+
+        let err = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(message) if message.contains("revisits node")));
+
+        let storage = crate::storage::BytesStorage::new(data);
+        let err =
+            collect_btree_v2_records_storage(&storage, &header, 8, 8, None, &[], None).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(message) if message.contains("revisits node")));
     }
 
     #[test]
