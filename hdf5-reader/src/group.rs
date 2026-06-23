@@ -5,6 +5,7 @@ use crate::attribute_api::{
 };
 use crate::btree_v1;
 use crate::btree_v2;
+use crate::checksum::jenkins_lookup3;
 use crate::dataset::Dataset;
 use crate::error::{Error, Result};
 use crate::fractal_heap::{FractalHeap, FractalHeapDirectBlockCache};
@@ -145,25 +146,22 @@ impl Group {
 
     /// Get a child group by name.
     pub fn group(&self, name: &str) -> Result<Group> {
-        let children = self.resolve_children()?;
-        for child in &children {
-            if child.name == name {
-                return match self.child_object_kind(child)? {
-                    ChildObjectKind::Group => Ok(Group::new(
-                        child.location.context.clone(),
-                        child.location.address,
-                        child.name.clone(),
-                        child.location.root_address,
-                    )),
-                    ChildObjectKind::Dataset => Err(Error::GroupNotFound(format!(
-                        "'{}' is a dataset, not a group",
-                        name
-                    ))),
-                    ChildObjectKind::Other => {
-                        Err(Error::GroupNotFound(format!("'{}' is not a group", name)))
-                    }
-                };
-            }
+        if let Some(child) = self.resolve_child(name)? {
+            return match self.child_object_kind(&child)? {
+                ChildObjectKind::Group => Ok(Group::new(
+                    child.location.context.clone(),
+                    child.location.address,
+                    child.name.clone(),
+                    child.location.root_address,
+                )),
+                ChildObjectKind::Dataset => Err(Error::GroupNotFound(format!(
+                    "'{}' is a dataset, not a group",
+                    name
+                ))),
+                ChildObjectKind::Other => {
+                    Err(Error::GroupNotFound(format!("'{}' is not a group", name)))
+                }
+            };
         }
         Err(Error::GroupNotFound(name.to_string()))
     }
@@ -176,14 +174,11 @@ impl Group {
 
     /// Get a child dataset by name.
     pub fn dataset(&self, name: &str) -> Result<Dataset> {
-        let children = self.resolve_children()?;
-        for child in &children {
-            if child.name == name {
-                if let Some(dataset) = self.try_open_child_dataset(child)? {
-                    return Ok(dataset);
-                }
-                return Err(Error::DatasetNotFound(name.to_string()));
+        if let Some(child) = self.resolve_child(name)? {
+            if let Some(dataset) = self.try_open_child_dataset(&child)? {
+                return Ok(dataset);
             }
+            return Err(Error::DatasetNotFound(name.to_string()));
         }
         Err(Error::DatasetNotFound(name.to_string()))
     }
@@ -254,6 +249,53 @@ impl Group {
         self.resolve_children_with_link_depth(0)
     }
 
+    fn resolve_child(&self, name: &str) -> Result<Option<ChildEntry>> {
+        self.resolve_child_with_link_depth(name, 0)
+    }
+
+    fn resolve_child_with_link_depth(
+        &self,
+        name: &str,
+        link_depth: u32,
+    ) -> Result<Option<ChildEntry>> {
+        let header = self.cached_header(self.address)?;
+
+        let mut link_info: Option<LinkInfoMessage> = None;
+        let mut matching_compact_link: Option<LinkMessage> = None;
+
+        for msg in &header.messages {
+            match msg {
+                HdfMessage::SymbolTable(st) => {
+                    return Ok(self
+                        .resolve_old_style_group_storage(st)?
+                        .into_iter()
+                        .find(|child| child.name == name));
+                }
+                HdfMessage::Link(link) if link.name == name => {
+                    matching_compact_link = Some(link.clone());
+                }
+                HdfMessage::LinkInfo(li) => {
+                    link_info = Some(li.clone());
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(link) = matching_compact_link {
+            if let Some(child) = self.resolve_link_message_target(&link, link_depth)? {
+                return Ok(Some(child));
+            }
+        }
+
+        if let Some(ref li) = link_info {
+            if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
+                return self.resolve_dense_link_storage(li, name, link_depth);
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Resolve children with a soft-link depth counter to prevent cycles.
     fn resolve_children_with_link_depth(&self, link_depth: u32) -> Result<Vec<ChildEntry>> {
         let header = self.cached_header(self.address)?;
@@ -314,34 +356,37 @@ impl Group {
         children: &mut Vec<ChildEntry>,
     ) -> Result<()> {
         for link in links {
-            match &link.target {
-                LinkTarget::Hard { address } => {
-                    children.push(ChildEntry {
-                        name: link.name.clone(),
-                        location: self.local_location(*address),
-                    });
-                }
-                LinkTarget::Soft { path } => {
-                    if let Ok(location) = self.resolve_soft_link_depth(path, link_depth) {
-                        children.push(ChildEntry {
-                            name: link.name.clone(),
-                            location,
-                        });
-                    }
-                }
-                LinkTarget::External { filename, path } => {
-                    if let Some(location) =
-                        self.resolve_external_link_depth(filename, path, link_depth)?
-                    {
-                        children.push(ChildEntry {
-                            name: link.name.clone(),
-                            location,
-                        });
-                    }
-                }
+            if let Some(child) = self.resolve_link_message_target(link, link_depth)? {
+                children.push(child);
             }
         }
         Ok(())
+    }
+
+    fn resolve_link_message_target(
+        &self,
+        link: &LinkMessage,
+        link_depth: u32,
+    ) -> Result<Option<ChildEntry>> {
+        match &link.target {
+            LinkTarget::Hard { address } => Ok(Some(ChildEntry {
+                name: link.name.clone(),
+                location: self.local_location(*address),
+            })),
+            LinkTarget::Soft { path } => Ok(self
+                .resolve_soft_link_depth(path, link_depth)
+                .ok()
+                .map(|location| ChildEntry {
+                    name: link.name.clone(),
+                    location,
+                })),
+            LinkTarget::External { filename, path } => Ok(self
+                .resolve_external_link_depth(filename, path, link_depth)?
+                .map(|location| ChildEntry {
+                    name: link.name.clone(),
+                    location,
+                })),
+        }
     }
 
     fn resolve_old_style_group_storage(&self, st: &SymbolTableMessage) -> Result<Vec<ChildEntry>> {
@@ -492,6 +537,64 @@ impl Group {
         Ok(children)
     }
 
+    fn resolve_dense_link_storage(
+        &self,
+        link_info: &LinkInfoMessage,
+        name: &str,
+        link_depth: u32,
+    ) -> Result<Option<ChildEntry>> {
+        let heap = FractalHeap::parse_at_storage(
+            self.context.storage.as_ref(),
+            link_info.fractal_heap_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let btree_header = btree_v2::BTreeV2Header::parse_at_storage(
+            self.context.storage.as_ref(),
+            link_info.btree_name_index_address,
+            self.offset_size(),
+            self.length_size(),
+        )?;
+
+        let records = btree_v2::collect_btree_v2_link_name_hash_records_storage(
+            self.context.storage.as_ref(),
+            &btree_header,
+            self.offset_size(),
+            self.length_size(),
+            jenkins_lookup3(name.as_bytes()),
+        )?;
+
+        let mut direct_block_cache = FractalHeapDirectBlockCache::default();
+        for record in &records {
+            let btree_v2::BTreeV2Record::LinkNameHash { heap_id, .. } = record else {
+                continue;
+            };
+
+            let managed_bytes = heap.get_object_storage_cached_with_registry(
+                heap_id,
+                self.context.storage.as_ref(),
+                self.offset_size(),
+                self.length_size(),
+                &mut direct_block_cache,
+                Some(self.context.filter_registry.as_ref()),
+            )?;
+
+            let mut link_cursor = Cursor::new(&managed_bytes);
+            let link_msg = link::parse(
+                &mut link_cursor,
+                self.offset_size(),
+                self.length_size(),
+                managed_bytes.len(),
+            )?;
+            if link_msg.name == name {
+                return self.resolve_link_message_target(&link_msg, link_depth);
+            }
+        }
+
+        Ok(None)
+    }
+
     pub fn child_name_by_address(&self, address: u64) -> Result<Option<String>> {
         Ok(self
             .resolve_children()?
@@ -622,11 +725,8 @@ impl Group {
         }
 
         let target_name = parts[parts.len() - 1];
-        let children = current_group.resolve_children_with_link_depth(depth + 1)?;
-        for child in &children {
-            if child.name == target_name {
-                return Ok(child.location.clone());
-            }
+        if let Some(child) = current_group.resolve_child_with_link_depth(target_name, depth + 1)? {
+            return Ok(child.location);
         }
 
         Err(Error::Other(format!(

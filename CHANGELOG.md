@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 - 2026-06-22
+## 0.7.0 - 2026-06-23
 
 - breaking: change `netcdf_reader::classic::data::compute_record_stride` to return
   `Result<u64>` and reject padded record-size and record-stride overflows instead
@@ -20,6 +20,17 @@
   reject oversized continuation or chunk lengths before platform casts
 - check HDF5 superblock magic-search offset arithmetic for overflow on huge
   range-backed storage
+- add a real B-tree v2 chunk-index fixture and parse chunk offsets as scaled
+  dataset element coordinates
+- reject malformed B-tree v2 records that consume more bytes than the declared
+  record size or have record sizes too small for fixed fields
+- preserve B-tree v2 internal-node records in traversal order so records from
+  depth > 0 trees are not skipped
+- reject repeated B-tree v1/v2 nodes and repeated fractal-heap indirect blocks,
+  and bound recursive traversal depth and indirect row counts
+- use B-tree v2 link-name hash ranges to prune dense group lookup instead of
+  enumerating every dense link before matching a requested name
+- update `memmap2` to 0.9.11
 - add CodeQL analysis and run the HDF5 open fuzz target in CI
 - clarify README dependency-scope wording for the published pure-Rust crates
 

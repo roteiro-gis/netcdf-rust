@@ -8,7 +8,7 @@
 //! This module parses the heap header and provides object extraction for
 //! managed, tiny, and unfiltered huge object IDs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::checksum::jenkins_lookup3;
@@ -26,6 +26,8 @@ const _FHDB_SIGNATURE: [u8; 4] = *b"FHDB";
 
 /// Signature bytes for an indirect block: ASCII `FHIB`.
 const FHIB_SIGNATURE: [u8; 4] = *b"FHIB";
+const MAX_FRACTAL_HEAP_INDIRECT_DEPTH: usize = 64;
+const MAX_FRACTAL_HEAP_INDIRECT_ROWS: u16 = 64;
 
 /// Parsed fractal heap header.
 #[derive(Debug, Clone)]
@@ -938,6 +940,7 @@ impl FractalHeap {
             })
         } else {
             // Root block is an indirect block — traverse the doubling table.
+            let mut visited = HashSet::new();
             self.find_direct_block_via_indirect(
                 self.root_block_address,
                 heap_offset,
@@ -945,6 +948,8 @@ impl FractalHeap {
                 offset_size,
                 length_size,
                 self.current_rows_in_root_indirect,
+                MAX_FRACTAL_HEAP_INDIRECT_DEPTH,
+                &mut visited,
             )
         }
     }
@@ -969,6 +974,7 @@ impl FractalHeap {
                 filter_mask: self.io_filter_mask.unwrap_or(0),
             })
         } else {
+            let mut visited = HashSet::new();
             self.find_direct_block_via_indirect_storage(
                 self.root_block_address,
                 heap_offset,
@@ -976,11 +982,14 @@ impl FractalHeap {
                 offset_size,
                 length_size,
                 self.current_rows_in_root_indirect,
+                MAX_FRACTAL_HEAP_INDIRECT_DEPTH,
+                &mut visited,
             )
         }
     }
 
     /// Traverse an indirect block to find the direct block for a given offset.
+    #[allow(clippy::too_many_arguments)]
     fn find_direct_block_via_indirect(
         &self,
         indirect_address: u64,
@@ -989,10 +998,18 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
         nrows: u16,
+        depth_remaining: usize,
+        visited: &mut HashSet<u64>,
     ) -> Result<DirectBlockLocation> {
+        self.enter_indirect_block(indirect_address, nrows, depth_remaining, visited)?;
+
         // Validate FHIB signature
-        let addr = indirect_address as usize;
-        if addr + 4 > file_data.len() {
+        let addr = usize::try_from(indirect_address)
+            .map_err(|_| Error::OffsetOutOfBounds(indirect_address))?;
+        if addr
+            .checked_add(4)
+            .map_or(true, |end| end > file_data.len())
+        {
             return Err(Error::OffsetOutOfBounds(indirect_address));
         }
         if file_data[addr..addr + 4] != FHIB_SIGNATURE {
@@ -1014,11 +1031,13 @@ impl FractalHeap {
         let mut running_offset: u64 = 0;
 
         for row in 0..nrows as u64 {
-            let block_size = self.block_size_for_row(row);
+            let block_size = self.block_size_for_row_checked(row)?;
             let is_direct = block_size <= self.max_direct_block_size;
 
             for col in 0..width {
-                let block_end = running_offset + block_size;
+                let block_end = running_offset.checked_add(block_size).ok_or_else(|| {
+                    Error::InvalidData("fractal heap indirect block offset overflows u64".into())
+                })?;
                 if heap_offset >= running_offset && heap_offset < block_end {
                     // This is the block we want. Read its address from the
                     // indirect block.
@@ -1033,14 +1052,31 @@ impl FractalHeap {
 
                     if is_direct {
                         let entry_size = self.direct_block_entry_size(offset_size, length_size);
-                        let entry_pos =
-                            indirect_address + iblock_header_size + entry_index * entry_size;
+                        let entry_offset =
+                            entry_index.checked_mul(entry_size).ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry offset overflows u64".into(),
+                                )
+                            })?;
+                        let entry_pos = indirect_address
+                            .checked_add(iblock_header_size)
+                            .and_then(|pos| pos.checked_add(entry_offset))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry address overflows u64".into(),
+                                )
+                            })?;
                         let entry_len = usize::try_from(entry_size).map_err(|_| {
                             Error::InvalidData(
                                 "fractal heap direct entry size exceeds platform usize".into(),
                             )
                         })?;
-                        if entry_pos as usize + entry_len > file_data.len() {
+                        let entry_pos_usize = usize::try_from(entry_pos)
+                            .map_err(|_| Error::OffsetOutOfBounds(entry_pos))?;
+                        if entry_pos_usize
+                            .checked_add(entry_len)
+                            .map_or(true, |end| end > file_data.len())
+                        {
                             return Err(Error::OffsetOutOfBounds(entry_pos));
                         }
                         let mut cursor = Cursor::new(file_data);
@@ -1066,19 +1102,49 @@ impl FractalHeap {
                         });
                     } else {
                         // Need to recurse into a sub-indirect block.
-                        let direct_count =
-                            self.max_direct_block_rows() * u64::from(self.table_width);
+                        let direct_count = self
+                            .max_direct_block_rows_checked()?
+                            .checked_mul(u64::from(self.table_width))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry count overflows u64".into(),
+                                )
+                            })?;
                         let indirect_index =
                             entry_index.checked_sub(direct_count).ok_or_else(|| {
                                 Error::InvalidData(
                                     "fractal heap indirect entry precedes direct entries".into(),
                                 )
                             })?;
+                        let direct_entry_bytes = direct_count
+                            .checked_mul(self.direct_block_entry_size(offset_size, length_size))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry table size overflows u64".into(),
+                                )
+                            })?;
+                        let indirect_entry_offset = indirect_index
+                            .checked_mul(u64::from(offset_size))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap indirect entry offset overflows u64".into(),
+                                )
+                            })?;
                         let entry_pos = indirect_address
-                            + iblock_header_size
-                            + direct_count * self.direct_block_entry_size(offset_size, length_size)
-                            + indirect_index * u64::from(offset_size);
-                        if entry_pos as usize + offset_size as usize > file_data.len() {
+                            .checked_add(iblock_header_size)
+                            .and_then(|pos| pos.checked_add(direct_entry_bytes))
+                            .and_then(|pos| pos.checked_add(indirect_entry_offset))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap indirect entry address overflows u64".into(),
+                                )
+                            })?;
+                        let entry_pos_usize = usize::try_from(entry_pos)
+                            .map_err(|_| Error::OffsetOutOfBounds(entry_pos))?;
+                        if entry_pos_usize
+                            .checked_add(usize::from(offset_size))
+                            .map_or(true, |end| end > file_data.len())
+                        {
                             return Err(Error::OffsetOutOfBounds(entry_pos));
                         }
                         let mut cursor = Cursor::new(file_data);
@@ -1088,7 +1154,7 @@ impl FractalHeap {
                             return Err(Error::UndefinedAddress);
                         }
                         // Determine how many rows the sub-indirect has.
-                        let sub_rows = self.rows_for_block_size(block_size);
+                        let sub_rows = self.rows_for_block_size_checked(block_size)?;
                         return self.find_direct_block_via_indirect(
                             block_address,
                             heap_offset - running_offset,
@@ -1096,6 +1162,8 @@ impl FractalHeap {
                             offset_size,
                             length_size,
                             sub_rows,
+                            depth_remaining - 1,
+                            visited,
                         );
                     }
                 }
@@ -1109,6 +1177,7 @@ impl FractalHeap {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn find_direct_block_via_indirect_storage(
         &self,
         indirect_address: u64,
@@ -1117,7 +1186,11 @@ impl FractalHeap {
         offset_size: u8,
         length_size: u8,
         nrows: u16,
+        depth_remaining: usize,
+        visited: &mut HashSet<u64>,
     ) -> Result<DirectBlockLocation> {
+        self.enter_indirect_block(indirect_address, nrows, depth_remaining, visited)?;
+
         let sig = storage.read_range(indirect_address, 4)?;
         if sig.as_ref() != FHIB_SIGNATURE {
             return Err(Error::InvalidData(format!(
@@ -1131,11 +1204,13 @@ impl FractalHeap {
         let mut running_offset = 0u64;
 
         for row in 0..u64::from(nrows) {
-            let block_size = self.block_size_for_row(row);
+            let block_size = self.block_size_for_row_checked(row)?;
             let is_direct = block_size <= self.max_direct_block_size;
 
             for col in 0..width {
-                let block_end = running_offset + block_size;
+                let block_end = running_offset.checked_add(block_size).ok_or_else(|| {
+                    Error::InvalidData("fractal heap indirect block offset overflows u64".into())
+                })?;
                 if heap_offset >= running_offset && heap_offset < block_end {
                     let entry_index = row * width + col;
                     let iblock_header_size = 4
@@ -1145,8 +1220,20 @@ impl FractalHeap {
 
                     if is_direct {
                         let entry_size = self.direct_block_entry_size(offset_size, length_size);
-                        let entry_pos =
-                            indirect_address + iblock_header_size + entry_index * entry_size;
+                        let entry_offset =
+                            entry_index.checked_mul(entry_size).ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry offset overflows u64".into(),
+                                )
+                            })?;
+                        let entry_pos = indirect_address
+                            .checked_add(iblock_header_size)
+                            .and_then(|pos| pos.checked_add(entry_offset))
+                            .ok_or_else(|| {
+                                Error::InvalidData(
+                                    "fractal heap direct entry address overflows u64".into(),
+                                )
+                            })?;
                         let entry_len = usize::try_from(entry_size).map_err(|_| {
                             Error::InvalidData(
                                 "fractal heap direct entry size exceeds platform usize".into(),
@@ -1175,17 +1262,43 @@ impl FractalHeap {
                         });
                     }
 
-                    let direct_count = self.max_direct_block_rows() * u64::from(self.table_width);
+                    let direct_count = self
+                        .max_direct_block_rows_checked()?
+                        .checked_mul(u64::from(self.table_width))
+                        .ok_or_else(|| {
+                            Error::InvalidData(
+                                "fractal heap direct entry count overflows u64".into(),
+                            )
+                        })?;
                     let indirect_index =
                         entry_index.checked_sub(direct_count).ok_or_else(|| {
                             Error::InvalidData(
                                 "fractal heap indirect entry precedes direct entries".into(),
                             )
                         })?;
+                    let direct_entry_bytes = direct_count
+                        .checked_mul(self.direct_block_entry_size(offset_size, length_size))
+                        .ok_or_else(|| {
+                            Error::InvalidData(
+                                "fractal heap direct entry table size overflows u64".into(),
+                            )
+                        })?;
+                    let indirect_entry_offset = indirect_index
+                        .checked_mul(u64::from(offset_size))
+                        .ok_or_else(|| {
+                            Error::InvalidData(
+                                "fractal heap indirect entry offset overflows u64".into(),
+                            )
+                        })?;
                     let entry_addr_pos = indirect_address
-                        + iblock_header_size
-                        + direct_count * self.direct_block_entry_size(offset_size, length_size)
-                        + indirect_index * u64::from(offset_size);
+                        .checked_add(iblock_header_size)
+                        .and_then(|pos| pos.checked_add(direct_entry_bytes))
+                        .and_then(|pos| pos.checked_add(indirect_entry_offset))
+                        .ok_or_else(|| {
+                            Error::InvalidData(
+                                "fractal heap indirect entry address overflows u64".into(),
+                            )
+                        })?;
                     let entry = storage.read_range(entry_addr_pos, usize::from(offset_size))?;
                     let mut cursor = Cursor::new(entry.as_ref());
                     let block_address = cursor.read_offset(offset_size)?;
@@ -1193,7 +1306,7 @@ impl FractalHeap {
                         return Err(Error::UndefinedAddress);
                     }
 
-                    let sub_rows = self.rows_for_block_size(block_size);
+                    let sub_rows = self.rows_for_block_size_checked(block_size)?;
                     return self.find_direct_block_via_indirect_storage(
                         block_address,
                         heap_offset - running_offset,
@@ -1201,6 +1314,8 @@ impl FractalHeap {
                         offset_size,
                         length_size,
                         sub_rows,
+                        depth_remaining - 1,
+                        visited,
                     );
                 }
                 running_offset = block_end;
@@ -1213,48 +1328,89 @@ impl FractalHeap {
         )))
     }
 
+    fn enter_indirect_block(
+        &self,
+        indirect_address: u64,
+        nrows: u16,
+        depth_remaining: usize,
+        visited: &mut HashSet<u64>,
+    ) -> Result<()> {
+        if depth_remaining == 0 {
+            return Err(Error::InvalidData(
+                "fractal heap indirect traversal exceeded recursion limit".into(),
+            ));
+        }
+        if nrows > MAX_FRACTAL_HEAP_INDIRECT_ROWS {
+            return Err(Error::InvalidData(format!(
+                "fractal heap indirect block has {} rows, limit is {}",
+                nrows, MAX_FRACTAL_HEAP_INDIRECT_ROWS
+            )));
+        }
+        if !visited.insert(indirect_address) {
+            return Err(Error::InvalidData(format!(
+                "fractal heap indirect traversal revisits block at offset {:#x}",
+                indirect_address
+            )));
+        }
+        Ok(())
+    }
+
     /// Compute the block size for a given row in the doubling table.
-    fn block_size_for_row(&self, row: u64) -> u64 {
+    fn block_size_for_row_checked(&self, row: u64) -> Result<u64> {
         if row == 0 {
-            self.starting_block_size
+            Ok(self.starting_block_size)
         } else {
-            self.starting_block_size * (1u64 << (row - 1))
+            let shift = u32::try_from(row - 1)
+                .map_err(|_| Error::InvalidData("fractal heap indirect row exceeds u32".into()))?;
+            let factor = 1u64.checked_shl(shift).ok_or_else(|| {
+                Error::InvalidData("fractal heap indirect row shift overflows u64".into())
+            })?;
+            self.starting_block_size.checked_mul(factor).ok_or_else(|| {
+                Error::InvalidData("fractal heap indirect block size overflows u64".into())
+            })
         }
     }
 
     /// Compute how many rows of the doubling table fit in a block of the
     /// given total size.
-    fn rows_for_block_size(&self, total_size: u64) -> u16 {
+    fn rows_for_block_size_checked(&self, total_size: u64) -> Result<u16> {
         let mut rows = 0u16;
         let mut accum = 0u64;
-        let width = self.table_width as u64;
+        let width = u64::from(self.table_width);
         loop {
-            let bs = self.block_size_for_row(rows as u64);
-            let row_total = bs * width;
-            if accum + row_total > total_size {
+            if rows >= MAX_FRACTAL_HEAP_INDIRECT_ROWS {
                 break;
             }
-            accum += row_total;
-            rows += 1;
-            if rows > 1000 {
-                break; // safety
+            let bs = self.block_size_for_row_checked(u64::from(rows))?;
+            let row_total = bs.checked_mul(width).ok_or_else(|| {
+                Error::InvalidData("fractal heap indirect row size overflows u64".into())
+            })?;
+            let next = accum.checked_add(row_total).ok_or_else(|| {
+                Error::InvalidData("fractal heap indirect table size overflows u64".into())
+            })?;
+            if next > total_size {
+                break;
             }
+            accum = next;
+            rows = rows.checked_add(1).ok_or_else(|| {
+                Error::InvalidData("fractal heap indirect row count overflows u16".into())
+            })?;
         }
-        rows
+        Ok(rows)
     }
 
-    fn max_direct_block_rows(&self) -> u64 {
+    fn max_direct_block_rows_checked(&self) -> Result<u64> {
         let mut rows = 0u64;
         loop {
-            if self.block_size_for_row(rows) > self.max_direct_block_size {
+            if rows >= u64::from(MAX_FRACTAL_HEAP_INDIRECT_ROWS) {
+                break;
+            }
+            if self.block_size_for_row_checked(rows)? > self.max_direct_block_size {
                 break;
             }
             rows += 1;
-            if rows > 1000 {
-                break;
-            }
         }
-        rows
+        Ok(rows)
     }
 
     fn direct_block_entry_size(&self, offset_size: u8, length_size: u8) -> u64 {
@@ -1489,10 +1645,82 @@ mod tests {
             io_filter_info: Vec::new(),
         };
 
-        assert_eq!(heap.block_size_for_row(0), 256);
-        assert_eq!(heap.block_size_for_row(1), 256); // 256 * 2^0
-        assert_eq!(heap.block_size_for_row(2), 512); // 256 * 2^1
-        assert_eq!(heap.block_size_for_row(3), 1024); // 256 * 2^2
+        assert_eq!(heap.block_size_for_row_checked(0).unwrap(), 256);
+        assert_eq!(heap.block_size_for_row_checked(1).unwrap(), 256); // 256 * 2^0
+        assert_eq!(heap.block_size_for_row_checked(2).unwrap(), 512); // 256 * 2^1
+        assert_eq!(heap.block_size_for_row_checked(3).unwrap(), 1024); // 256 * 2^2
+    }
+
+    #[test]
+    fn find_direct_block_rejects_indirect_row_count_above_limit() {
+        let mut heap = base_heap();
+        heap.root_block_address = 0;
+        heap.current_rows_in_root_indirect = MAX_FRACTAL_HEAP_INDIRECT_ROWS + 1;
+
+        let err = heap.find_direct_block(0, &[], 8, 8).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(ref message) if message.contains("limit")),
+            "{err:?}"
+        );
+
+        let storage = crate::storage::BytesStorage::new(Vec::new());
+        let err = heap
+            .find_direct_block_storage(0, &storage, 8, 8)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(ref message) if message.contains("limit")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn find_direct_block_rejects_cyclic_indirect_block() {
+        let mut heap = base_heap();
+        let indirect_address = 512u64;
+        heap.table_width = 1;
+        heap.starting_block_size = 256;
+        heap.max_direct_block_size = 256;
+        heap.max_heap_size = 64;
+        heap.root_block_address = indirect_address;
+        heap.current_rows_in_root_indirect = 3;
+
+        let offset_size = 8u8;
+        let length_size = 8u8;
+        let offset_bytes = usize::from(heap.max_heap_size).div_ceil(8);
+        let iblock_header_size = 4 + 1 + usize::from(offset_size) + offset_bytes;
+        let direct_count = usize::try_from(
+            heap.max_direct_block_rows_checked().unwrap() * u64::from(heap.table_width),
+        )
+        .unwrap();
+        let direct_entry_size =
+            usize::try_from(heap.direct_block_entry_size(offset_size, length_size)).unwrap();
+        let indirect_entry_pos = iblock_header_size + direct_count * direct_entry_size;
+        let mut indirect = vec![0u8; indirect_entry_pos + usize::from(offset_size)];
+        indirect[0..4].copy_from_slice(b"FHIB");
+        indirect[4] = 0;
+        indirect[indirect_entry_pos..indirect_entry_pos + usize::from(offset_size)]
+            .copy_from_slice(&indirect_address.to_le_bytes());
+
+        let mut file_data = vec![0u8; indirect_address as usize + indirect.len()];
+        file_data[indirect_address as usize..indirect_address as usize + indirect.len()]
+            .copy_from_slice(&indirect);
+
+        let err = heap
+            .find_direct_block(600, &file_data, offset_size, length_size)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(ref message) if message.contains("revisits block")),
+            "{err:?}"
+        );
+
+        let storage = crate::storage::BytesStorage::new(file_data);
+        let err = heap
+            .find_direct_block_storage(600, &storage, offset_size, length_size)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(ref message) if message.contains("revisits block")),
+            "{err:?}"
+        );
     }
 
     #[test]
