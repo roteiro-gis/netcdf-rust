@@ -804,32 +804,64 @@ fn parse_internal_node(
         "internal node",
     )?;
 
-    // The records from this internal node are NOT included in the leaf
-    // collection — they are separators. We do NOT add them to results.
-    // Only leaf records are collected.
-    // (Actually, in HDF5 v2 B-trees, records in internal nodes are real
-    // records too, not just separators. We should collect them.)
-    records.extend(
-        node_records
-            .iter()
-            .filter(|record| record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash))
-            .cloned(),
-    );
-
-    // Recurse into children.
+    // HDF5's v2 B-tree iterator visits child[i], then record[i], then the
+    // final child. Internal-node records are real records, not only separators.
     let child_depth = depth - 1;
-    for (i, &child_addr) in child_addresses.iter().enumerate() {
-        if Cursor::is_undefined_offset(child_addr, offset_size) {
-            continue;
+    for (i, record) in node_records.iter().enumerate() {
+        let child_addr = child_addresses[i];
+        if !Cursor::is_undefined_offset(child_addr, offset_size)
+            && child_may_match_link_name_hash(&node_records, i, link_name_hash)
+        {
+            let child_nrec = child_nrecords[i];
+            if child_depth == 0 {
+                let mut child_cursor = Cursor::new(data);
+                child_cursor.set_position(child_addr);
+                parse_leaf_node(
+                    &mut child_cursor,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    link_name_hash,
+                    child_nrec,
+                    heap_id_len,
+                    records,
+                )?;
+            } else {
+                parse_internal_node(
+                    data,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    link_name_hash,
+                    child_nrec,
+                    child_depth,
+                    heap_id_len,
+                    records,
+                )?;
+            }
         }
-        if !child_may_match_link_name_hash(&node_records, i, link_name_hash) {
-            continue;
+
+        if record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash) {
+            records.push(record.clone());
         }
-        let child_nrec = child_nrecords[i];
+    }
+
+    let final_child_index = node_records.len();
+    let final_child_addr = child_addresses[final_child_index];
+    if !Cursor::is_undefined_offset(final_child_addr, offset_size)
+        && child_may_match_link_name_hash(&node_records, final_child_index, link_name_hash)
+    {
+        let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
-            // Child is a leaf.
             let mut child_cursor = Cursor::new(data);
-            child_cursor.set_position(child_addr);
+            child_cursor.set_position(final_child_addr);
             parse_leaf_node(
                 &mut child_cursor,
                 header,
@@ -844,10 +876,9 @@ fn parse_internal_node(
                 records,
             )?;
         } else {
-            // Child is another internal node.
             parse_internal_node(
                 data,
-                child_addr,
+                final_child_addr,
                 header,
                 offset_size,
                 length_size,
@@ -1212,26 +1243,62 @@ fn parse_internal_node_storage(
         "internal node",
     )?;
 
-    records.extend(
-        node_records
-            .iter()
-            .filter(|record| record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash))
-            .cloned(),
-    );
-
     let child_depth = depth - 1;
-    for (i, &child_addr) in child_addresses.iter().enumerate() {
-        if Cursor::is_undefined_offset(child_addr, offset_size) {
-            continue;
+    for (i, record) in node_records.iter().enumerate() {
+        let child_addr = child_addresses[i];
+        if !Cursor::is_undefined_offset(child_addr, offset_size)
+            && child_may_match_link_name_hash(&node_records, i, link_name_hash)
+        {
+            let child_nrec = child_nrecords[i];
+            if child_depth == 0 {
+                parse_leaf_node_storage(
+                    storage,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    link_name_hash,
+                    child_nrec,
+                    heap_id_len,
+                    records,
+                )?;
+            } else {
+                parse_internal_node_storage(
+                    storage,
+                    child_addr,
+                    header,
+                    offset_size,
+                    length_size,
+                    ndims,
+                    chunk_dims,
+                    chunk_bounds,
+                    link_name_hash,
+                    child_nrec,
+                    child_depth,
+                    heap_id_len,
+                    records,
+                )?;
+            }
         }
-        if !child_may_match_link_name_hash(&node_records, i, link_name_hash) {
-            continue;
+
+        if record_matches_query(record, chunk_dims, chunk_bounds, link_name_hash) {
+            records.push(record.clone());
         }
-        let child_nrec = child_nrecords[i];
+    }
+
+    let final_child_index = node_records.len();
+    let final_child_addr = child_addresses[final_child_index];
+    if !Cursor::is_undefined_offset(final_child_addr, offset_size)
+        && child_may_match_link_name_hash(&node_records, final_child_index, link_name_hash)
+    {
+        let child_nrec = child_nrecords[final_child_index];
         if child_depth == 0 {
             parse_leaf_node_storage(
                 storage,
-                child_addr,
+                final_child_addr,
                 header,
                 offset_size,
                 length_size,
@@ -1246,7 +1313,7 @@ fn parse_internal_node_storage(
         } else {
             parse_internal_node_storage(
                 storage,
-                child_addr,
+                final_child_addr,
                 header,
                 offset_size,
                 length_size,
@@ -1649,6 +1716,103 @@ mod tests {
             }
             _ => panic!("expected LinkNameHash"),
         }
+    }
+
+    fn build_type5_record(hash: u32, heap_id: [u8; 8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&hash.to_le_bytes());
+        record.extend_from_slice(&heap_id);
+        record
+    }
+
+    fn build_type5_leaf(records: &[(u32, [u8; 8])], node_size: usize) -> Vec<u8> {
+        let mut leaf = Vec::new();
+        leaf.extend_from_slice(b"BTLF");
+        leaf.push(0);
+        leaf.push(5);
+        for &(hash, heap_id) in records {
+            leaf.extend_from_slice(&build_type5_record(hash, heap_id));
+        }
+        let checksum = jenkins_lookup3(&leaf);
+        leaf.extend_from_slice(&checksum.to_le_bytes());
+        leaf.resize(node_size, 0);
+        leaf
+    }
+
+    fn build_type5_internal(
+        records: &[(u32, [u8; 8])],
+        children: &[(u64, u8)],
+        node_size: usize,
+    ) -> Vec<u8> {
+        assert_eq!(children.len(), records.len() + 1);
+
+        let mut node = Vec::new();
+        node.extend_from_slice(b"BTIN");
+        node.push(0);
+        node.push(5);
+        for &(hash, heap_id) in records {
+            node.extend_from_slice(&build_type5_record(hash, heap_id));
+        }
+        for &(address, child_records) in children {
+            node.extend_from_slice(&address.to_le_bytes());
+            node.push(child_records);
+        }
+        let checksum = jenkins_lookup3(&node);
+        node.extend_from_slice(&checksum.to_le_bytes());
+        node.resize(node_size, 0);
+        node
+    }
+
+    fn link_hashes(records: &[BTreeV2Record]) -> Vec<u32> {
+        records
+            .iter()
+            .map(|record| match record {
+                BTreeV2Record::LinkNameHash { hash, .. } => *hash,
+                other => panic!("expected LinkNameHash, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_depth_one_tree_includes_internal_records_in_order() {
+        // Mirrors HDF5 H5B2__iterate_node: recurse into child[i], visit
+        // record[i], then recurse into the final child. Internal-node records
+        // are callback records, not just separators.
+        let node_size = 128usize;
+        let left_addr = node_size as u64;
+        let right_addr = (node_size * 2) as u64;
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size: node_size as u32,
+            record_size: 12,
+            depth: 1,
+            split_percent: 75,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 1,
+            total_records: 3,
+        };
+
+        let root = build_type5_internal(
+            &[(20, [20; 8])],
+            &[(left_addr, 1), (right_addr, 1)],
+            node_size,
+        );
+        let left_leaf = build_type5_leaf(&[(10, [10; 8])], node_size);
+        let right_leaf = build_type5_leaf(&[(30, [30; 8])], node_size);
+
+        let mut data = vec![0; node_size * 3];
+        data[0..node_size].copy_from_slice(&root);
+        data[node_size..node_size * 2].copy_from_slice(&left_leaf);
+        data[node_size * 2..node_size * 3].copy_from_slice(&right_leaf);
+
+        let records = collect_btree_v2_records(&data, &header, 8, 8, None, &[], None).unwrap();
+        assert_eq!(link_hashes(&records), vec![10, 20, 30]);
+
+        let storage = crate::storage::BytesStorage::new(data);
+        let records =
+            collect_btree_v2_records_storage(&storage, &header, 8, 8, None, &[], None).unwrap();
+        assert_eq!(link_hashes(&records), vec![10, 20, 30]);
     }
 
     #[test]
