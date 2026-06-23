@@ -989,6 +989,7 @@ impl FractalHeap {
     }
 
     /// Traverse an indirect block to find the direct block for a given offset.
+    #[allow(clippy::too_many_arguments)]
     fn find_direct_block_via_indirect(
         &self,
         indirect_address: u64,
@@ -1176,6 +1177,7 @@ impl FractalHeap {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn find_direct_block_via_indirect_storage(
         &self,
         indirect_address: u64,

@@ -216,6 +216,7 @@ pub enum BTreeV2Record {
 // ---------------------------------------------------------------------------
 
 /// Parse a single record of the given B-tree type.
+#[allow(clippy::too_many_arguments)]
 fn parse_record(
     cursor: &mut Cursor,
     btree_type: u8,
