@@ -252,7 +252,7 @@ impl NcFileBuilder {
                 actual: format!("{:?}", expected),
             });
         }
-        let mut data = Vec::with_capacity(values.len() * std::mem::size_of::<T>());
+        let mut data = Vec::with_capacity(std::mem::size_of_val(values));
         for &value in values {
             value.write_one_be(&mut data);
         }

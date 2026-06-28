@@ -215,7 +215,7 @@ impl DatasetBuilder {
                     "chunk shape rank must match dataset rank".into(),
                 ));
             }
-            if chunk_shape.iter().any(|&d| d == 0) {
+            if chunk_shape.contains(&0) {
                 return Err(Error::InvalidDefinition(
                     "chunk dimensions must be non-zero".into(),
                 ));
