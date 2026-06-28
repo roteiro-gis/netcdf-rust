@@ -6,28 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-
-/// Where the link points.
-#[derive(Debug, Clone)]
-pub enum LinkTarget {
-    /// Hard link — the child object header lives at this address.
-    Hard { address: u64 },
-    /// Soft link — a path string (possibly relative) within the file.
-    Soft { path: String },
-    /// External link — references an object in another HDF5 file.
-    External { filename: String, path: String },
-}
-
-/// Parsed link message.
-#[derive(Debug, Clone)]
-pub struct LinkMessage {
-    /// Name of this link (child name within the group).
-    pub name: String,
-    /// Where the link points.
-    pub target: LinkTarget,
-    /// Creation order index, if tracked.
-    pub creation_order: Option<u64>,
-}
+pub use hdf5_core::{LinkMessage, LinkTarget};
 
 /// Parse a link message (version 1).
 pub fn parse(

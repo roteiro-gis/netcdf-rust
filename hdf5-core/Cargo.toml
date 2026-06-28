@@ -1,0 +1,16 @@
+[package]
+name = "hdf5-core"
+description = "Shared HDF5 format types, constants, and validation helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/hdf5-core"
+keywords = ["hdf5", "codec", "scientific-data"]
+categories = ["science", "encoding", "parser-implementations"]
+
+[dependencies]
+thiserror = { workspace = true }

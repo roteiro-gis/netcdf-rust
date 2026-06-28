@@ -5,26 +5,7 @@
 
 use crate::error::Result;
 use crate::io::Cursor;
-
-/// A single external file slot.
-#[derive(Debug, Clone)]
-pub struct ExternalFileSlot {
-    /// Offset into the local heap for the file name.
-    pub name_offset: u64,
-    /// Byte offset into the external file where data starts.
-    pub offset: u64,
-    /// Number of bytes to read from the external file.
-    pub size: u64,
-}
-
-/// Parsed external data files message.
-#[derive(Debug, Clone)]
-pub struct ExternalFilesMessage {
-    /// Address of the local heap containing file names.
-    pub heap_address: u64,
-    /// List of external file slots.
-    pub slots: Vec<ExternalFileSlot>,
-}
+pub use hdf5_core::{ExternalFileSlot, ExternalFilesMessage};
 
 /// Parse an external data files message.
 pub fn parse(

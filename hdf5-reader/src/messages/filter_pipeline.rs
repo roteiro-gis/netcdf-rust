@@ -6,31 +6,10 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-
-/// Well-known filter IDs.
-pub const FILTER_DEFLATE: u16 = 1;
-pub const FILTER_SHUFFLE: u16 = 2;
-pub const FILTER_FLETCHER32: u16 = 3;
-pub const FILTER_SZIP: u16 = 4;
-pub const FILTER_NBIT: u16 = 5;
-pub const FILTER_SCALEOFFSET: u16 = 6;
-
-/// A single filter in the pipeline.
-#[derive(Debug, Clone)]
-pub struct FilterDescription {
-    /// Filter identification number.
-    pub id: u16,
-    /// Optional filter name (null for well-known filters in v2).
-    pub name: Option<String>,
-    /// Client data parameters.
-    pub client_data: Vec<u32>,
-}
-
-/// Parsed filter pipeline message.
-#[derive(Debug, Clone)]
-pub struct FilterPipelineMessage {
-    pub filters: Vec<FilterDescription>,
-}
+pub use hdf5_core::{
+    FilterDescription, FilterPipelineMessage, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_NBIT,
+    FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP,
+};
 
 /// Parse a filter pipeline message.
 pub fn parse(

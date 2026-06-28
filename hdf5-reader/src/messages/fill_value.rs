@@ -6,28 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-
-/// When to write the fill value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FillTime {
-    /// Write fill value only if the user explicitly set one.
-    IfSet,
-    /// Always write a fill value (use default if none set).
-    Always,
-    /// Never write a fill value.
-    Never,
-}
-
-/// Parsed fill value message.
-#[derive(Debug, Clone)]
-pub struct FillValueMessage {
-    /// Whether a fill value is defined.
-    pub defined: bool,
-    /// When to write the fill value.
-    pub fill_time: FillTime,
-    /// The raw fill value bytes, if defined.
-    pub value: Option<Vec<u8>>,
-}
+pub use hdf5_core::{FillTime, FillValueMessage};
 
 /// Parse the old fill value message (type 0x0004).
 ///

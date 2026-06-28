@@ -6,53 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-
-/// Chunk indexing method (version 4 only).
-#[derive(Debug, Clone)]
-pub enum ChunkIndexing {
-    /// Single chunk — the entire dataset is one chunk.
-    SingleChunk { filtered_size: u64, filters: u32 },
-    /// Implicit indexing — chunk addresses are computed, not stored.
-    Implicit,
-    /// Fixed array indexing.
-    FixedArray { page_bits: u8, chunk_size_len: u8 },
-    /// Extensible array indexing.
-    ExtensibleArray {
-        max_bits: u8,
-        index_bits: u8,
-        min_pointers: u8,
-        min_elements: u8,
-        chunk_size_len: u8,
-    },
-    /// Version 2 B-tree indexing.
-    BTreeV2,
-}
-
-/// The storage layout for a dataset's raw data.
-#[derive(Debug, Clone)]
-pub enum DataLayout {
-    /// Data is stored inline in the object header.
-    Compact { data: Vec<u8> },
-    /// Data is stored in a single contiguous block in the file.
-    Contiguous { address: u64, size: u64 },
-    /// Data is split into fixed-size chunks.
-    Chunked {
-        /// Address of the chunk index (B-tree root or similar).
-        address: u64,
-        /// Chunk dimensions.
-        dims: Vec<u32>,
-        /// Element size (encoded in the last "dimension" for v1-v3).
-        element_size: u32,
-        /// Chunk indexing type (v4 only).
-        chunk_indexing: Option<ChunkIndexing>,
-    },
-}
-
-/// Parsed data layout message.
-#[derive(Debug, Clone)]
-pub struct DataLayoutMessage {
-    pub layout: DataLayout,
-}
+pub use hdf5_core::{ChunkIndexing, DataLayout, DataLayoutMessage};
 
 /// Parse a data layout message.
 pub fn parse(

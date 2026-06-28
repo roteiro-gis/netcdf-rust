@@ -1070,7 +1070,7 @@ impl Dataset {
 
     /// Total number of elements in the dataset.
     pub fn num_elements(&self) -> Result<u64> {
-        self.dataspace.num_elements()
+        Ok(self.dataspace.num_elements()?)
     }
 
     /// Read the entire dataset into an n-dimensional array.

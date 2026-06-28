@@ -1,0 +1,16 @@
+[package]
+name = "netcdf-core"
+description = "Shared NetCDF data model, format constants, and validation helpers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/netcdf-core"
+keywords = ["netcdf", "codec", "scientific-data"]
+categories = ["science", "encoding", "parser-implementations"]
+
+[dependencies]
+thiserror = { workspace = true }

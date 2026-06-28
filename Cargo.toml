@@ -1,5 +1,12 @@
 [workspace]
-members = ["hdf5-reader", "netcdf-reader"]
+members = [
+    "hdf5-core",
+    "hdf5-reader",
+    "hdf5-writer",
+    "netcdf-core",
+    "netcdf-reader",
+    "netcdf-writer",
+]
 resolver = "2"
 
 [workspace.package]

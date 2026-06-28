@@ -395,6 +395,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-core"
+version = "0.7.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "hdf5-metno-src"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -427,6 +434,7 @@ name = "hdf5-reader"
 version = "0.7.0"
 dependencies = [
  "flate2",
+ "hdf5-core",
  "libc",
  "lru",
  "lz4_flex",
@@ -436,6 +444,15 @@ dependencies = [
  "proptest",
  "rayon",
  "smallvec",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "hdf5-writer"
+version = "0.7.0"
+dependencies = [
+ "hdf5-core",
  "tempfile",
  "thiserror",
 ]
@@ -667,6 +684,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcdf-core"
+version = "0.7.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "netcdf-reader"
 version = "0.7.0"
 dependencies = [
@@ -676,6 +700,7 @@ dependencies = [
  "memmap2",
  "ndarray",
  "netcdf",
+ "netcdf-core",
  "peak_alloc",
  "proptest",
  "rayon",
@@ -706,6 +731,16 @@ dependencies = [
  "netcdf-src",
  "parking_lot",
  "semver",
+]
+
+[[package]]
+name = "netcdf-writer"
+version = "0.7.0"
+dependencies = [
+ "hdf5-writer",
+ "netcdf-core",
+ "netcdf-reader",
+ "thiserror",
 ]
 
 [[package]]
