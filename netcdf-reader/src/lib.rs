@@ -80,31 +80,6 @@ pub trait NcReadable: classic::data::NcReadType {}
 #[cfg(not(feature = "netcdf4"))]
 impl<T: classic::data::NcReadType> NcReadable for T {}
 
-/// NetCDF file format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NcFormat {
-    /// CDF-1 classic format.
-    Classic,
-    /// CDF-2 64-bit offset format.
-    Offset64,
-    /// CDF-5 64-bit data format.
-    Cdf5,
-    /// NetCDF-4 (HDF5-backed).
-    Nc4,
-    /// NetCDF-4 classic model (HDF5-backed, restricted data model).
-    Nc4Classic,
-}
-
-/// NetCDF-4 metadata reconstruction policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NcMetadataMode {
-    /// Fail the open if NetCDF-4 metadata cannot be reconstructed exactly.
-    #[default]
-    Strict,
-    /// Allow heuristic reconstruction for malformed or partially-supported files.
-    Lossy,
-}
-
 /// An opened NetCDF file.
 pub struct NcFile {
     format: NcFormat,

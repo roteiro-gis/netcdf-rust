@@ -414,7 +414,7 @@ impl Nc4File {
     ) -> Result<ArrayD<f64>> {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
-        let hdf5_sel = selection.to_hdf5_slice_info();
+        let hdf5_sel = to_hdf5_slice_info(selection);
         let dtype = dataset_nc_type(&dataset)?;
         dispatch_read_as_f64!(&dtype, |T| dataset.read_slice::<T>(&hdf5_sel))
     }
@@ -427,7 +427,7 @@ impl Nc4File {
     ) -> Result<ArrayD<T>> {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
-        let hdf5_sel = selection.to_hdf5_slice_info();
+        let hdf5_sel = to_hdf5_slice_info(selection);
         Ok(dataset.read_slice::<T>(&hdf5_sel)?)
     }
 
@@ -443,8 +443,29 @@ impl Nc4File {
     ) -> Result<ArrayD<T>> {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
-        let hdf5_sel = selection.to_hdf5_slice_info();
+        let hdf5_sel = to_hdf5_slice_info(selection);
         Ok(dataset.read_slice_parallel::<T>(&hdf5_sel)?)
+    }
+}
+
+fn to_hdf5_slice_info(selection: &crate::types::NcSliceInfo) -> hdf5_reader::SliceInfo {
+    hdf5_reader::SliceInfo {
+        selections: selection
+            .selections
+            .iter()
+            .map(|s| match s {
+                crate::types::NcSliceInfoElem::Index(idx) => {
+                    hdf5_reader::SliceInfoElem::Index(*idx)
+                }
+                crate::types::NcSliceInfoElem::Slice { start, end, step } => {
+                    hdf5_reader::SliceInfoElem::Slice {
+                        start: *start,
+                        end: *end,
+                        step: *step,
+                    }
+                }
+            })
+            .collect(),
     }
 }
 

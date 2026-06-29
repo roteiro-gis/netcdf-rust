@@ -49,3 +49,11 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<netcdf_core::Error> for Error {
+    fn from(err: netcdf_core::Error) -> Self {
+        match err {
+            netcdf_core::Error::InvalidData(message) => Error::InvalidData(message),
+        }
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "netcdf-writer"
+description = "Pure-Rust NetCDF encoder for classic and NetCDF-4 data models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/netcdf-writer"
+keywords = ["netcdf", "encoder", "scientific-data"]
+categories = ["science", "encoding"]
+
+[dependencies]
+netcdf-core = { version = "0.7.0", path = "../netcdf-core" }
+hdf5-writer = { version = "0.7.0", path = "../hdf5-writer", optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["netcdf4"]
+netcdf4 = ["dep:hdf5-writer"]
+
+[dev-dependencies]
+netcdf-reader = { path = "../netcdf-reader" }

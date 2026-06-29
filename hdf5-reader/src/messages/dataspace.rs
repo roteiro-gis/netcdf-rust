@@ -5,50 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::io::Cursor;
-
-/// Unlimited dimension sentinel value.
-pub const UNLIMITED: u64 = u64::MAX;
-
-/// The type of dataspace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DataspaceType {
-    /// Contains no data elements at all.
-    Null,
-    /// A single data element (rank 0).
-    Scalar,
-    /// A regular N-dimensional array.
-    Simple,
-}
-
-/// Parsed dataspace message.
-#[derive(Debug, Clone)]
-pub struct DataspaceMessage {
-    /// Number of dimensions (0 for scalar).
-    pub rank: u8,
-    /// Current dimension sizes (`rank` elements).
-    pub dims: Vec<u64>,
-    /// Optional maximum dimension sizes (`rank` elements). `UNLIMITED` = unlimited.
-    pub max_dims: Option<Vec<u64>>,
-    /// The dataspace type.
-    pub dataspace_type: DataspaceType,
-}
-
-impl DataspaceMessage {
-    /// Total number of elements in the dataspace (product of current dimension sizes).
-    pub fn num_elements(&self) -> Result<u64> {
-        if self.dims.is_empty() {
-            return Ok(match self.dataspace_type {
-                DataspaceType::Scalar => 1,
-                _ => 0,
-            });
-        }
-        self.dims.iter().try_fold(1u64, |acc, &dim| {
-            acc.checked_mul(dim).ok_or_else(|| {
-                Error::InvalidData("dataspace element count overflows u64".to_string())
-            })
-        })
-    }
-}
+pub use hdf5_core::{DataspaceMessage, DataspaceType, UNLIMITED};
 
 /// Parse a dataspace message.
 ///

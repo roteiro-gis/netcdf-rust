@@ -1,0 +1,20 @@
+[package]
+name = "hdf5-writer"
+description = "Pure-Rust HDF5 writer architecture and encoding utilities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+documentation = "https://docs.rs/hdf5-writer"
+keywords = ["hdf5", "encoder", "scientific-data"]
+categories = ["science", "encoding"]
+
+[dependencies]
+hdf5-core = { version = "0.7.0", path = "../hdf5-core" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
