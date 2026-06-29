@@ -1,11 +1,21 @@
 //! Pure-Rust NetCDF writer.
 //!
 //! The current implementation writes CDF-1, CDF-2, and CDF-5 classic-family
-//! files. NetCDF-4/HDF5 output is represented in the public format enum but
-//! intentionally returns an explicit unsupported error until `hdf5-writer`
-//! gains binary emission.
+//! files, plus a conservative NetCDF-4/HDF5 subset backed by `hdf5-writer`.
+//! NetCDF-4 emission is intentionally strict about metadata it cannot yet
+//! represent losslessly.
 
+#[cfg(feature = "netcdf4")]
+use std::io::Cursor as IoCursor;
 use std::io::Write;
+
+#[cfg(feature = "netcdf4")]
+use hdf5_writer::{
+    AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
+    DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype, Hdf5Builder, Hdf5Writer,
+    ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
+    StringPadding as H5StringPadding, VarLenKind as H5VarLenKind, WriteOptions as H5WriteOptions,
+};
 
 pub use netcdf_core::{
     NcAttrValue, NcAttribute, NcDimension, NcFormat, NcGroup, NcSliceInfo, NcSliceInfoElem, NcType,
@@ -284,10 +294,7 @@ impl NcFileBuilder {
                 plan.write(&mut writer)?;
                 Ok(format)
             }
-            NcFormat::Nc4 | NcFormat::Nc4Classic => Err(Error::UnsupportedFeature(
-                "NetCDF-4 writing depends on HDF5 binary emission and is not implemented yet"
-                    .into(),
-            )),
+            NcFormat::Nc4 | NcFormat::Nc4Classic => self.write_nc4(&mut writer, format),
         }
     }
 
@@ -318,6 +325,176 @@ impl NcFileBuilder {
                 Err(_) => Err(classic_err),
             },
         }
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn write_nc4(&self, writer: &mut impl Write, format: NcFormat) -> Result<NcFormat> {
+        self.validate_for_nc4_bridge(format)?;
+        let hdf5_plan = self.build_hdf5_plan(format)?;
+        let cursor = Hdf5Writer::new(IoCursor::new(Vec::new()), H5WriteOptions::default())
+            .finish(hdf5_plan)
+            .map_err(hdf5_error_to_unsupported)?;
+        writer.write_all(&cursor.into_inner())?;
+        Ok(format)
+    }
+
+    #[cfg(not(feature = "netcdf4"))]
+    fn write_nc4(&self, _writer: &mut impl Write, _format: NcFormat) -> Result<NcFormat> {
+        Err(Error::UnsupportedFeature(
+            "NetCDF-4 writing requires the netcdf4 feature".into(),
+        ))
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn validate_for_nc4_bridge(&self, format: NcFormat) -> Result<()> {
+        if format == NcFormat::Nc4Classic {
+            for variable in &self.variables {
+                validate_classic_type(&variable.dtype)?;
+            }
+        }
+        if self
+            .dimensions
+            .iter()
+            .any(|dimension| dimension.is_unlimited)
+        {
+            return Err(Error::UnsupportedFeature(
+                "NetCDF-4 unlimited dimensions require chunked HDF5 emission".into(),
+            ));
+        }
+        for variable in &self.variables {
+            let expected = expected_variable_bytes(self, variable, false)?;
+            if variable.data.len() != expected {
+                return Err(Error::DataLengthMismatch {
+                    expected,
+                    actual: variable.data.len(),
+                });
+            }
+            let is_coordinate = self.variable_is_coordinate_scale(variable)?;
+            if !is_coordinate && variable.dim_ids.len() > 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "NetCDF-4 variable '{}' requires DIMENSION_LIST global-heap metadata",
+                    variable.name
+                )));
+            }
+            if !is_coordinate && variable.dim_ids.len() == 1 {
+                return Err(Error::UnsupportedFeature(format!(
+                    "NetCDF-4 one-dimensional non-coordinate variable '{}' requires DIMENSION_LIST metadata",
+                    variable.name
+                )));
+            }
+        }
+        for (dim_id, dimension) in self.dimensions.iter().enumerate() {
+            let dimension_id = DimensionId(dim_id);
+            if self
+                .coordinate_variable_for_dimension(dimension_id)
+                .is_none()
+                && self
+                    .variables
+                    .iter()
+                    .any(|variable| variable.name == dimension.name)
+            {
+                return Err(Error::UnsupportedFeature(format!(
+                    "NetCDF-4 dimension '{}' needs a hidden dimension-scale dataset, but a scalar variable already uses that name",
+                    dimension.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn build_hdf5_plan(&self, format: NcFormat) -> Result<hdf5_writer::Hdf5WritePlan> {
+        let mut builder = Hdf5Builder::new();
+        if format == NcFormat::Nc4Classic {
+            builder = builder.attribute(
+                H5AttributeBuilder::scalar("_nc3_strict", 1_i32)
+                    .map_err(hdf5_error_to_unsupported)?,
+            );
+        }
+        for attr in &self.attributes {
+            builder = builder.attribute(nc_attr_to_hdf5(attr)?);
+        }
+
+        for (dim_id, dimension) in self.dimensions.iter().enumerate() {
+            if self
+                .coordinate_variable_for_dimension(DimensionId(dim_id))
+                .is_some()
+            {
+                continue;
+            }
+            let zeros = vec![0_i32; checked_usize(dimension.size, "dimension scale size")?];
+            let dataset =
+                H5DatasetBuilder::typed_data(&dimension.name, vec![dimension.size], &zeros)
+                    .map_err(hdf5_error_to_unsupported)?
+                    .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+                    .attribute(H5AttributeBuilder::fixed_string(
+                        "NAME",
+                        format!(
+                            "This is a netCDF dimension but not a netCDF variable. {}",
+                            dimension.name
+                        ),
+                    ))
+                    .attribute(
+                        H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
+                            .map_err(hdf5_error_to_unsupported)?,
+                    );
+            builder = builder.dataset(dataset);
+        }
+
+        for variable in &self.variables {
+            let shape = variable
+                .dim_ids
+                .iter()
+                .map(|id| self.dimensions[id.0].size)
+                .collect::<Vec<_>>();
+            let data = convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?;
+            let mut dataset = H5DatasetBuilder::new(
+                &variable.name,
+                nc_type_to_hdf5(&variable.dtype)?,
+                shape.clone(),
+            )
+            .raw_data(data);
+
+            if self.variable_is_coordinate_scale(variable)? {
+                let dim_id = variable.dim_ids[0];
+                dataset = dataset
+                    .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+                    .attribute(H5AttributeBuilder::fixed_string(
+                        "NAME",
+                        self.dimensions[dim_id.0].name.as_str(),
+                    ))
+                    .attribute(
+                        H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id.0 as i32)
+                            .map_err(hdf5_error_to_unsupported)?,
+                    );
+            } else if variable.dim_ids.is_empty() {
+                dataset = dataset.attribute(empty_dimension_list_attribute());
+            }
+
+            for attr in &variable.attributes {
+                dataset = dataset.attribute(nc_attr_to_hdf5(attr)?);
+            }
+
+            builder = builder.dataset(dataset);
+        }
+
+        builder.into_plan().map_err(hdf5_error_to_unsupported)
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn variable_is_coordinate_scale(&self, variable: &VariableDef) -> Result<bool> {
+        Ok(match variable.dim_ids.as_slice() {
+            [dim_id] => self.dimension(*dim_id)?.name == variable.name,
+            _ => false,
+        })
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn coordinate_variable_for_dimension(&self, dimension: DimensionId) -> Option<&VariableDef> {
+        let dim = self.dimensions.get(dimension.0)?;
+        self.variables.iter().find(|variable| {
+            variable.name == dim.name && variable.dim_ids.as_slice() == [dimension]
+        })
     }
 
     fn add_variable_with_type(
@@ -772,6 +949,221 @@ fn encode_attr_value(value: &NcAttrValue) -> Result<(NcType, u64, Vec<u8>)> {
         }
     };
     Ok((dtype, count, out))
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
+    let byte_order = H5ByteOrder::LittleEndian;
+    match dtype {
+        NcType::Byte => Ok(H5Datatype::FixedPoint {
+            size: 1,
+            signed: true,
+            byte_order,
+        }),
+        NcType::UByte => Ok(H5Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            byte_order,
+        }),
+        NcType::Short => Ok(H5Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            byte_order,
+        }),
+        NcType::UShort => Ok(H5Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            byte_order,
+        }),
+        NcType::Int => Ok(H5Datatype::FixedPoint {
+            size: 4,
+            signed: true,
+            byte_order,
+        }),
+        NcType::UInt => Ok(H5Datatype::FixedPoint {
+            size: 4,
+            signed: false,
+            byte_order,
+        }),
+        NcType::Int64 => Ok(H5Datatype::FixedPoint {
+            size: 8,
+            signed: true,
+            byte_order,
+        }),
+        NcType::UInt64 => Ok(H5Datatype::FixedPoint {
+            size: 8,
+            signed: false,
+            byte_order,
+        }),
+        NcType::Float => Ok(H5Datatype::FloatingPoint {
+            size: 4,
+            byte_order,
+        }),
+        NcType::Double => Ok(H5Datatype::FloatingPoint {
+            size: 8,
+            byte_order,
+        }),
+        NcType::Char => Err(Error::UnsupportedFeature(
+            "NetCDF-4 NC_CHAR variable emission is not implemented yet".into(),
+        )),
+        other => Err(Error::UnsupportedFeature(format!(
+            "NetCDF-4 type emission is not implemented for {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn convert_classic_be_data_to_hdf5_le(dtype: &NcType, data: &[u8]) -> Result<Vec<u8>> {
+    let width = dtype.size()?;
+    if width == 1 {
+        return Ok(data.to_vec());
+    }
+    if data.len() % width != 0 {
+        return Err(Error::InvalidDefinition(format!(
+            "variable data length {} is not a multiple of element size {width}",
+            data.len()
+        )));
+    }
+
+    match dtype {
+        NcType::Short | NcType::UShort => Ok(data
+            .chunks_exact(2)
+            .flat_map(|chunk| [chunk[1], chunk[0]])
+            .collect()),
+        NcType::Int | NcType::UInt | NcType::Float => Ok(data
+            .chunks_exact(4)
+            .flat_map(|chunk| [chunk[3], chunk[2], chunk[1], chunk[0]])
+            .collect()),
+        NcType::Int64 | NcType::UInt64 | NcType::Double => Ok(data
+            .chunks_exact(8)
+            .flat_map(|chunk| {
+                [
+                    chunk[7], chunk[6], chunk[5], chunk[4], chunk[3], chunk[2], chunk[1], chunk[0],
+                ]
+            })
+            .collect()),
+        other => Err(Error::UnsupportedFeature(format!(
+            "NetCDF-4 data conversion is not implemented for {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc_attr_to_hdf5(attribute: &NcAttribute) -> Result<H5AttributeBuilder> {
+    match &attribute.value {
+        NcAttrValue::Chars(value) => Ok(H5AttributeBuilder::fixed_string(&attribute.name, value)),
+        NcAttrValue::Bytes(values) => hdf5_numeric_attr(&attribute.name, NcType::Byte, values),
+        NcAttrValue::UBytes(values) => hdf5_numeric_attr(&attribute.name, NcType::UByte, values),
+        NcAttrValue::Shorts(values) => hdf5_numeric_attr(&attribute.name, NcType::Short, values),
+        NcAttrValue::UShorts(values) => hdf5_numeric_attr(&attribute.name, NcType::UShort, values),
+        NcAttrValue::Ints(values) => hdf5_numeric_attr(&attribute.name, NcType::Int, values),
+        NcAttrValue::UInts(values) => hdf5_numeric_attr(&attribute.name, NcType::UInt, values),
+        NcAttrValue::Int64s(values) => hdf5_numeric_attr(&attribute.name, NcType::Int64, values),
+        NcAttrValue::UInt64s(values) => hdf5_numeric_attr(&attribute.name, NcType::UInt64, values),
+        NcAttrValue::Floats(values) => hdf5_numeric_attr(&attribute.name, NcType::Float, values),
+        NcAttrValue::Doubles(values) => hdf5_numeric_attr(&attribute.name, NcType::Double, values),
+        NcAttrValue::Strings(_) => Err(Error::UnsupportedFeature(
+            "NetCDF-4 NC_STRING attribute emission is not implemented yet".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+trait NcAttrElement {
+    fn write_le(&self, dst: &mut Vec<u8>);
+}
+
+#[cfg(feature = "netcdf4")]
+macro_rules! impl_attr_element_bytes {
+    ($ty:ty) => {
+        impl NcAttrElement for $ty {
+            fn write_le(&self, dst: &mut Vec<u8>) {
+                dst.push(*self as u8);
+            }
+        }
+    };
+}
+
+#[cfg(feature = "netcdf4")]
+macro_rules! impl_attr_element_le {
+    ($ty:ty) => {
+        impl NcAttrElement for $ty {
+            fn write_le(&self, dst: &mut Vec<u8>) {
+                dst.extend_from_slice(&self.to_le_bytes());
+            }
+        }
+    };
+}
+
+#[cfg(feature = "netcdf4")]
+impl_attr_element_bytes!(i8);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_bytes!(u8);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(i16);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(u16);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(i32);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(u32);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(i64);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(u64);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(f32);
+#[cfg(feature = "netcdf4")]
+impl_attr_element_le!(f64);
+
+#[cfg(feature = "netcdf4")]
+fn hdf5_numeric_attr<T: NcAttrElement>(
+    name: &str,
+    dtype: NcType,
+    values: &[T],
+) -> Result<H5AttributeBuilder> {
+    let mut raw = Vec::with_capacity(values.len() * dtype.size()?);
+    for value in values {
+        value.write_le(&mut raw);
+    }
+    Ok(H5AttributeBuilder::new(
+        name,
+        nc_type_to_hdf5(&dtype)?,
+        vec![values.len() as u64],
+        raw,
+    ))
+}
+
+#[cfg(feature = "netcdf4")]
+fn empty_dimension_list_attribute() -> H5AttributeBuilder {
+    H5AttributeBuilder::new(
+        "DIMENSION_LIST",
+        H5Datatype::VarLen {
+            base: Box::new(H5Datatype::Reference {
+                ref_type: H5ReferenceType::Object,
+                size: 8,
+            }),
+            kind: H5VarLenKind::Sequence,
+            encoding: H5StringEncoding::Ascii,
+            padding: H5StringPadding::NullTerminate,
+        },
+        vec![0],
+        Vec::new(),
+    )
+}
+
+#[cfg(feature = "netcdf4")]
+fn hdf5_error_to_unsupported(err: hdf5_writer::Error) -> Error {
+    Error::UnsupportedFeature(format!("HDF5 writer error: {err}"))
+}
+
+#[cfg(feature = "netcdf4")]
+fn checked_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        Error::InvalidDefinition(format!(
+            "{context} value {value} exceeds platform usize capacity"
+        ))
+    })
 }
 
 fn expected_variable_bytes(

@@ -87,10 +87,9 @@ jobs:
       - name: Fetch package dependencies
         run: cargo fetch --locked
 
-      - name: Package core crates offline
+      - name: Package workspace offline
         run: |
-          cargo package -p hdf5-core --offline --locked
-          cargo package -p netcdf-core --offline --locked
+          cargo package --workspace --offline --locked
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
