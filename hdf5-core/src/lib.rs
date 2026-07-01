@@ -11,6 +11,111 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Jenkins lookup3 `hashlittle2` used by HDF5 metadata checksums.
+///
+/// HDF5 uses this checksum for superblock v2/v3, object header v2,
+/// B-tree v2, extensible-array, fixed-array, fractal-heap, and shared-message
+/// metadata blocks. This is a direct translation of Bob Jenkins'
+/// lookup3.c `hashlittle2` with both init values set to zero.
+pub fn jenkins_lookup3(data: &[u8]) -> u32 {
+    let len = data.len();
+    let mut a: u32 = 0xdeadbeef_u32.wrapping_add(len as u32);
+    let mut b: u32 = a;
+    let mut c: u32 = a;
+    let mut offset = 0;
+
+    while offset + 12 < len {
+        a = a.wrapping_add(u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]));
+        b = b.wrapping_add(u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]));
+        c = c.wrapping_add(u32::from_le_bytes([
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+        ]));
+        jenkins_mix(&mut a, &mut b, &mut c);
+        offset += 12;
+    }
+
+    let remaining = len - offset;
+    if remaining > 0 {
+        let mut tail_a: u32 = 0;
+        let mut tail_b: u32 = 0;
+        let mut tail_c: u32 = 0;
+
+        for i in 0..remaining.min(4) {
+            tail_a |= (data[offset + i] as u32) << (i * 8);
+        }
+        if remaining > 4 {
+            for i in 4..remaining.min(8) {
+                tail_b |= (data[offset + i] as u32) << ((i - 4) * 8);
+            }
+        }
+        if remaining > 8 {
+            for i in 8..remaining {
+                tail_c |= (data[offset + i] as u32) << ((i - 8) * 8);
+            }
+        }
+
+        a = a.wrapping_add(tail_a);
+        b = b.wrapping_add(tail_b);
+        c = c.wrapping_add(tail_c);
+        jenkins_final_mix(&mut a, &mut b, &mut c);
+    }
+
+    c
+}
+
+#[inline]
+fn jenkins_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(4);
+    *b = b.wrapping_add(*a);
+}
+
+#[inline]
+fn jenkins_final_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(14));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(11));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(25));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(16));
+    *a ^= *c;
+    *a = a.wrapping_sub(c.rotate_left(4));
+    *b ^= *a;
+    *b = b.wrapping_sub(a.rotate_left(14));
+    *c ^= *b;
+    *c = c.wrapping_sub(b.rotate_left(24));
+}
+
 /// Byte order for numeric data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ByteOrder {
@@ -293,4 +398,24 @@ pub struct LinkMessage {
     pub name: String,
     pub target: LinkTarget,
     pub creation_order: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jenkins_lookup3_is_deterministic() {
+        assert_eq!(jenkins_lookup3(b"hello"), jenkins_lookup3(b"hello"));
+        assert_ne!(jenkins_lookup3(b"hello"), jenkins_lookup3(b"world"));
+    }
+
+    #[test]
+    fn jenkins_lookup3_handles_twelve_byte_boundary_like_lookup3() {
+        let twelve = [0x5au8; 12];
+        let thirteen = [0x5au8; 13];
+
+        assert_ne!(jenkins_lookup3(&twelve), jenkins_lookup3(&thirteen));
+        assert_eq!(jenkins_lookup3(&twelve), jenkins_lookup3(&twelve));
+    }
 }

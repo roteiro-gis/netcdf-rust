@@ -17,4 +17,5 @@ hdf5-core = { version = "0.7.0", path = "../hdf5-core" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+hdf5-reader = { version = "0.7.0", path = "../hdf5-reader" }
 tempfile = "3"
