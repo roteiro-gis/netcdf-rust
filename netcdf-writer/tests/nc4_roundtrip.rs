@@ -98,11 +98,92 @@ fn writes_nc4_classic_marker() {
 }
 
 #[test]
-fn rejects_nc4_non_coordinate_dimensioned_variable_until_dimlist_heap_is_supported() {
+fn writes_nc4_one_dimensional_non_coordinate_variable() {
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 4).unwrap();
+    let coordinate = builder.add_variable::<f32>("x", &[x]).unwrap();
+    builder
+        .write_variable(coordinate, &[0.0_f32, 1.0, 2.0, 3.0])
+        .unwrap();
+    let temp = builder.add_variable::<f32>("temp", &[x]).unwrap();
+    builder
+        .write_variable(temp, &[10.0_f32, 11.0, 12.0, 13.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dimension("x").unwrap().size, 4);
+
+    let variable = file.variable("temp").unwrap();
+    assert_eq!(variable.shape(), vec![4]);
+    assert!(!variable.is_coordinate_variable());
+
+    let values = file.read_variable::<f32>("temp").unwrap();
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[10.0, 11.0, 12.0, 13.0]
+    );
+}
+
+#[test]
+fn writes_nc4_multidimensional_variable_with_hidden_dimension_scales() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 2).unwrap();
+    let x = builder.add_dimension("x", 3).unwrap();
+    let temp = builder.add_variable::<f32>("temp", &[y, x]).unwrap();
+    builder
+        .add_variable_attribute(temp, "units", NcAttrValue::Chars("K".to_string()))
+        .unwrap();
+    builder
+        .write_variable(temp, &[280.0_f32, 281.0, 282.0, 283.0, 284.0, 285.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dimensions().unwrap().len(), 2);
+    assert_eq!(file.dimension("y").unwrap().size, 2);
+    assert_eq!(file.dimension("x").unwrap().size, 3);
+    assert!(file.variable("y").is_err());
+    assert!(file.variable("x").is_err());
+
+    let variable = file.variable("temp").unwrap();
+    assert_eq!(variable.shape(), vec![2, 3]);
+    assert_eq!(
+        variable
+            .attribute("units")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "K"
+    );
+
+    let values = file.read_variable::<f32>("temp").unwrap();
+    assert_eq!(values.shape(), &[2, 3]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[280.0, 281.0, 282.0, 283.0, 284.0, 285.0]
+    );
+}
+
+#[test]
+fn rejects_nc4_dimension_scale_name_conflict() {
     let mut builder = NcFileBuilder::new();
     let x = builder.add_dimension("x", 2).unwrap();
     let temp = builder.add_variable::<f32>("temp", &[x]).unwrap();
     builder.write_variable(temp, &[10.0_f32, 11.0]).unwrap();
+    let x_scalar = builder.add_variable::<i32>("x", &[]).unwrap();
+    builder.write_variable(x_scalar, &[5]).unwrap();
 
     let err = builder
         .to_vec(NcWriteOptions {
@@ -110,5 +191,5 @@ fn rejects_nc4_non_coordinate_dimensioned_variable_until_dimlist_heap_is_support
         })
         .unwrap_err();
 
-    assert!(err.to_string().contains("DIMENSION_LIST"));
+    assert!(err.to_string().contains("hidden dimension-scale"));
 }

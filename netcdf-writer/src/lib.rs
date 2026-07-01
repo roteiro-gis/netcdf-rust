@@ -369,19 +369,6 @@ impl NcFileBuilder {
                     actual: variable.data.len(),
                 });
             }
-            let is_coordinate = self.variable_is_coordinate_scale(variable)?;
-            if !is_coordinate && variable.dim_ids.len() > 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "NetCDF-4 variable '{}' requires DIMENSION_LIST global-heap metadata",
-                    variable.name
-                )));
-            }
-            if !is_coordinate && variable.dim_ids.len() == 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "NetCDF-4 one-dimensional non-coordinate variable '{}' requires DIMENSION_LIST metadata",
-                    variable.name
-                )));
-            }
         }
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
             let dimension_id = DimensionId(dim_id);
@@ -469,6 +456,8 @@ impl NcFileBuilder {
                     );
             } else if variable.dim_ids.is_empty() {
                 dataset = dataset.attribute(empty_dimension_list_attribute());
+            } else {
+                dataset = dataset.attribute(self.dimension_list_attribute(variable)?);
             }
 
             for attr in &variable.attributes {
@@ -495,6 +484,19 @@ impl NcFileBuilder {
         self.variables.iter().find(|variable| {
             variable.name == dim.name && variable.dim_ids.as_slice() == [dimension]
         })
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn dimension_list_attribute(&self, variable: &VariableDef) -> Result<H5AttributeBuilder> {
+        let target_sequences = variable
+            .dim_ids
+            .iter()
+            .map(|dimension| Ok(vec![self.dimension(*dimension)?.name.clone()]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(H5AttributeBuilder::vlen_object_references(
+            "DIMENSION_LIST",
+            target_sequences,
+        ))
     }
 
     fn add_variable_with_type(
