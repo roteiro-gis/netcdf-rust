@@ -372,6 +372,7 @@ pub struct AttributeBuilder {
     datatype: Datatype,
     shape: Vec<u64>,
     raw_data: Vec<u8>,
+    vlen_object_reference_targets: Option<Vec<Vec<String>>>,
 }
 
 impl AttributeBuilder {
@@ -386,6 +387,7 @@ impl AttributeBuilder {
             datatype,
             shape: shape.into(),
             raw_data: raw_data.into(),
+            vlen_object_reference_targets: None,
         }
     }
 
@@ -434,6 +436,27 @@ impl AttributeBuilder {
         )
     }
 
+    pub fn vlen_object_references(
+        name: impl Into<String>,
+        target_sequences: Vec<Vec<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            datatype: Datatype::VarLen {
+                base: Box::new(Datatype::Reference {
+                    ref_type: ReferenceType::Object,
+                    size: OFFSET_SIZE,
+                }),
+                kind: VarLenKind::Sequence,
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullTerminate,
+            },
+            shape: vec![target_sequences.len() as u64],
+            raw_data: Vec::new(),
+            vlen_object_reference_targets: Some(target_sequences),
+        }
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -452,6 +475,26 @@ impl AttributeBuilder {
 
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
+        if let Some(target_sequences) = &self.vlen_object_reference_targets {
+            if self.shape != [target_sequences.len() as u64] {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen reference shape must match sequence count",
+                    self.name
+                )));
+            }
+            for sequence in target_sequences {
+                if sequence.is_empty() {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "attribute '{}' contains an empty vlen object-reference sequence",
+                        self.name
+                    )));
+                }
+                for target in sequence {
+                    validate_name(target)?;
+                }
+            }
+            return Ok(());
+        }
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         if self.raw_data.len() != expected {
             return Err(Error::InvalidDefinition(format!(
@@ -608,6 +651,58 @@ struct HeaderMessage {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedAttribute {
+    name: String,
+    datatype: Datatype,
+    shape: Vec<u64>,
+    raw_data: PlannedAttributeRaw,
+}
+
+#[derive(Debug, Clone)]
+enum PlannedAttributeRaw {
+    Inline(Vec<u8>),
+    GlobalHeapVLenReferences(Vec<VLenHeapReference>),
+}
+
+#[derive(Debug, Clone)]
+struct VLenHeapReference {
+    sequence_len: u32,
+    heap_index: u16,
+}
+
+#[derive(Debug, Clone)]
+struct GlobalHeapObjectPlan {
+    index: u16,
+    reference_count: u16,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedAttributes {
+    root: Vec<PlannedAttribute>,
+    datasets: Vec<Vec<PlannedAttribute>>,
+    heap_objects: Vec<GlobalHeapObjectPlan>,
+}
+
+impl PlannedAttribute {
+    fn raw_data(&self, heap_address: u64) -> Vec<u8> {
+        match &self.raw_data {
+            PlannedAttributeRaw::Inline(raw_data) => raw_data.clone(),
+            PlannedAttributeRaw::GlobalHeapVLenReferences(refs) => {
+                let mut raw_data =
+                    Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
+                for reference in refs {
+                    raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
+                    raw_data.extend_from_slice(&heap_address.to_le_bytes());
+                    raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
+                }
+                raw_data
+            }
+        }
+    }
+}
+
 fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u8>> {
     if options.variant != Hdf5Variant::Modern {
         return Err(Error::UnsupportedFeature(format!(
@@ -617,7 +712,9 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let prepared = prepare_datasets(plan, options)?;
-    let root_header_size = encode_root_header(&prepared, &plan.attributes)?.len();
+    let placeholder_targets = placeholder_target_addresses(&prepared);
+    let placeholder_attributes = plan_attributes(plan, &placeholder_targets)?;
+    let root_header_size = encode_root_header(&prepared, &placeholder_attributes.root, 0)?.len();
     let mut next_address = align_u64(SUPERBLOCK_V2_SIZE as u64, 8);
     let root_address = next_address;
     next_address = align_u64(
@@ -630,9 +727,9 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     );
 
     let mut header_addresses = Vec::with_capacity(prepared.len());
-    for prepared_dataset in &prepared {
+    for (prepared_dataset, attributes) in prepared.iter().zip(&placeholder_attributes.datasets) {
         header_addresses.push(next_address);
-        let placeholder = encode_dataset_header(prepared_dataset, 0)?;
+        let placeholder = encode_dataset_header(prepared_dataset, attributes, 0, 0)?;
         next_address = align_u64(
             checked_add_u64(
                 next_address,
@@ -656,20 +753,42 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         );
     }
 
+    let target_addresses = target_addresses(&prepared, &header_addresses);
+    let planned_attributes = plan_attributes(plan, &target_addresses)?;
+
     let links: Vec<_> = prepared
         .iter()
         .zip(header_addresses.iter().copied())
         .map(|(prepared_dataset, address)| (prepared_dataset.dataset.name.as_str(), address))
         .collect();
-    let root_header = encode_root_header_from_links(&links, &plan.attributes)?;
+
+    let heap_address = if planned_attributes.heap_objects.is_empty() {
+        0
+    } else {
+        next_address
+    };
+    let heap = if planned_attributes.heap_objects.is_empty() {
+        Vec::new()
+    } else {
+        encode_global_heap_collection(&planned_attributes.heap_objects)?
+    };
+    next_address = align_u64(
+        checked_add_u64(next_address, heap.len() as u64, "global heap end")?,
+        8,
+    );
+
+    let root_header =
+        encode_root_header_from_links(&links, &planned_attributes.root, heap_address)?;
 
     let mut emissions = Vec::with_capacity(prepared.len());
-    for ((prepared_dataset, header_address), data_address) in prepared
+    for (((prepared_dataset, attributes), header_address), data_address) in prepared
         .iter()
+        .zip(&planned_attributes.datasets)
         .zip(header_addresses.iter().copied())
         .zip(data_addresses.iter().copied())
     {
-        let header = encode_dataset_header(prepared_dataset, data_address)?;
+        let header =
+            encode_dataset_header(prepared_dataset, attributes, data_address, heap_address)?;
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
             header_address,
@@ -698,6 +817,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
                 .as_deref()
                 .expect("prepared datasets always have raw data"),
         );
+    }
+
+    if !heap.is_empty() {
+        pad_to_address(&mut file, heap_address)?;
+        file.extend_from_slice(&heap);
     }
 
     pad_to_address(&mut file, eof_address)?;
@@ -781,6 +905,138 @@ fn prepare_datasets(
     Ok(prepared)
 }
 
+fn placeholder_target_addresses(
+    prepared: &[PreparedDataset<'_>],
+) -> std::collections::BTreeMap<String, u64> {
+    prepared
+        .iter()
+        .map(|prepared_dataset| (prepared_dataset.dataset.name.clone(), 0))
+        .collect()
+}
+
+fn target_addresses(
+    prepared: &[PreparedDataset<'_>],
+    header_addresses: &[u64],
+) -> std::collections::BTreeMap<String, u64> {
+    prepared
+        .iter()
+        .zip(header_addresses.iter().copied())
+        .map(|(prepared_dataset, address)| (prepared_dataset.dataset.name.clone(), address))
+        .collect()
+}
+
+fn plan_attributes(
+    plan: &Hdf5WritePlan,
+    target_addresses: &std::collections::BTreeMap<String, u64>,
+) -> Result<PlannedAttributes> {
+    let mut heap_objects = Vec::new();
+    let root = plan_attribute_list(&plan.attributes, target_addresses, &mut heap_objects)?;
+    let datasets = plan
+        .datasets
+        .iter()
+        .map(|dataset| {
+            plan_attribute_list(&dataset.attributes, target_addresses, &mut heap_objects)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PlannedAttributes {
+        root,
+        datasets,
+        heap_objects,
+    })
+}
+
+fn plan_attribute_list(
+    attributes: &[AttributeBuilder],
+    target_addresses: &std::collections::BTreeMap<String, u64>,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Vec<PlannedAttribute>> {
+    attributes
+        .iter()
+        .map(|attribute| plan_attribute(attribute, target_addresses, heap_objects))
+        .collect()
+}
+
+fn plan_attribute(
+    attribute: &AttributeBuilder,
+    target_addresses: &std::collections::BTreeMap<String, u64>,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<PlannedAttribute> {
+    attribute.validate()?;
+    if let Some(target_sequences) = &attribute.vlen_object_reference_targets {
+        let mut refs = Vec::with_capacity(target_sequences.len());
+        for sequence in target_sequences {
+            let index = checked_heap_index(heap_objects.len() + 1)?;
+            let mut data = Vec::with_capacity(sequence.len() * usize::from(OFFSET_SIZE));
+            for target in sequence {
+                let address = target_addresses.get(target).ok_or_else(|| {
+                    Error::InvalidDefinition(format!(
+                        "attribute '{}' references unknown HDF5 object '{}'",
+                        attribute.name, target
+                    ))
+                })?;
+                data.extend_from_slice(&address.to_le_bytes());
+            }
+            let sequence_len = u32::try_from(sequence.len()).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "attribute '{}' vlen object-reference sequence exceeds u32 capacity",
+                    attribute.name
+                ))
+            })?;
+            heap_objects.push(GlobalHeapObjectPlan {
+                index,
+                reference_count: 1,
+                data,
+            });
+            refs.push(VLenHeapReference {
+                sequence_len,
+                heap_index: index,
+            });
+        }
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::GlobalHeapVLenReferences(refs),
+        })
+    } else {
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::Inline(attribute.raw_data.clone()),
+        })
+    }
+}
+
+fn checked_heap_index(index: usize) -> Result<u16> {
+    u16::try_from(index).map_err(|_| {
+        Error::UnsupportedFeature("global heap object count exceeds u16 capacity".into())
+    })
+}
+
+fn encode_global_heap_collection(objects: &[GlobalHeapObjectPlan]) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    for object in objects {
+        body.extend_from_slice(&object.index.to_le_bytes());
+        body.extend_from_slice(&object.reference_count.to_le_bytes());
+        body.extend_from_slice(&[0; 4]);
+        body.extend_from_slice(&(object.data.len() as u64).to_le_bytes());
+        body.extend_from_slice(&object.data);
+        let padded_len = align_u64(object.data.len() as u64, 8) as usize;
+        body.resize(body.len() + (padded_len - object.data.len()), 0);
+    }
+    body.extend_from_slice(&0u16.to_le_bytes());
+
+    let collection_size = checked_add_u64(16, body.len() as u64, "global heap size")?;
+    let mut bytes = Vec::with_capacity(checked_usize(collection_size, "global heap size")?);
+    bytes.extend_from_slice(b"GCOL");
+    bytes.push(1);
+    bytes.extend_from_slice(&[0, 0, 0]);
+    bytes.extend_from_slice(&collection_size.to_le_bytes());
+    bytes.extend_from_slice(&body);
+    Ok(bytes)
+}
+
 fn encode_superblock_v2(root_address: u64, eof_address: u64) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(SUPERBLOCK_V2_SIZE);
     bytes.extend_from_slice(&HDF5_MAGIC);
@@ -799,20 +1055,22 @@ fn encode_superblock_v2(root_address: u64, eof_address: u64) -> Vec<u8> {
 
 fn encode_root_header(
     prepared: &[PreparedDataset<'_>],
-    attributes: &[AttributeBuilder],
+    attributes: &[PlannedAttribute],
+    heap_address: u64,
 ) -> Result<Vec<u8>> {
     let links: Vec<_> = prepared
         .iter()
         .map(|prepared_dataset| (prepared_dataset.dataset.name.as_str(), 0u64))
         .collect();
-    encode_root_header_from_links(&links, attributes)
+    encode_root_header_from_links(&links, attributes, heap_address)
 }
 
 fn encode_root_header_from_links(
     links: &[(&str, u64)],
-    attributes: &[AttributeBuilder],
+    attributes: &[PlannedAttribute],
+    heap_address: u64,
 ) -> Result<Vec<u8>> {
-    let mut messages = encode_attribute_header_messages(attributes)?;
+    let mut messages = encode_attribute_header_messages(attributes, heap_address)?;
     let link_messages: Result<Vec<_>> = links
         .iter()
         .map(|(name, address)| {
@@ -826,7 +1084,12 @@ fn encode_root_header_from_links(
     encode_object_header_v2(&messages)
 }
 
-fn encode_dataset_header(dataset: &PreparedDataset<'_>, data_address: u64) -> Result<Vec<u8>> {
+fn encode_dataset_header(
+    dataset: &PreparedDataset<'_>,
+    attributes: &[PlannedAttribute],
+    data_address: u64,
+    heap_address: u64,
+) -> Result<Vec<u8>> {
     let mut messages = vec![
         HeaderMessage {
             type_id: MSG_DATASPACE,
@@ -844,19 +1107,20 @@ fn encode_dataset_header(dataset: &PreparedDataset<'_>, data_address: u64) -> Re
             payload: encode_contiguous_layout_message(data_address, dataset.data_size),
         },
     ];
-    messages.extend(encode_attribute_header_messages(
-        &dataset.dataset.attributes,
-    )?);
+    messages.extend(encode_attribute_header_messages(attributes, heap_address)?);
     encode_object_header_v2(&messages)
 }
 
-fn encode_attribute_header_messages(attributes: &[AttributeBuilder]) -> Result<Vec<HeaderMessage>> {
+fn encode_attribute_header_messages(
+    attributes: &[PlannedAttribute],
+    heap_address: u64,
+) -> Result<Vec<HeaderMessage>> {
     attributes
         .iter()
         .map(|attribute| {
             Ok(HeaderMessage {
                 type_id: MSG_ATTRIBUTE,
-                payload: encode_attribute_message(attribute)?,
+                payload: encode_attribute_message(attribute, heap_address)?,
             })
         })
         .collect()
@@ -904,11 +1168,11 @@ fn encode_hard_link_message(name: &str, address: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn encode_attribute_message(attribute: &AttributeBuilder) -> Result<Vec<u8>> {
-    attribute.validate()?;
+fn encode_attribute_message(attribute: &PlannedAttribute, heap_address: u64) -> Result<Vec<u8>> {
     let name_bytes = attribute.name.as_bytes();
     let datatype = encode_datatype_message(&attribute.datatype)?;
     let dataspace = encode_dataspace_message(&attribute.shape, None)?;
+    let raw_data = attribute.raw_data(heap_address);
     if name_bytes.len() + 1 > u16::MAX as usize
         || datatype.len() > u16::MAX as usize
         || dataspace.len() > u16::MAX as usize
@@ -930,7 +1194,7 @@ fn encode_attribute_message(attribute: &AttributeBuilder) -> Result<Vec<u8>> {
     bytes.push(0);
     bytes.extend_from_slice(&datatype);
     bytes.extend_from_slice(&dataspace);
-    bytes.extend_from_slice(&attribute.raw_data);
+    bytes.extend_from_slice(&raw_data);
     Ok(bytes)
 }
 

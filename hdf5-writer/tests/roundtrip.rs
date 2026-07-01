@@ -82,6 +82,58 @@ fn writes_multiple_root_datasets() {
 }
 
 #[test]
+fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
+    let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
+        .unwrap()
+        .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+        .attribute(AttributeBuilder::fixed_string("NAME", "x"));
+    let values = [10.0_f32, 11.0, 12.0];
+    let data = DatasetBuilder::typed_data("temp", vec![3], &values)
+        .unwrap()
+        .attribute(AttributeBuilder::vlen_object_references(
+            "DIMENSION_LIST",
+            vec![vec!["x".to_string()]],
+        ));
+    let plan = Hdf5Builder::new()
+        .dataset(scale)
+        .dataset(data)
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let scale = file.dataset("/x").unwrap();
+    let data = file.dataset("/temp").unwrap();
+    let attr = data.attribute("DIMENSION_LIST").unwrap();
+    assert_eq!(attr.shape, vec![1]);
+    assert_eq!(attr.raw_data.len(), 16);
+
+    let seq_len = u32::from_le_bytes(attr.raw_data[0..4].try_into().unwrap());
+    let heap_addr = u64::from_le_bytes(attr.raw_data[4..12].try_into().unwrap());
+    let heap_index = u32::from_le_bytes(attr.raw_data[12..16].try_into().unwrap()) as u16;
+    assert_eq!(seq_len, 1);
+
+    let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+        file.storage(),
+        heap_addr,
+        file.superblock().offset_size,
+        file.superblock().length_size,
+    )
+    .unwrap();
+    let heap_object = heap.get_object(heap_index).unwrap();
+    let refs = hdf5_reader::reference::read_object_references(
+        &heap_object.data,
+        file.superblock().offset_size,
+    )
+    .unwrap();
+    assert_eq!(refs, vec![scale.address()]);
+}
+
+#[test]
 fn binary_emission_requires_data() {
     let plan = Hdf5Builder::new()
         .dataset(DatasetBuilder::typed::<f32>("data", vec![2, 3]))
