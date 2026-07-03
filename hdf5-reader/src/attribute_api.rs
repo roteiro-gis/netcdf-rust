@@ -27,6 +27,7 @@ pub struct Attribute {
     pub datatype: Datatype,
     pub shape: Vec<u64>,
     pub raw_data: Vec<u8>,
+    pub decoded_strings: Option<Vec<String>>,
 }
 
 impl Attribute {
@@ -47,6 +48,15 @@ impl Attribute {
             DataspaceType::Null => vec![0],
             DataspaceType::Simple => msg.dataspace.dims.clone(),
         };
+        let decoded_strings = file_data.and_then(|file_data| {
+            decoded_vlen_strings(
+                &msg.datatype,
+                &msg.raw_data,
+                file_data,
+                offset_size,
+                msg.dataspace.num_elements().ok()?,
+            )
+        });
         let raw_data = if let (Some(file_data), Datatype::VarLen { base, kind, .. }) =
             (file_data, &msg.datatype)
         {
@@ -64,6 +74,7 @@ impl Attribute {
             datatype: msg.datatype,
             shape,
             raw_data,
+            decoded_strings,
         }
     }
 
@@ -110,6 +121,19 @@ impl Attribute {
     /// For variable-length strings, use `read_vlen_string()` with the file data
     /// and offset_size — this method will return an error directing you there.
     pub fn read_string(&self) -> Result<String> {
+        if let Some(strings) = &self.decoded_strings {
+            return match strings.len() {
+                1 => Ok(strings[0].clone()),
+                0 => Err(Error::InvalidData(format!(
+                    "attribute '{}' contains no string elements",
+                    self.name
+                ))),
+                count => Err(Error::InvalidData(format!(
+                    "attribute '{}' contains {count} string elements; use read_strings()",
+                    self.name
+                ))),
+            };
+        }
         match &self.datatype {
             Datatype::VarLen {
                 base,
@@ -170,6 +194,19 @@ impl Attribute {
     /// Variable-length strings in HDF5 are stored as references into a global
     /// heap collection. Each reference is: `seq_len(u32) + heap_addr(offset_size) + index(u32)`.
     pub fn read_vlen_string(&self, file_data: &[u8], offset_size: u8) -> Result<String> {
+        if let Some(strings) = &self.decoded_strings {
+            return match strings.len() {
+                1 => Ok(strings[0].clone()),
+                0 => Err(Error::InvalidData(format!(
+                    "attribute '{}' contains no string elements",
+                    self.name
+                ))),
+                count => Err(Error::InvalidData(format!(
+                    "attribute '{}' contains {count} string elements; use read_vlen_strings()",
+                    self.name
+                ))),
+            };
+        }
         match &self.datatype {
             Datatype::String {
                 size: StringSize::Variable,
@@ -204,6 +241,9 @@ impl Attribute {
 
     /// Read an array of variable-length strings from the global heap.
     pub fn read_vlen_strings(&self, file_data: &[u8], offset_size: u8) -> Result<Vec<String>> {
+        if let Some(strings) = &self.decoded_strings {
+            return Ok(strings.clone());
+        }
         match &self.datatype {
             Datatype::String {
                 size: StringSize::Variable,
@@ -242,6 +282,9 @@ impl Attribute {
 
     /// Read the attribute as a vector of strings.
     pub fn read_strings(&self) -> Result<Vec<String>> {
+        if let Some(strings) = &self.decoded_strings {
+            return Ok(strings.clone());
+        }
         match &self.datatype {
             Datatype::String {
                 size: StringSize::Fixed(len),
@@ -511,6 +554,85 @@ pub(crate) fn read_one_vlen_string_storage(
     }
 }
 
+pub(crate) fn decoded_vlen_strings_storage(
+    datatype: &Datatype,
+    raw_data: &[u8],
+    storage: &dyn Storage,
+    offset_size: u8,
+    length_size: u8,
+    element_count: u64,
+) -> Option<Vec<String>> {
+    let (padding, encoding) = vlen_string_format(datatype)?;
+    let ref_size = 4 + offset_size as usize + 4;
+    let n = checked_usize(element_count, "attribute string element count").ok()?;
+    if raw_data.len() < n.checked_mul(ref_size)? {
+        return None;
+    }
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push(
+            read_one_vlen_string_storage(
+                raw_data,
+                i * ref_size,
+                storage,
+                offset_size,
+                length_size,
+                padding,
+                encoding,
+            )
+            .ok()?,
+        );
+    }
+    Some(result)
+}
+
+fn decoded_vlen_strings(
+    datatype: &Datatype,
+    raw_data: &[u8],
+    file_data: &[u8],
+    offset_size: u8,
+    element_count: u64,
+) -> Option<Vec<String>> {
+    let (padding, encoding) = vlen_string_format(datatype)?;
+    let ref_size = 4 + offset_size as usize + 4;
+    let n = checked_usize(element_count, "attribute string element count").ok()?;
+    if raw_data.len() < n.checked_mul(ref_size)? {
+        return None;
+    }
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        result.push(
+            read_one_vlen_string(
+                raw_data,
+                i * ref_size,
+                file_data,
+                offset_size,
+                padding,
+                encoding,
+            )
+            .ok()?,
+        );
+    }
+    Some(result)
+}
+
+fn vlen_string_format(datatype: &Datatype) -> Option<(StringPadding, StringEncoding)> {
+    match datatype {
+        Datatype::String {
+            size: StringSize::Variable,
+            padding,
+            encoding,
+        } => Some((*padding, *encoding)),
+        Datatype::VarLen {
+            base,
+            kind: VarLenKind::String,
+            padding,
+            encoding,
+        } if is_byte_vlen(base) => Some((*padding, *encoding)),
+        _ => None,
+    }
+}
+
 /// Decode a byte slice into a String, handling padding and encoding.
 ///
 /// HDF5 supports ASCII and UTF-8 string encodings. Both are valid UTF-8
@@ -620,6 +742,7 @@ mod tests {
             },
             shape: vec![],
             raw_data,
+            decoded_strings: None,
         };
         let val = attr.read_scalar::<f64>().unwrap();
         assert!((val - PI).abs() < 1e-10);
@@ -641,6 +764,7 @@ mod tests {
             },
             shape: vec![4],
             raw_data,
+            decoded_strings: None,
         };
         let result = attr.read_1d::<i32>().unwrap();
         assert_eq!(result, vec![1, 2, 3, 4]);
@@ -657,6 +781,7 @@ mod tests {
             },
             shape: vec![],
             raw_data: b"meters\0\0\0\0".to_vec(),
+            decoded_strings: None,
         };
         assert_eq!(attr.read_string().unwrap(), "meters");
     }
@@ -677,6 +802,7 @@ mod tests {
             },
             shape: vec![],
             raw_data: b"test_dataset".to_vec(),
+            decoded_strings: None,
         };
         assert_eq!(attr.read_string().unwrap(), "test_dataset");
     }
@@ -693,6 +819,7 @@ mod tests {
             },
             shape: vec![],
             raw_data,
+            decoded_strings: None,
         };
         let val = attr.read_as_f64().unwrap();
         assert!((val - 42.0).abs() < 1e-10);

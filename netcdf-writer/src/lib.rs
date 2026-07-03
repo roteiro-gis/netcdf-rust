@@ -350,6 +350,12 @@ impl NcFileBuilder {
         if format == NcFormat::Nc4Classic {
             for variable in &self.variables {
                 validate_classic_type(&variable.dtype)?;
+                for attr in &variable.attributes {
+                    validate_nc4_classic_attr_value(&attr.value)?;
+                }
+            }
+            for attr in &self.attributes {
+                validate_nc4_classic_attr_value(&attr.value)?;
             }
         }
         if self
@@ -368,19 +374,6 @@ impl NcFileBuilder {
                     expected,
                     actual: variable.data.len(),
                 });
-            }
-            let is_coordinate = self.variable_is_coordinate_scale(variable)?;
-            if !is_coordinate && variable.dim_ids.len() > 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "NetCDF-4 variable '{}' requires DIMENSION_LIST global-heap metadata",
-                    variable.name
-                )));
-            }
-            if !is_coordinate && variable.dim_ids.len() == 1 {
-                return Err(Error::UnsupportedFeature(format!(
-                    "NetCDF-4 one-dimensional non-coordinate variable '{}' requires DIMENSION_LIST metadata",
-                    variable.name
-                )));
             }
         }
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
@@ -469,6 +462,8 @@ impl NcFileBuilder {
                     );
             } else if variable.dim_ids.is_empty() {
                 dataset = dataset.attribute(empty_dimension_list_attribute());
+            } else {
+                dataset = dataset.attribute(self.dimension_list_attribute(variable)?);
             }
 
             for attr in &variable.attributes {
@@ -495,6 +490,19 @@ impl NcFileBuilder {
         self.variables.iter().find(|variable| {
             variable.name == dim.name && variable.dim_ids.as_slice() == [dimension]
         })
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn dimension_list_attribute(&self, variable: &VariableDef) -> Result<H5AttributeBuilder> {
+        let target_sequences = variable
+            .dim_ids
+            .iter()
+            .map(|dimension| Ok(vec![self.dimension(*dimension)?.name.clone()]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(H5AttributeBuilder::vlen_object_references(
+            "DIMENSION_LIST",
+            target_sequences,
+        ))
     }
 
     fn add_variable_with_type(
@@ -1062,9 +1070,8 @@ fn nc_attr_to_hdf5(attribute: &NcAttribute) -> Result<H5AttributeBuilder> {
         NcAttrValue::UInt64s(values) => hdf5_numeric_attr(&attribute.name, NcType::UInt64, values),
         NcAttrValue::Floats(values) => hdf5_numeric_attr(&attribute.name, NcType::Float, values),
         NcAttrValue::Doubles(values) => hdf5_numeric_attr(&attribute.name, NcType::Double, values),
-        NcAttrValue::Strings(_) => Err(Error::UnsupportedFeature(
-            "NetCDF-4 NC_STRING attribute emission is not implemented yet".into(),
-        )),
+        NcAttrValue::Strings(values) => H5AttributeBuilder::vlen_strings(&attribute.name, values)
+            .map_err(hdf5_error_to_unsupported),
     }
 }
 
@@ -1258,6 +1265,16 @@ fn validate_classic_type(dtype: &NcType) -> Result<()> {
         return Err(Error::UnsupportedFeature(format!(
             "{dtype:?} requires NetCDF-4"
         )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn validate_nc4_classic_attr_value(value: &NcAttrValue) -> Result<()> {
+    if matches!(value, NcAttrValue::Strings(_)) {
+        return Err(Error::UnsupportedFeature(
+            "NC_STRING attributes require full NetCDF-4".into(),
+        ));
     }
     Ok(())
 }
