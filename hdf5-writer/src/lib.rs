@@ -727,7 +727,7 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
 
 #[derive(Debug)]
 struct DatasetEmission<'a> {
-    dataset: &'a DatasetBuilder,
+    raw_data: &'a [u8],
     header_address: u64,
     data_address: u64,
     header: Vec<u8>,
@@ -878,7 +878,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         let header =
             encode_dataset_header(prepared_dataset, attributes, data_address, heap_address)?;
         emissions.push(DatasetEmission {
-            dataset: prepared_dataset.dataset,
+            raw_data: &prepared_dataset.raw_data,
             header_address,
             data_address,
             header,
@@ -898,13 +898,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 
     for emission in &emissions {
         pad_to_address(&mut file, emission.data_address)?;
-        file.extend_from_slice(
-            emission
-                .dataset
-                .raw_data
-                .as_deref()
-                .expect("prepared datasets always have raw data"),
-        );
+        file.extend_from_slice(emission.raw_data);
     }
 
     if !heap.is_empty() {
@@ -919,7 +913,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 #[derive(Debug)]
 struct PreparedDataset<'a> {
     dataset: &'a DatasetBuilder,
-    raw_data: &'a [u8],
+    raw_data: Vec<u8>,
     data_size: u64,
 }
 
@@ -939,12 +933,6 @@ fn prepare_datasets(
         if dataset.max_shape.is_some() {
             return Err(Error::UnsupportedFeature(format!(
                 "resizable HDF5 dataspace is not emitted yet: '{}'",
-                dataset.name
-            )));
-        }
-        if !matches!(dataset.layout, PlannedLayout::Contiguous) {
-            return Err(Error::UnsupportedFeature(format!(
-                "only contiguous HDF5 datasets are emitted now: '{}'",
                 dataset.name
             )));
         }
@@ -984,11 +972,29 @@ fn prepare_datasets(
                 raw_data.len()
             )));
         }
+        let storage_data = match &dataset.layout {
+            PlannedLayout::Contiguous => raw_data.to_vec(),
+            PlannedLayout::Compact => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compact HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            PlannedLayout::Chunked { chunk_shape } => {
+                chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
+            }
+        };
+        let data_size = u64::try_from(storage_data.len()).map_err(|_| {
+            Error::InvalidDefinition(format!(
+                "dataset '{}' storage byte length exceeds u64 capacity",
+                dataset.name
+            ))
+        })?;
 
         prepared.push(PreparedDataset {
             dataset,
-            raw_data,
-            data_size: expected as u64,
+            raw_data: storage_data,
+            data_size,
         });
     }
     Ok(prepared)
@@ -1222,11 +1228,27 @@ fn encode_dataset_header(
         },
         HeaderMessage {
             type_id: MSG_DATA_LAYOUT,
-            payload: encode_contiguous_layout_message(data_address, dataset.data_size),
+            payload: encode_data_layout_message(dataset, data_address)?,
         },
     ];
     messages.extend(encode_attribute_header_messages(attributes, heap_address)?);
     encode_object_header_v2(&messages)
+}
+
+fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) -> Result<Vec<u8>> {
+    match &dataset.dataset.layout {
+        PlannedLayout::Contiguous => Ok(encode_contiguous_layout_message(
+            data_address,
+            dataset.data_size,
+        )),
+        PlannedLayout::Chunked { chunk_shape } => {
+            encode_implicit_chunked_layout_message(data_address, chunk_shape)
+        }
+        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
+            "compact HDF5 datasets are not emitted yet: '{}'",
+            dataset.dataset.name
+        ))),
+    }
 }
 
 fn encode_attribute_header_messages(
@@ -1439,6 +1461,29 @@ fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
     bytes
 }
 
+fn encode_implicit_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> Result<Vec<u8>> {
+    if chunk_shape.len() > u8::MAX as usize {
+        return Err(Error::InvalidDefinition(
+            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(6 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    bytes.push(4);
+    bytes.push(2);
+    bytes.push(0);
+    bytes.push(chunk_shape.len() as u8);
+    bytes.push(4);
+    for &dim in chunk_shape {
+        let dim = u32::try_from(dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+        })?;
+        bytes.extend_from_slice(&dim.to_le_bytes());
+    }
+    bytes.push(2);
+    bytes.extend_from_slice(&address.to_le_bytes());
+    Ok(bytes)
+}
+
 fn class_word(class: u8, version: u8, flags: u32) -> u32 {
     u32::from(class) | (u32::from(version) << 4) | (flags << 8)
 }
@@ -1501,6 +1546,193 @@ fn ensure_datatype_matches_element<T: H5WriteElement>(datatype: &Datatype) -> Re
         )));
     }
     Ok(())
+}
+
+fn chunked_storage_data(
+    raw_data: &[u8],
+    shape: &[u64],
+    chunk_shape: &[u64],
+    element_size: usize,
+) -> Result<Vec<u8>> {
+    if shape.is_empty() {
+        return Err(Error::InvalidDefinition(
+            "chunked scalar HDF5 datasets are not supported".into(),
+        ));
+    }
+    if shape.contains(&0) {
+        return Err(Error::InvalidDefinition(
+            "zero-sized chunked HDF5 datasets are not supported".into(),
+        ));
+    }
+    if chunk_shape.len() != shape.len() {
+        return Err(Error::InvalidDefinition(
+            "chunk shape rank must match dataset rank".into(),
+        ));
+    }
+
+    let mut chunks_per_dim = Vec::with_capacity(shape.len());
+    for (&dim, &chunk_dim) in shape.iter().zip(chunk_shape) {
+        if chunk_dim == 0 {
+            return Err(Error::InvalidDefinition(
+                "chunk dimensions must be non-zero".into(),
+            ));
+        }
+        u32::try_from(chunk_dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+        })?;
+        chunks_per_dim.push(dim.div_ceil(chunk_dim));
+    }
+
+    let chunk_elements = chunk_shape.iter().try_fold(1u64, |acc, &dim| {
+        checked_mul_u64(acc, dim, "chunk element count")
+    })?;
+    let element_size_u64 = u64::try_from(element_size).map_err(|_| {
+        Error::InvalidDefinition("datatype element size exceeds u64 capacity".into())
+    })?;
+    let chunk_bytes_u64 = checked_mul_u64(chunk_elements, element_size_u64, "chunk byte length")?;
+    let total_chunks = chunks_per_dim.iter().try_fold(1u64, |acc, &count| {
+        checked_mul_u64(acc, count, "chunk count")
+    })?;
+    let storage_bytes_u64 = checked_mul_u64(total_chunks, chunk_bytes_u64, "chunked data length")?;
+    let storage_bytes = checked_usize(storage_bytes_u64, "chunked data length")?;
+    let mut storage = vec![0u8; storage_bytes];
+
+    let dataset_strides = row_major_strides(shape, "dataset stride")?;
+    let chunk_strides = row_major_strides(chunk_shape, "chunk stride")?;
+    let mut chunk_indices = vec![0u64; shape.len()];
+
+    for chunk_linear in 0..total_chunks {
+        let chunk_base = checked_usize(
+            checked_mul_u64(chunk_linear, chunk_bytes_u64, "chunk byte offset")?,
+            "chunk byte offset",
+        )?;
+        let mut starts = Vec::with_capacity(shape.len());
+        let mut counts = Vec::with_capacity(shape.len());
+        for ((&chunk_index, &chunk_dim), &dim) in chunk_indices.iter().zip(chunk_shape).zip(shape) {
+            let start = checked_mul_u64(chunk_index, chunk_dim, "chunk start")?;
+            starts.push(start);
+            counts.push((dim - start).min(chunk_dim));
+        }
+        let src_start =
+            starts
+                .iter()
+                .zip(&dataset_strides)
+                .try_fold(0u64, |acc, (&start, &stride)| {
+                    checked_add_u64(
+                        acc,
+                        checked_mul_u64(start, stride, "chunk source element offset")?,
+                        "chunk source element offset",
+                    )
+                })?;
+        copy_chunk_rows(
+            raw_data,
+            &mut storage,
+            element_size,
+            &dataset_strides,
+            &chunk_strides,
+            &counts,
+            0,
+            src_start,
+            0,
+            chunk_base,
+        )?;
+        increment_row_major_index(&mut chunk_indices, &chunks_per_dim);
+    }
+
+    Ok(storage)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_chunk_rows(
+    src: &[u8],
+    dst: &mut [u8],
+    element_size: usize,
+    src_strides: &[u64],
+    chunk_strides: &[u64],
+    counts: &[u64],
+    dim: usize,
+    src_element: u64,
+    dst_element: u64,
+    dst_chunk_base: usize,
+) -> Result<()> {
+    let last_dim = counts.len() - 1;
+    if dim == last_dim {
+        let count = checked_usize(counts[dim], "chunk row element count")?;
+        let byte_count = checked_mul_usize(count, element_size, "chunk row byte length")?;
+        let src_start = element_byte_offset(src_element, element_size, "chunk source offset")?;
+        let dst_relative =
+            element_byte_offset(dst_element, element_size, "chunk destination offset")?;
+        let dst_start = dst_chunk_base.checked_add(dst_relative).ok_or_else(|| {
+            Error::InvalidDefinition("chunk destination offset overflows usize".into())
+        })?;
+        let src_end = src_start
+            .checked_add(byte_count)
+            .ok_or_else(|| Error::InvalidDefinition("chunk source end overflows usize".into()))?;
+        let dst_end = dst_start.checked_add(byte_count).ok_or_else(|| {
+            Error::InvalidDefinition("chunk destination end overflows usize".into())
+        })?;
+        if src_end > src.len() || dst_end > dst.len() {
+            return Err(Error::InvalidDefinition(
+                "chunk packing range exceeds dataset storage".into(),
+            ));
+        }
+        dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
+        return Ok(());
+    }
+
+    for index in 0..counts[dim] {
+        copy_chunk_rows(
+            src,
+            dst,
+            element_size,
+            src_strides,
+            chunk_strides,
+            counts,
+            dim + 1,
+            checked_add_u64(
+                src_element,
+                checked_mul_u64(index, src_strides[dim], "chunk source stride")?,
+                "chunk source stride",
+            )?,
+            checked_add_u64(
+                dst_element,
+                checked_mul_u64(index, chunk_strides[dim], "chunk destination stride")?,
+                "chunk destination stride",
+            )?,
+            dst_chunk_base,
+        )?;
+    }
+    Ok(())
+}
+
+fn row_major_strides(dims: &[u64], context: &str) -> Result<Vec<u64>> {
+    let mut strides = vec![1u64; dims.len()];
+    let mut stride = 1u64;
+    for index in (0..dims.len()).rev() {
+        strides[index] = stride;
+        stride = checked_mul_u64(stride, dims[index], context)?;
+    }
+    Ok(strides)
+}
+
+fn increment_row_major_index(indices: &mut [u64], limits: &[u64]) {
+    for dim in (0..indices.len()).rev() {
+        indices[dim] += 1;
+        if indices[dim] < limits[dim] {
+            return;
+        }
+        indices[dim] = 0;
+    }
+}
+
+fn element_byte_offset(element_offset: u64, element_size: usize, context: &str) -> Result<usize> {
+    let element_size = u64::try_from(element_size).map_err(|_| {
+        Error::InvalidDefinition(format!("{context} element size exceeds u64 capacity"))
+    })?;
+    checked_usize(
+        checked_mul_u64(element_offset, element_size, context)?,
+        context,
+    )
 }
 
 fn numeric_datatype_order(datatype: &Datatype) -> Result<ByteOrder> {
@@ -1628,6 +1860,11 @@ fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
         Error::InvalidDefinition(format!("{context} exceeds platform usize capacity"))
     })
+}
+
+fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| Error::InvalidDefinition(format!("{context} exceeds u64 capacity")))
 }
 
 fn checked_add_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
