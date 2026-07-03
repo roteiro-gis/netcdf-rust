@@ -79,6 +79,56 @@ fn writes_nc4_scalar_variable() {
 }
 
 #[test]
+fn writes_nc4_string_vector_attributes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_attribute(
+            "history",
+            NcAttrValue::Strings(vec!["created".to_string(), "updated".to_string()]),
+        )
+        .unwrap();
+    builder
+        .add_attribute(
+            "single_string_array",
+            NcAttrValue::Strings(vec!["kept as array".to_string()]),
+        )
+        .unwrap();
+    let variable = builder.add_variable::<i32>("value", &[]).unwrap();
+    builder
+        .add_variable_attribute(
+            variable,
+            "labels",
+            NcAttrValue::Strings(vec!["minimum".to_string(), "maximum".to_string()]),
+        )
+        .unwrap();
+    builder.write_variable(variable, &[7_i32]).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.global_attribute("history").unwrap().value,
+        NcAttrValue::Strings(vec!["created".to_string(), "updated".to_string()])
+    );
+    assert_eq!(
+        file.global_attribute("single_string_array").unwrap().value,
+        NcAttrValue::Strings(vec!["kept as array".to_string()])
+    );
+    assert_eq!(
+        file.variable("value")
+            .unwrap()
+            .attribute("labels")
+            .unwrap()
+            .value,
+        NcAttrValue::Strings(vec!["minimum".to_string(), "maximum".to_string()])
+    );
+}
+
+#[test]
 fn writes_nc4_classic_marker() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<f64>("value", &[]).unwrap();
@@ -95,6 +145,27 @@ fn writes_nc4_classic_marker() {
     assert_eq!(file.format(), NcFormat::Nc4Classic);
     let values = file.read_variable::<f64>("value").unwrap();
     assert_eq!(values.as_slice_memory_order().unwrap(), &[6.25]);
+}
+
+#[test]
+fn rejects_nc4_classic_string_attributes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_attribute(
+            "history",
+            NcAttrValue::Strings(vec!["requires enhanced model".to_string()]),
+        )
+        .unwrap();
+    let variable = builder.add_variable::<f64>("value", &[]).unwrap();
+    builder.write_variable(variable, &[6.25_f64]).unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("NC_STRING attributes"));
 }
 
 #[test]

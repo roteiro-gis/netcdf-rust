@@ -350,6 +350,12 @@ impl NcFileBuilder {
         if format == NcFormat::Nc4Classic {
             for variable in &self.variables {
                 validate_classic_type(&variable.dtype)?;
+                for attr in &variable.attributes {
+                    validate_nc4_classic_attr_value(&attr.value)?;
+                }
+            }
+            for attr in &self.attributes {
+                validate_nc4_classic_attr_value(&attr.value)?;
             }
         }
         if self
@@ -1064,9 +1070,8 @@ fn nc_attr_to_hdf5(attribute: &NcAttribute) -> Result<H5AttributeBuilder> {
         NcAttrValue::UInt64s(values) => hdf5_numeric_attr(&attribute.name, NcType::UInt64, values),
         NcAttrValue::Floats(values) => hdf5_numeric_attr(&attribute.name, NcType::Float, values),
         NcAttrValue::Doubles(values) => hdf5_numeric_attr(&attribute.name, NcType::Double, values),
-        NcAttrValue::Strings(_) => Err(Error::UnsupportedFeature(
-            "NetCDF-4 NC_STRING attribute emission is not implemented yet".into(),
-        )),
+        NcAttrValue::Strings(values) => H5AttributeBuilder::vlen_strings(&attribute.name, values)
+            .map_err(hdf5_error_to_unsupported),
     }
 }
 
@@ -1260,6 +1265,16 @@ fn validate_classic_type(dtype: &NcType) -> Result<()> {
         return Err(Error::UnsupportedFeature(format!(
             "{dtype:?} requires NetCDF-4"
         )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn validate_nc4_classic_attr_value(value: &NcAttrValue) -> Result<()> {
+    if matches!(value, NcAttrValue::Strings(_)) {
+        return Err(Error::UnsupportedFeature(
+            "NC_STRING attributes require full NetCDF-4".into(),
+        ));
     }
     Ok(())
 }

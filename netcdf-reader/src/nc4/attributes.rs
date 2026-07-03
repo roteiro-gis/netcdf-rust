@@ -136,7 +136,7 @@ fn convert_attribute_value(
             _ => Ok(None),
         },
         Datatype::String { .. } => {
-            if attr.num_elements()? == 1 {
+            if attr.shape.is_empty() {
                 read_attr(attr.read_string().map(NcAttrValue::Chars))
             } else {
                 read_attr(attr.read_strings().map(NcAttrValue::Strings))
@@ -146,17 +146,20 @@ fn convert_attribute_value(
             base,
             kind: VarLenKind::String,
             ..
-        } if attr.num_elements()? == 1
-            && matches!(
-                base.as_ref(),
-                Datatype::FixedPoint {
-                    size: 1,
-                    signed: false,
-                    ..
-                }
-            ) =>
+        } if matches!(
+            base.as_ref(),
+            Datatype::FixedPoint {
+                size: 1,
+                signed: false,
+                ..
+            }
+        ) =>
         {
-            read_attr(attr.read_string().map(NcAttrValue::Chars))
+            if attr.shape.is_empty() {
+                read_attr(attr.read_string().map(NcAttrValue::Chars))
+            } else {
+                read_attr(attr.read_strings().map(NcAttrValue::Strings))
+            }
         }
         _ if strict => Err(unsupported()),
         _ => Ok(None),
@@ -180,6 +183,7 @@ mod tests {
             },
             shape: vec![1],
             raw_data: vec![0, 0, 0, 0],
+            decoded_strings: None,
         };
 
         let err = convert_attribute_value(&attr, crate::NcMetadataMode::Strict).unwrap_err();
@@ -197,6 +201,7 @@ mod tests {
             },
             shape: vec![1],
             raw_data: vec![0; 16],
+            decoded_strings: None,
         };
 
         assert!(convert_attribute_value(&attr, crate::NcMetadataMode::Lossy)

@@ -10,8 +10,8 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::attribute_api::{
-    collect_attribute_messages_storage, decode_string, read_one_vlen_string_storage,
-    resolve_vlen_bytes_storage, Attribute,
+    collect_attribute_messages_storage, decode_string, decoded_vlen_strings_storage,
+    read_one_vlen_string_storage, resolve_vlen_bytes_storage, Attribute,
 };
 use crate::cache::{ChunkCache, ChunkCacheStats, ChunkKey};
 use crate::chunk_index;
@@ -3241,6 +3241,20 @@ fn swap_elements_to_native(
 }
 
 fn attribute_from_message_storage(message: &AttributeMessage, context: &FileContext) -> Attribute {
+    let decoded_strings = message
+        .dataspace
+        .num_elements()
+        .ok()
+        .and_then(|element_count| {
+            decoded_vlen_strings_storage(
+                &message.datatype,
+                &message.raw_data,
+                context.storage.as_ref(),
+                context.superblock.offset_size,
+                context.superblock.length_size,
+                element_count,
+            )
+        });
     let raw_data = match &message.datatype {
         Datatype::VarLen {
             base,
@@ -3269,6 +3283,7 @@ fn attribute_from_message_storage(message: &AttributeMessage, context: &FileCont
             DataspaceType::Simple => message.dataspace.dims.clone(),
         },
         raw_data,
+        decoded_strings,
     }
 }
 

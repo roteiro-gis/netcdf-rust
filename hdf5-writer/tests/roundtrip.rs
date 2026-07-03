@@ -82,6 +82,65 @@ fn writes_multiple_root_datasets() {
 }
 
 #[test]
+fn writes_fixed_string_arrays() {
+    let plan = Hdf5Builder::new()
+        .attribute(
+            AttributeBuilder::fixed_string_vector("history", &["created", "updated"]).unwrap(),
+        )
+        .dataset(
+            DatasetBuilder::fixed_string_data("labels", vec![3], &["red", "green", "blue"])
+                .unwrap(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.root_group()
+            .unwrap()
+            .attribute("history")
+            .unwrap()
+            .read_strings()
+            .unwrap(),
+        vec!["created".to_string(), "updated".to_string()]
+    );
+    assert_eq!(
+        file.dataset("/labels").unwrap().read_strings().unwrap(),
+        vec!["red".to_string(), "green".to_string(), "blue".to_string()]
+    );
+}
+
+#[test]
+fn writes_vlen_string_attribute_backed_by_global_heap() {
+    let plan = Hdf5Builder::new()
+        .attribute(AttributeBuilder::vlen_strings("history", &["created", "updated"]).unwrap())
+        .dataset(DatasetBuilder::typed_data("data", vec![1], &[1_i32]).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.root_group()
+            .unwrap()
+            .attribute("history")
+            .unwrap()
+            .read_strings()
+            .unwrap(),
+        vec!["created".to_string(), "updated".to_string()]
+    );
+}
+
+#[test]
 fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
     let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
         .unwrap()

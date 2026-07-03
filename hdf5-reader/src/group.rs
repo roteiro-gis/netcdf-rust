@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use crate::attribute_api::{
-    collect_attribute_messages_storage, resolve_vlen_bytes_storage, Attribute,
+    collect_attribute_messages_storage, decoded_vlen_strings_storage, resolve_vlen_bytes_storage,
+    Attribute,
 };
 use crate::btree_v1;
 use crate::btree_v2;
@@ -200,6 +201,17 @@ impl Group {
         )?
         .into_iter()
         .map(|attr| {
+            let element_count = attr.dataspace.num_elements().ok();
+            let decoded_strings = element_count.and_then(|element_count| {
+                decoded_vlen_strings_storage(
+                    &attr.datatype,
+                    &attr.raw_data,
+                    self.context.storage.as_ref(),
+                    self.offset_size(),
+                    self.length_size(),
+                    element_count,
+                )
+            });
             let raw_data = match &attr.datatype {
                 crate::messages::datatype::Datatype::VarLen {
                     base,
@@ -229,6 +241,7 @@ impl Group {
                     crate::messages::dataspace::DataspaceType::Simple => attr.dataspace.dims,
                 },
                 raw_data,
+                decoded_strings,
             }
         })
         .collect())

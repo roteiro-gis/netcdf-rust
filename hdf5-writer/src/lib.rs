@@ -253,6 +253,25 @@ impl DatasetBuilder {
         Self::typed::<T>(name, shape).data(values)
     }
 
+    pub fn fixed_string_data<S: AsRef<str>>(
+        name: impl Into<String>,
+        shape: impl Into<Vec<u64>>,
+        values: &[S],
+    ) -> Result<Self> {
+        let name = name.into();
+        let shape = shape.into();
+        let expected = expected_element_count(&shape)?;
+        if values.len() != expected {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' expects {expected} string elements, got {}",
+                name,
+                values.len()
+            )));
+        }
+        let (datatype, raw_data) = encode_fixed_string_values(values)?;
+        Ok(Self::new(name, datatype, shape).raw_data(raw_data))
+    }
+
     pub fn max_shape(mut self, max_shape: impl Into<Vec<u64>>) -> Self {
         self.max_shape = Some(max_shape.into());
         self
@@ -373,6 +392,7 @@ pub struct AttributeBuilder {
     shape: Vec<u64>,
     raw_data: Vec<u8>,
     vlen_object_reference_targets: Option<Vec<Vec<String>>>,
+    vlen_string_values: Option<Vec<String>>,
 }
 
 impl AttributeBuilder {
@@ -388,6 +408,7 @@ impl AttributeBuilder {
             shape: shape.into(),
             raw_data: raw_data.into(),
             vlen_object_reference_targets: None,
+            vlen_string_values: None,
         }
     }
 
@@ -436,6 +457,17 @@ impl AttributeBuilder {
         )
     }
 
+    pub fn fixed_string_vector<S: AsRef<str>>(
+        name: impl Into<String>,
+        values: &[S],
+    ) -> Result<Self> {
+        let element_count = u64::try_from(values.len()).map_err(|_| {
+            Error::InvalidDefinition("string attribute element count exceeds u64 capacity".into())
+        })?;
+        let (datatype, raw_data) = encode_fixed_string_values(values)?;
+        Ok(Self::new(name, datatype, vec![element_count], raw_data))
+    }
+
     pub fn vlen_object_references(
         name: impl Into<String>,
         target_sequences: Vec<Vec<String>>,
@@ -454,7 +486,46 @@ impl AttributeBuilder {
             shape: vec![target_sequences.len() as u64],
             raw_data: Vec::new(),
             vlen_object_reference_targets: Some(target_sequences),
+            vlen_string_values: None,
         }
+    }
+
+    pub fn vlen_strings<S: AsRef<str>>(name: impl Into<String>, values: &[S]) -> Result<Self> {
+        let element_count = u64::try_from(values.len()).map_err(|_| {
+            Error::InvalidDefinition("string attribute element count exceeds u64 capacity".into())
+        })?;
+        let mut strings = Vec::with_capacity(values.len());
+        let mut encoding = StringEncoding::Ascii;
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "variable-length string values cannot contain NUL bytes".into(),
+                ));
+            }
+            if !value.is_ascii() {
+                encoding = StringEncoding::Utf8;
+            }
+            strings.push(value.to_string());
+        }
+
+        Ok(Self {
+            name: name.into(),
+            datatype: Datatype::VarLen {
+                base: Box::new(Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    byte_order: ByteOrder::LittleEndian,
+                }),
+                kind: VarLenKind::String,
+                encoding,
+                padding: StringPadding::NullTerminate,
+            },
+            shape: vec![element_count],
+            raw_data: Vec::new(),
+            vlen_object_reference_targets: None,
+            vlen_string_values: Some(strings),
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -475,6 +546,23 @@ impl AttributeBuilder {
 
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
+        if let Some(values) = &self.vlen_string_values {
+            if self.shape != [values.len() as u64] {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen string shape must match value count",
+                    self.name
+                )));
+            }
+            for value in values {
+                if value.as_bytes().contains(&0) {
+                    return Err(Error::InvalidDefinition(format!(
+                        "attribute '{}' vlen string values cannot contain NUL bytes",
+                        self.name
+                    )));
+                }
+            }
+            return Ok(());
+        }
         if let Some(target_sequences) = &self.vlen_object_reference_targets {
             if self.shape != [target_sequences.len() as u64] {
                 return Err(Error::InvalidDefinition(format!(
@@ -874,12 +962,13 @@ fn prepare_datasets(
         }
 
         let element_size = datatype_element_size(&dataset.datatype)?;
-        let datatype_order = numeric_datatype_order(&dataset.datatype)?;
-        if datatype_order != options.byte_order {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' datatype byte order {:?} does not match writer byte order {:?}",
-                dataset.name, datatype_order, options.byte_order
-            )));
+        if let Some(datatype_order) = datatype_numeric_order(&dataset.datatype) {
+            if datatype_order != options.byte_order {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' datatype byte order {:?} does not match writer byte order {:?}",
+                    dataset.name, datatype_order, options.byte_order
+                )));
+            }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
         let raw_data = dataset.raw_data.as_deref().ok_or_else(|| {
@@ -962,7 +1051,36 @@ fn plan_attribute(
     heap_objects: &mut Vec<GlobalHeapObjectPlan>,
 ) -> Result<PlannedAttribute> {
     attribute.validate()?;
-    if let Some(target_sequences) = &attribute.vlen_object_reference_targets {
+    if let Some(values) = &attribute.vlen_string_values {
+        let mut refs = Vec::with_capacity(values.len());
+        for value in values {
+            let index = checked_heap_index(heap_objects.len() + 1)?;
+            let mut data = Vec::with_capacity(value.len() + 1);
+            data.extend_from_slice(value.as_bytes());
+            data.push(0);
+            let sequence_len = u32::try_from(data.len()).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "attribute '{}' vlen string exceeds u32 capacity",
+                    attribute.name
+                ))
+            })?;
+            heap_objects.push(GlobalHeapObjectPlan {
+                index,
+                reference_count: 1,
+                data,
+            });
+            refs.push(VLenHeapReference {
+                sequence_len,
+                heap_index: index,
+            });
+        }
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::GlobalHeapVLenReferences(refs),
+        })
+    } else if let Some(target_sequences) = &attribute.vlen_object_reference_targets {
         let mut refs = Vec::with_capacity(target_sequences.len());
         for sequence in target_sequences {
             let index = checked_heap_index(heap_objects.len() + 1)?;
@@ -1386,28 +1504,76 @@ fn ensure_datatype_matches_element<T: H5WriteElement>(datatype: &Datatype) -> Re
 }
 
 fn numeric_datatype_order(datatype: &Datatype) -> Result<ByteOrder> {
+    datatype_numeric_order(datatype).ok_or_else(|| {
+        Error::UnsupportedFeature(format!(
+            "typed data encoding is not implemented for {datatype:?}"
+        ))
+    })
+}
+
+fn datatype_numeric_order(datatype: &Datatype) -> Option<ByteOrder> {
     match datatype {
         Datatype::FixedPoint { byte_order, .. } | Datatype::FloatingPoint { byte_order, .. } => {
-            Ok(*byte_order)
+            Some(*byte_order)
         }
-        other => Err(Error::UnsupportedFeature(format!(
-            "typed data encoding is not implemented for {other:?}"
-        ))),
+        _ => None,
     }
 }
 
+fn encode_fixed_string_values<S: AsRef<str>>(values: &[S]) -> Result<(Datatype, Vec<u8>)> {
+    let mut width = 1usize;
+    let mut encoding = StringEncoding::Ascii;
+    for value in values {
+        let value = value.as_ref();
+        if value.as_bytes().contains(&0) {
+            return Err(Error::InvalidDefinition(
+                "fixed string values cannot contain NUL bytes".into(),
+            ));
+        }
+        width = width.max(value.len());
+        if !value.is_ascii() {
+            encoding = StringEncoding::Utf8;
+        }
+    }
+
+    let width_u32 = u32::try_from(width).map_err(|_| {
+        Error::InvalidDefinition("fixed string element width exceeds HDF5 capacity".into())
+    })?;
+    let capacity = checked_mul_usize(values.len(), width, "fixed string data byte length")?;
+    let mut raw_data = Vec::with_capacity(capacity);
+    for value in values {
+        let element_end = raw_data.len().checked_add(width).ok_or_else(|| {
+            Error::InvalidDefinition("fixed string data byte length exceeds usize capacity".into())
+        })?;
+        raw_data.extend_from_slice(value.as_ref().as_bytes());
+        raw_data.resize(element_end, 0);
+    }
+
+    Ok((
+        Datatype::String {
+            size: StringSize::Fixed(width_u32),
+            encoding,
+            padding: StringPadding::NullPad,
+        },
+        raw_data,
+    ))
+}
+
+fn expected_element_count(shape: &[u64]) -> Result<usize> {
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    shape.iter().try_fold(1usize, |acc, &dim| {
+        checked_mul_usize(
+            acc,
+            checked_usize(dim, "dataset dimension")?,
+            "dataset element count",
+        )
+    })
+}
+
 fn expected_data_len(shape: &[u64], element_size: usize) -> Result<usize> {
-    let elements = if shape.is_empty() {
-        1usize
-    } else {
-        shape.iter().try_fold(1usize, |acc, &dim| {
-            checked_mul_usize(
-                acc,
-                checked_usize(dim, "dataset dimension")?,
-                "dataset element count",
-            )
-        })?
-    };
+    let elements = expected_element_count(shape)?;
     checked_mul_usize(elements, element_size, "dataset byte length")
 }
 
