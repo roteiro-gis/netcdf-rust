@@ -230,6 +230,49 @@ fn writes_fill_value_for_unallocated_dataset() {
 }
 
 #[test]
+fn writes_compact_dataset_inline() {
+    let values = [10_i16, 20, 30, 40];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("small", vec![2, 2], &values)
+                .unwrap()
+                .compact(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/small").unwrap();
+    assert_eq!(dataset.shape(), &[2, 2]);
+    let array = dataset.read_array::<i16>().unwrap();
+    assert_eq!(array.as_slice_memory_order().unwrap(), values);
+}
+
+#[test]
+fn rejects_oversized_compact_dataset() {
+    let values = vec![0_u8; usize::from(u16::MAX) + 1];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("too_large", vec![values.len() as u64], &values)
+                .unwrap()
+                .compact(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("compact HDF5 dataset data"));
+}
+
+#[test]
 fn writes_vlen_string_attribute_backed_by_global_heap() {
     let plan = Hdf5Builder::new()
         .attribute(AttributeBuilder::vlen_strings("history", &["created", "updated"]).unwrap())

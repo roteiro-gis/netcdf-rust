@@ -743,6 +743,7 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
 
 #[derive(Debug)]
 struct DatasetEmission<'a> {
+    dataset: &'a DatasetBuilder,
     raw_data: &'a [u8],
     header_address: u64,
     data_address: u64,
@@ -847,14 +848,16 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     let mut data_addresses = Vec::with_capacity(prepared.len());
     for prepared_dataset in &prepared {
         data_addresses.push(next_address);
-        next_address = align_u64(
-            checked_add_u64(
-                next_address,
-                prepared_dataset.raw_data.len() as u64,
-                "dataset raw data end",
-            )?,
-            8,
-        );
+        if !matches!(prepared_dataset.dataset.layout, PlannedLayout::Compact) {
+            next_address = align_u64(
+                checked_add_u64(
+                    next_address,
+                    prepared_dataset.raw_data.len() as u64,
+                    "dataset raw data end",
+                )?,
+                8,
+            );
+        }
     }
 
     let target_addresses = target_addresses(&prepared, &header_addresses);
@@ -894,6 +897,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         let header =
             encode_dataset_header(prepared_dataset, attributes, data_address, heap_address)?;
         emissions.push(DatasetEmission {
+            dataset: prepared_dataset.dataset,
             raw_data: &prepared_dataset.raw_data,
             header_address,
             data_address,
@@ -913,8 +917,10 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     for emission in &emissions {
-        pad_to_address(&mut file, emission.data_address)?;
-        file.extend_from_slice(emission.raw_data);
+        if !matches!(emission.dataset.layout, PlannedLayout::Compact) {
+            pad_to_address(&mut file, emission.data_address)?;
+            file.extend_from_slice(emission.raw_data);
+        }
     }
 
     if !heap.is_empty() {
@@ -973,12 +979,7 @@ fn prepare_datasets(
             }
             match &dataset.layout {
                 PlannedLayout::Contiguous => raw_data.to_vec(),
-                PlannedLayout::Compact => {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "compact HDF5 datasets are not emitted yet: '{}'",
-                        dataset.name
-                    )));
-                }
+                PlannedLayout::Compact => raw_data.to_vec(),
                 PlannedLayout::Chunked { chunk_shape } => {
                     chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
                 }
@@ -1267,10 +1268,7 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
         PlannedLayout::Chunked { chunk_shape } => {
             encode_implicit_chunked_layout_message(storage_address, chunk_shape)
         }
-        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
-            "compact HDF5 datasets are not emitted yet: '{}'",
-            dataset.dataset.name
-        ))),
+        PlannedLayout::Compact => encode_compact_layout_message(&dataset.raw_data),
     }
 }
 
@@ -1482,6 +1480,20 @@ fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
     bytes.extend_from_slice(&address.to_le_bytes());
     bytes.extend_from_slice(&size.to_le_bytes());
     bytes
+}
+
+fn encode_compact_layout_message(data: &[u8]) -> Result<Vec<u8>> {
+    let size = u16::try_from(data.len()).map_err(|_| {
+        Error::UnsupportedFeature(
+            "compact HDF5 dataset data exceeds u16 byte length capacity".into(),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(4 + data.len());
+    bytes.push(3);
+    bytes.push(0);
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(data);
+    Ok(bytes)
 }
 
 fn encode_fill_value_message(fill_value: &[u8]) -> Result<Vec<u8>> {
