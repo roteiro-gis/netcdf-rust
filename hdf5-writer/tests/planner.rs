@@ -28,3 +28,13 @@ fn rejects_filters_on_non_chunked_dataset() {
 
     assert!(err.to_string().contains("filtered HDF5 datasets"));
 }
+
+#[test]
+fn rejects_resizable_non_chunked_dataset() {
+    let err = Hdf5Builder::new()
+        .dataset(DatasetBuilder::typed::<f32>("temperature", vec![2, 3]).max_shape(vec![4, 3]))
+        .into_plan()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("must use chunked layout"));
+}
