@@ -21,6 +21,7 @@ const UNDEFINED_ADDRESS: u64 = u64::MAX;
 
 const MSG_DATASPACE: u8 = 0x01;
 const MSG_DATATYPE: u8 = 0x03;
+const MSG_FILL_VALUE: u8 = 0x05;
 const MSG_LINK: u8 = 0x06;
 const MSG_DATA_LAYOUT: u8 = 0x08;
 const MSG_ATTRIBUTE: u8 = 0x0c;
@@ -382,6 +383,16 @@ impl DatasetBuilder {
                 return Err(Error::InvalidDefinition(
                     "chunk dimensions must be non-zero".into(),
                 ));
+            }
+        }
+        if let Some(fill_value) = &self.fill_value {
+            let element_size = datatype_element_size(&self.datatype)?;
+            if fill_value.len() != element_size {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' fill value byte length must match datatype element size: expected {element_size}, got {}",
+                    self.name,
+                    fill_value.len()
+                )));
             }
         }
         validate_attributes(&self.attributes)?;
@@ -941,12 +952,6 @@ fn prepare_datasets(
                 dataset.name
             )));
         }
-        if dataset.fill_value.is_some() {
-            return Err(Error::UnsupportedFeature(format!(
-                "HDF5 fill value messages are not emitted yet: '{}'",
-                dataset.name
-            )));
-        }
 
         let element_size = datatype_element_size(&dataset.datatype)?;
         if let Some(datatype_order) = datatype_numeric_order(&dataset.datatype) {
@@ -958,30 +963,39 @@ fn prepare_datasets(
             }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
-        let raw_data = dataset.raw_data.as_deref().ok_or_else(|| {
-            Error::InvalidDefinition(format!(
-                "dataset '{}' has no raw data for binary emission",
-                dataset.name
-            ))
-        })?;
-        if raw_data.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} data bytes, got {}",
-                dataset.name,
-                raw_data.len()
-            )));
-        }
-        let storage_data = match &dataset.layout {
-            PlannedLayout::Contiguous => raw_data.to_vec(),
-            PlannedLayout::Compact => {
+        let storage_data = if let Some(raw_data) = dataset.raw_data.as_deref() {
+            if raw_data.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' expects {expected} data bytes, got {}",
+                    dataset.name,
+                    raw_data.len()
+                )));
+            }
+            match &dataset.layout {
+                PlannedLayout::Contiguous => raw_data.to_vec(),
+                PlannedLayout::Compact => {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "compact HDF5 datasets are not emitted yet: '{}'",
+                        dataset.name
+                    )));
+                }
+                PlannedLayout::Chunked { chunk_shape } => {
+                    chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
+                }
+            }
+        } else if dataset.fill_value.is_some() {
+            if matches!(dataset.layout, PlannedLayout::Compact) {
                 return Err(Error::UnsupportedFeature(format!(
                     "compact HDF5 datasets are not emitted yet: '{}'",
                     dataset.name
                 )));
             }
-            PlannedLayout::Chunked { chunk_shape } => {
-                chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
-            }
+            Vec::new()
+        } else {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' has no raw data for binary emission",
+                dataset.name
+            )));
         };
         let data_size = u64::try_from(storage_data.len()).map_err(|_| {
             Error::InvalidDefinition(format!(
@@ -1213,23 +1227,28 @@ fn encode_dataset_header(
     data_address: u64,
     heap_address: u64,
 ) -> Result<Vec<u8>> {
-    let mut messages = vec![
-        HeaderMessage {
-            type_id: MSG_DATASPACE,
-            payload: encode_dataspace_message(
-                &dataset.dataset.shape,
-                dataset.dataset.max_shape.as_deref(),
-            )?,
-        },
-        HeaderMessage {
-            type_id: MSG_DATATYPE,
-            payload: encode_datatype_message(&dataset.dataset.datatype)?,
-        },
-        HeaderMessage {
-            type_id: MSG_DATA_LAYOUT,
-            payload: encode_data_layout_message(dataset, data_address)?,
-        },
-    ];
+    let mut messages = Vec::new();
+    messages.push(HeaderMessage {
+        type_id: MSG_DATASPACE,
+        payload: encode_dataspace_message(
+            &dataset.dataset.shape,
+            dataset.dataset.max_shape.as_deref(),
+        )?,
+    });
+    messages.push(HeaderMessage {
+        type_id: MSG_DATATYPE,
+        payload: encode_datatype_message(&dataset.dataset.datatype)?,
+    });
+    if let Some(fill_value) = &dataset.dataset.fill_value {
+        messages.push(HeaderMessage {
+            type_id: MSG_FILL_VALUE,
+            payload: encode_fill_value_message(fill_value)?,
+        });
+    }
+    messages.push(HeaderMessage {
+        type_id: MSG_DATA_LAYOUT,
+        payload: encode_data_layout_message(dataset, data_address)?,
+    });
     messages.extend(encode_attribute_header_messages(attributes, heap_address)?);
     encode_object_header_v2(&messages)
 }
@@ -1463,6 +1482,18 @@ fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
     bytes.extend_from_slice(&address.to_le_bytes());
     bytes.extend_from_slice(&size.to_le_bytes());
     bytes
+}
+
+fn encode_fill_value_message(fill_value: &[u8]) -> Result<Vec<u8>> {
+    let size = u32::try_from(fill_value.len()).map_err(|_| {
+        Error::UnsupportedFeature("HDF5 fill value exceeds u32 byte length capacity".into())
+    })?;
+    let mut bytes = Vec::with_capacity(6 + fill_value.len());
+    bytes.push(3);
+    bytes.push(0x10);
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(fill_value);
+    Ok(bytes)
 }
 
 fn encode_implicit_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> Result<Vec<u8>> {

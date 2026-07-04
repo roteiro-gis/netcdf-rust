@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use hdf5_reader::Hdf5File;
 use hdf5_writer::{
-    AttributeBuilder, DatasetBuilder, Hdf5Builder, Hdf5Writer, WriteOptions, UNLIMITED,
+    AttributeBuilder, ByteOrder, DatasetBuilder, Hdf5Builder, Hdf5Writer, WriteOptions, UNLIMITED,
 };
 
 #[test]
@@ -195,6 +195,38 @@ fn writes_empty_resizable_chunked_dataspace() {
     let array = dataset.read_array::<i32>().unwrap();
     assert_eq!(array.shape(), &[0, 5]);
     assert!(array.as_slice_memory_order().unwrap().is_empty());
+}
+
+#[test]
+fn writes_fill_value_for_unallocated_dataset() {
+    let fill = (-9999_i32).to_le_bytes();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_with_order::<i32>("filled", vec![2, 3], ByteOrder::LittleEndian)
+                .fill_value(fill),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/filled").unwrap();
+    assert_eq!(dataset.shape(), &[2, 3]);
+    assert_eq!(
+        dataset.fill_value().unwrap().value.as_deref(),
+        Some(&fill[..])
+    );
+
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[2, 3]);
+    assert_eq!(
+        array.as_slice_memory_order().unwrap(),
+        &[-9999, -9999, -9999, -9999, -9999, -9999]
+    );
 }
 
 #[test]

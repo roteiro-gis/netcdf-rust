@@ -38,3 +38,13 @@ fn rejects_resizable_non_chunked_dataset() {
 
     assert!(err.to_string().contains("must use chunked layout"));
 }
+
+#[test]
+fn rejects_fill_value_with_wrong_element_size() {
+    let err = Hdf5Builder::new()
+        .dataset(DatasetBuilder::typed::<i32>("temperature", vec![2, 3]).fill_value(vec![0]))
+        .into_plan()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("fill value byte length"));
+}
