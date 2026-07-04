@@ -116,6 +116,31 @@ fn writes_fixed_string_arrays() {
 }
 
 #[test]
+fn writes_implicit_chunked_dataset() {
+    let values = (0_i32..15).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("chunked", vec![3, 5], &values)
+                .unwrap()
+                .chunked(vec![2, 3]),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/chunked").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[3, 5]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
 fn writes_vlen_string_attribute_backed_by_global_heap() {
     let plan = Hdf5Builder::new()
         .attribute(AttributeBuilder::vlen_strings("history", &["created", "updated"]).unwrap())
