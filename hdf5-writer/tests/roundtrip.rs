@@ -2,8 +2,9 @@ use std::io::Cursor;
 
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
-    AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
-    WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, UNLIMITED,
+    AttributeBuilder, ByteOrder, CompoundField, DatasetBuilder, Datatype, EnumMember,
+    FilterDescription, Hdf5Builder, Hdf5Writer, WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32,
+    FILTER_SHUFFLE, UNLIMITED,
 };
 
 #[test]
@@ -206,6 +207,124 @@ fn writes_fixed_string_arrays() {
     assert_eq!(
         file.dataset("/labels").unwrap().read_strings().unwrap(),
         vec!["red".to_string(), "green".to_string(), "blue".to_string()]
+    );
+}
+
+#[test]
+fn writes_enhanced_datatype_messages() {
+    let bitfield_type = Datatype::Bitfield {
+        size: 2,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let opaque_type = Datatype::Opaque {
+        size: 3,
+        tag: "rgb".to_string(),
+    };
+    let array_type = Datatype::Array {
+        base: Box::new(Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            byte_order: ByteOrder::LittleEndian,
+        }),
+        dims: vec![2],
+    };
+    let enum_type = Datatype::Enum {
+        base: Box::new(Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        }),
+        members: vec![
+            EnumMember {
+                name: "OFF".to_string(),
+                value: vec![0],
+            },
+            EnumMember {
+                name: "ON".to_string(),
+                value: vec![1],
+            },
+        ],
+    };
+    let compound_type = Datatype::Compound {
+        size: 12,
+        fields: vec![
+            CompoundField {
+                name: "id".to_string(),
+                byte_offset: 0,
+                datatype: Datatype::FixedPoint {
+                    size: 4,
+                    signed: true,
+                    byte_order: ByteOrder::LittleEndian,
+                },
+            },
+            CompoundField {
+                name: "value".to_string(),
+                byte_offset: 4,
+                datatype: Datatype::FloatingPoint {
+                    size: 8,
+                    byte_order: ByteOrder::LittleEndian,
+                },
+            },
+        ],
+    };
+    let compound_data = {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+        bytes.extend_from_slice(&3.5_f64.to_le_bytes());
+        bytes
+    };
+
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::new("flags", bitfield_type.clone(), vec![2])
+                .raw_data([0x34, 0x12, 0xcd, 0xab]),
+        )
+        .dataset(
+            DatasetBuilder::new("pixels", opaque_type.clone(), vec![2])
+                .raw_data([0xff, 0x00, 0x00, 0x00, 0xff, 0x00]),
+        )
+        .dataset(
+            DatasetBuilder::new("pairs", array_type.clone(), vec![2])
+                .raw_data([1, 0, 2, 0, 3, 0, 4, 0]),
+        )
+        .dataset(DatasetBuilder::new("states", enum_type.clone(), vec![3]).raw_data([0, 1, 1]))
+        .dataset(
+            DatasetBuilder::new("records", compound_type.clone(), vec![1])
+                .raw_data(compound_data.clone()),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dataset("/flags").unwrap().dtype(), &bitfield_type);
+    assert_eq!(
+        file.dataset("/flags").unwrap().read_raw_bytes().unwrap(),
+        vec![0x34, 0x12, 0xcd, 0xab]
+    );
+    assert_eq!(file.dataset("/pixels").unwrap().dtype(), &opaque_type);
+    assert_eq!(
+        file.dataset("/pixels").unwrap().read_raw_bytes().unwrap(),
+        vec![0xff, 0x00, 0x00, 0x00, 0xff, 0x00]
+    );
+    assert_eq!(file.dataset("/pairs").unwrap().dtype(), &array_type);
+    assert_eq!(
+        file.dataset("/pairs").unwrap().read_raw_bytes().unwrap(),
+        vec![1, 0, 2, 0, 3, 0, 4, 0]
+    );
+    assert_eq!(file.dataset("/states").unwrap().dtype(), &enum_type);
+    assert_eq!(
+        file.dataset("/states").unwrap().read_raw_bytes().unwrap(),
+        vec![0, 1, 1]
+    );
+    assert_eq!(file.dataset("/records").unwrap().dtype(), &compound_type);
+    assert_eq!(
+        file.dataset("/records").unwrap().read_raw_bytes().unwrap(),
+        compound_data
     );
 }
 

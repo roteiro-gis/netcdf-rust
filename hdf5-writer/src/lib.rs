@@ -9,11 +9,11 @@ use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
 
 pub use hdf5_core::{
-    fletcher32, jenkins_lookup3, ByteOrder, ChunkIndexing, DataLayout, DataspaceMessage,
-    DataspaceType, Datatype, FillTime, FillValueMessage, FilterDescription, FilterPipelineMessage,
-    ReferenceType, StringEncoding, StringPadding, StringSize, VarLenKind, FILTER_DEFLATE,
-    FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP,
-    UNLIMITED,
+    fletcher32, jenkins_lookup3, ByteOrder, ChunkIndexing, CompoundField, DataLayout,
+    DataspaceMessage, DataspaceType, Datatype, EnumMember, FillTime, FillValueMessage,
+    FilterDescription, FilterPipelineMessage, ReferenceType, StringEncoding, StringPadding,
+    StringSize, VarLenKind, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT,
+    FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP, UNLIMITED,
 };
 
 const HDF5_MAGIC: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -2040,10 +2040,191 @@ fn encode_datatype_message(datatype: &Datatype) -> Result<Vec<u8>> {
             bytes.extend_from_slice(&encode_datatype_message(base)?);
             Ok(bytes)
         }
-        other => Err(Error::UnsupportedFeature(format!(
-            "datatype emission is not implemented for {other:?}"
-        ))),
+        Datatype::Bitfield { size, byte_order } => {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(4, 1, byte_order_flag(*byte_order)).to_le_bytes());
+            bytes.extend_from_slice(&u32::from(*size).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&(u16::from(*size) * 8).to_le_bytes());
+            Ok(bytes)
+        }
+        Datatype::Opaque { size, tag } => {
+            let tag_len = if tag.is_empty() {
+                0
+            } else {
+                checked_add_usize(tag.len(), 1, "opaque datatype tag length")?
+            };
+            if tag.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "opaque datatype tag cannot contain NUL bytes".into(),
+                ));
+            }
+            let flags = u32::try_from(tag_len).map_err(|_| {
+                Error::UnsupportedFeature("opaque datatype tag exceeds u32 capacity".into())
+            })?;
+            if flags > 0xff {
+                return Err(Error::UnsupportedFeature(
+                    "opaque datatype tag exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(5, 1, flags).to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            if tag_len > 0 {
+                bytes.extend_from_slice(tag.as_bytes());
+                bytes.push(0);
+                align_vec(&mut bytes, 8);
+            }
+            Ok(bytes)
+        }
+        Datatype::Compound { size, fields } => {
+            let n_fields = u32::try_from(fields.len()).map_err(|_| {
+                Error::UnsupportedFeature(
+                    "compound datatype member count exceeds u32 capacity".into(),
+                )
+            })?;
+            if n_fields > 0xffff {
+                return Err(Error::UnsupportedFeature(
+                    "compound datatype member count exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            let offset_size = compound_member_offset_size(*size);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(6, 3, n_fields).to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            let mut names = std::collections::BTreeSet::new();
+            for field in fields {
+                encode_datatype_name(&field.name, "compound field")?;
+                if !names.insert(field.name.as_str()) {
+                    return Err(Error::InvalidDefinition(format!(
+                        "duplicate compound field '{}'",
+                        field.name
+                    )));
+                }
+                let field_size =
+                    u32::try_from(datatype_element_size(&field.datatype)?).map_err(|_| {
+                        Error::UnsupportedFeature(format!(
+                            "compound field '{}' size exceeds u32 capacity",
+                            field.name
+                        ))
+                    })?;
+                let field_end = field.byte_offset.checked_add(field_size).ok_or_else(|| {
+                    Error::InvalidDefinition(format!(
+                        "compound field '{}' offset overflows datatype size",
+                        field.name
+                    ))
+                })?;
+                if field_end > *size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "compound field '{}' byte range {}..{} is outside datatype size {size}",
+                        field.name, field.byte_offset, field_end
+                    )));
+                }
+                bytes.extend_from_slice(field.name.as_bytes());
+                bytes.push(0);
+                write_uvar(u64::from(field.byte_offset), offset_size, &mut bytes);
+                bytes.extend_from_slice(&encode_datatype_message(&field.datatype)?);
+            }
+            Ok(bytes)
+        }
+        Datatype::Enum { base, members } => {
+            let n_members = u32::try_from(members.len()).map_err(|_| {
+                Error::UnsupportedFeature("enum datatype member count exceeds u32 capacity".into())
+            })?;
+            if n_members > 0xffff {
+                return Err(Error::UnsupportedFeature(
+                    "enum datatype member count exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            if !matches!(base.as_ref(), Datatype::FixedPoint { .. }) {
+                return Err(Error::InvalidDefinition(
+                    "enum datatype base must be fixed-point integer".into(),
+                ));
+            }
+            let value_size = datatype_element_size(base)?;
+            let value_size_u32 = u32::try_from(value_size).map_err(|_| {
+                Error::UnsupportedFeature("enum datatype value size exceeds u32 capacity".into())
+            })?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(8, 3, n_members).to_le_bytes());
+            bytes.extend_from_slice(&value_size_u32.to_le_bytes());
+            bytes.extend_from_slice(&encode_datatype_message(base)?);
+            let mut names = std::collections::BTreeSet::new();
+            for member in members {
+                encode_datatype_name(&member.name, "enum member")?;
+                if !names.insert(member.name.as_str()) {
+                    return Err(Error::InvalidDefinition(format!(
+                        "duplicate enum member '{}'",
+                        member.name
+                    )));
+                }
+                bytes.extend_from_slice(member.name.as_bytes());
+                bytes.push(0);
+            }
+            for member in members {
+                if member.value.len() != value_size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "enum member '{}' value byte length must be {value_size}, got {}",
+                        member.name,
+                        member.value.len()
+                    )));
+                }
+                bytes.extend_from_slice(&member.value);
+            }
+            Ok(bytes)
+        }
+        Datatype::Array { base, dims } => {
+            let rank = u8::try_from(dims.len()).map_err(|_| {
+                Error::UnsupportedFeature("array datatype rank exceeds HDF5 capacity".into())
+            })?;
+            let element_size = datatype_element_size(datatype)?;
+            let element_size_u32 = u32::try_from(element_size).map_err(|_| {
+                Error::UnsupportedFeature("array datatype element size exceeds u32 capacity".into())
+            })?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(10, 3, 0).to_le_bytes());
+            bytes.extend_from_slice(&element_size_u32.to_le_bytes());
+            bytes.push(rank);
+            for &dim in dims {
+                let dim = u32::try_from(dim).map_err(|_| {
+                    Error::UnsupportedFeature(
+                        "array datatype dimension exceeds HDF5 u32 capacity".into(),
+                    )
+                })?;
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            bytes.extend_from_slice(&encode_datatype_message(base)?);
+            Ok(bytes)
+        }
     }
+}
+
+fn encode_datatype_name(name: &str, context: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "{context} name must not be empty"
+        )));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(Error::InvalidDefinition(format!(
+            "{context} name cannot contain NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn compound_member_offset_size(size: u32) -> usize {
+    match size {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
+        0x1_0000..=0xff_ffff => 3,
+        _ => 4,
+    }
+}
+
+fn align_vec(bytes: &mut Vec<u8>, align: usize) {
+    let padding = (align - (bytes.len() % align)) % align;
+    bytes.resize(bytes.len() + padding, 0);
 }
 
 fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
@@ -2838,13 +3019,8 @@ fn size_width_for(value: u64) -> Result<(u8, usize)> {
 }
 
 fn write_uvar(value: u64, width: usize, dst: &mut Vec<u8>) {
-    match width {
-        1 => dst.push(value as u8),
-        2 => dst.extend_from_slice(&(value as u16).to_le_bytes()),
-        4 => dst.extend_from_slice(&(value as u32).to_le_bytes()),
-        8 => dst.extend_from_slice(&value.to_le_bytes()),
-        _ => unreachable!("validated HDF5 variable integer width"),
-    }
+    let bytes = value.to_le_bytes();
+    dst.extend_from_slice(&bytes[..width]);
 }
 
 fn pad_to_address(bytes: &mut Vec<u8>, address: u64) -> Result<()> {
