@@ -1106,6 +1106,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 #[derive(Debug)]
 struct PreparedDataset<'a> {
     dataset: &'a DatasetBuilder,
+    filters: Vec<FilterDescription>,
     raw_data: Vec<u8>,
     data_size: u64,
     chunk_index: Option<PreparedChunkIndex>,
@@ -1137,7 +1138,7 @@ fn prepare_datasets(
     let mut prepared = Vec::with_capacity(plan.datasets.len());
     for dataset in &plan.datasets {
         let element_size = datatype_element_size(&dataset.datatype)?;
-        validate_writer_filters(dataset)?;
+        let filters = validate_writer_filters(dataset, element_size)?;
         if let Some(datatype_order) = datatype_numeric_order(&dataset.datatype) {
             if datatype_order != options.byte_order {
                 return Err(Error::InvalidDefinition(format!(
@@ -1159,7 +1160,7 @@ fn prepare_datasets(
                 PlannedLayout::Contiguous => (raw_data.to_vec(), None),
                 PlannedLayout::Compact => (raw_data.to_vec(), None),
                 PlannedLayout::Chunked { chunk_shape } => {
-                    if dataset.filters.is_empty() {
+                    if filters.is_empty() {
                         (
                             chunked_storage_data(
                                 raw_data,
@@ -1179,7 +1180,10 @@ fn prepare_datasets(
                         if storage_data.is_empty() {
                             (storage_data, None)
                         } else {
-                            (apply_write_filters(&storage_data, &dataset.filters)?, None)
+                            (
+                                apply_write_filters(&storage_data, &filters, element_size)?,
+                                None,
+                            )
                         }
                     } else {
                         filtered_chunk_storage_data(
@@ -1187,7 +1191,7 @@ fn prepare_datasets(
                             &dataset.shape,
                             chunk_shape,
                             element_size,
-                            &dataset.filters,
+                            &filters,
                         )?
                     }
                 }
@@ -1215,6 +1219,7 @@ fn prepare_datasets(
 
         prepared.push(PreparedDataset {
             dataset,
+            filters,
             raw_data: storage_data,
             data_size,
             chunk_index,
@@ -1632,10 +1637,10 @@ fn encode_dataset_header(
             payload: encode_fill_value_message(fill_value)?,
         });
     }
-    if !dataset.dataset.filters.is_empty() {
+    if !dataset.filters.is_empty() {
         messages.push(HeaderMessage {
             type_id: MSG_FILTER_PIPELINE,
-            payload: encode_filter_pipeline_message(&dataset.dataset.filters)?,
+            payload: encode_filter_pipeline_message(&dataset.filters)?,
         });
     }
     messages.push(HeaderMessage {
@@ -1658,7 +1663,7 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
             dataset.data_size,
         )),
         PlannedLayout::Chunked { chunk_shape } => {
-            if dataset.dataset.filters.is_empty() {
+            if dataset.filters.is_empty() {
                 encode_implicit_chunked_layout_message(storage_address, chunk_shape)
             } else if dataset.chunk_index.is_some() {
                 encode_fixed_array_chunked_layout_message(storage_address, chunk_shape)
@@ -2121,9 +2126,12 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
     }
 }
 
-fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
+fn validate_writer_filters(
+    dataset: &DatasetBuilder,
+    element_size: usize,
+) -> Result<Vec<FilterDescription>> {
     if dataset.filters.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let PlannedLayout::Chunked { chunk_shape } = &dataset.layout else {
         return Err(Error::InvalidDefinition(
@@ -2131,6 +2139,10 @@ fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
         ));
     };
     let _ = chunk_count(&dataset.shape, chunk_shape)?;
+    let element_size_client_data = u32::try_from(element_size).map_err(|_| {
+        Error::UnsupportedFeature("shuffle filter element size exceeds u32 capacity".into())
+    })?;
+    let mut filters = Vec::with_capacity(dataset.filters.len());
     for filter in &dataset.filters {
         match filter.id {
             FILTER_DEFLATE => {
@@ -2144,6 +2156,32 @@ fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
                         "well-known HDF5 deflate filter must not carry a name".into(),
                     ));
                 }
+                filters.push(filter.clone());
+            }
+            FILTER_SHUFFLE => {
+                if filter.name.is_some() {
+                    return Err(Error::InvalidDefinition(
+                        "well-known HDF5 shuffle filter must not carry a name".into(),
+                    ));
+                }
+                match filter.client_data.as_slice() {
+                    [] => filters.push(FilterDescription {
+                        id: FILTER_SHUFFLE,
+                        name: None,
+                        client_data: vec![element_size_client_data],
+                    }),
+                    [size] if *size == element_size_client_data => filters.push(filter.clone()),
+                    [_] => {
+                        return Err(Error::InvalidDefinition(format!(
+                            "shuffle filter element size must match datatype element size {element_size}"
+                        )));
+                    }
+                    _ => {
+                        return Err(Error::InvalidDefinition(
+                            "shuffle filter requires zero or one element-size client value".into(),
+                        ));
+                    }
+                }
             }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -2152,13 +2190,18 @@ fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(filters)
 }
 
-fn apply_write_filters(data: &[u8], filters: &[FilterDescription]) -> Result<Vec<u8>> {
+fn apply_write_filters(
+    data: &[u8],
+    filters: &[FilterDescription],
+    element_size: usize,
+) -> Result<Vec<u8>> {
     let mut current = data.to_vec();
     for filter in filters {
         current = match filter.id {
+            FILTER_SHUFFLE => shuffle_filter(&current, element_size),
             FILTER_DEFLATE => deflate_filter(&current, filter)?,
             other => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -2168,6 +2211,31 @@ fn apply_write_filters(data: &[u8], filters: &[FilterDescription]) -> Result<Vec
         };
     }
     Ok(current)
+}
+
+fn shuffle_filter(data: &[u8], element_size: usize) -> Vec<u8> {
+    if element_size <= 1 || data.is_empty() {
+        return data.to_vec();
+    }
+
+    let n_elements = data.len() / element_size;
+    if n_elements == 0 {
+        return data.to_vec();
+    }
+
+    let mut output = vec![0u8; data.len()];
+    for byte_idx in 0..element_size {
+        let dst_start = byte_idx * n_elements;
+        for elem in 0..n_elements {
+            output[dst_start + elem] = data[elem * element_size + byte_idx];
+        }
+    }
+
+    let complete = n_elements * element_size;
+    if complete < data.len() {
+        output[complete..].copy_from_slice(&data[complete..]);
+    }
+    output
 }
 
 fn deflate_filter(data: &[u8], filter: &FilterDescription) -> Result<Vec<u8>> {
@@ -2377,7 +2445,7 @@ fn filtered_chunk_storage_data(
             0,
         )?;
 
-        let encoded = apply_write_filters(&chunk, filters)?;
+        let encoded = apply_write_filters(&chunk, filters, element_size)?;
         let relative_address = u64::try_from(storage.len()).map_err(|_| {
             Error::InvalidDefinition("filtered chunk storage exceeds u64 capacity".into())
         })?;
