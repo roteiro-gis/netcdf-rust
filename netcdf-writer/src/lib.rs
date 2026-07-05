@@ -422,6 +422,69 @@ impl NcFileBuilder {
         Ok(())
     }
 
+    pub fn write_opaque_variable<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        values: &[S],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let NcType::Opaque { size, .. } = &variable.dtype else {
+            return Err(Error::TypeMismatch {
+                expected: "Opaque".into(),
+                actual: format!("{:?}", variable.dtype),
+            });
+        };
+        let size = usize::try_from(*size).map_err(|_| {
+            Error::InvalidDefinition("opaque element size exceeds platform usize".into())
+        })?;
+        let mut data = Vec::with_capacity(values.len() * size);
+        for value in values {
+            let value = value.as_ref();
+            if value.len() != size {
+                return Err(Error::DataLengthMismatch {
+                    expected: size,
+                    actual: value.len(),
+                });
+            }
+            data.extend_from_slice(value);
+        }
+        variable.data = data;
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
+        variable.string_values = None;
+        variable.vlen_values = None;
+        Ok(())
+    }
+
+    pub fn write_array_variable<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        values: &[T],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let NcType::Array { base, .. } = &variable.dtype else {
+            return Err(Error::TypeMismatch {
+                expected: "Array".into(),
+                actual: format!("{:?}", variable.dtype),
+            });
+        };
+        let expected = T::nc_type();
+        if base.as_ref() != &expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", base),
+                actual: format!("{expected:?}"),
+            });
+        }
+        let mut data = Vec::with_capacity(std::mem::size_of_val(values));
+        for &value in values {
+            value.write_one_le(&mut data);
+        }
+        variable.data = data;
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
+        variable.string_values = None;
+        variable.vlen_values = None;
+        Ok(())
+    }
+
     pub fn write_vlen_variable_bytes<S: AsRef<[u8]>>(
         &mut self,
         variable: VariableId,

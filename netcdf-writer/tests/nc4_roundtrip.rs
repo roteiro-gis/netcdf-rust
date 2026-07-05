@@ -277,12 +277,18 @@ fn writes_nc4_user_defined_variables() {
     let obs = builder
         .add_user_defined_variable("obs", &[], obs_type.clone())
         .unwrap();
+    let samples = builder
+        .add_user_defined_variable("samples", &[n], samples_type.clone())
+        .unwrap();
 
     builder
         .write_enum_variable(quality, &[NcIntegerValue::U8(2), NcIntegerValue::U8(1)])
         .unwrap();
     builder
-        .write_user_defined_variable_bytes(blob, &[1, 2, 3, 4, 5, 6, 7, 8])
+        .write_opaque_variable(blob, &[&[1_u8, 2, 3, 4][..], &[5_u8, 6, 7, 8][..]])
+        .unwrap();
+    builder
+        .write_array_variable(samples, &[1_i16, 2, 3, 10, 11, 12])
         .unwrap();
     let mut obs_bytes = Vec::new();
     obs_bytes.extend_from_slice(&12.5_f32.to_le_bytes());
@@ -319,6 +325,22 @@ fn writes_nc4_user_defined_variables() {
         blob_values.as_slice().unwrap()[1],
         netcdf_reader::NcValue::Opaque(vec![5, 6, 7, 8])
     );
+
+    let sample_values = file.read_variable_user_defined("samples").unwrap();
+    match &sample_values.as_slice().unwrap()[1] {
+        netcdf_reader::NcValue::Array(array) => {
+            assert_eq!(array.dims, vec![3]);
+            assert_eq!(
+                array.values,
+                vec![
+                    netcdf_reader::NcValue::Short(10),
+                    netcdf_reader::NcValue::Short(11),
+                    netcdf_reader::NcValue::Short(12),
+                ]
+            );
+        }
+        other => panic!("expected array value, got {other:?}"),
+    }
 
     assert_eq!(file.variable("obs").unwrap().dtype(), &obs_type);
     let obs_values = file.read_variable_user_defined("obs").unwrap();
