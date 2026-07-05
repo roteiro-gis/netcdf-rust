@@ -13,6 +13,7 @@ keywords = ["hdf5", "encoder", "scientific-data"]
 categories = ["science", "encoding"]
 
 [dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hdf5-core = { version = "0.7.0", path = "../hdf5-core" }
 thiserror = { workspace = true }
 

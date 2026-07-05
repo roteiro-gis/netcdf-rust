@@ -2,7 +2,8 @@ use std::io::Cursor;
 
 use hdf5_reader::Hdf5File;
 use hdf5_writer::{
-    AttributeBuilder, ByteOrder, DatasetBuilder, Hdf5Builder, Hdf5Writer, WriteOptions, UNLIMITED,
+    AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
+    WriteOptions, FILTER_DEFLATE, UNLIMITED,
 };
 
 #[test]
@@ -227,6 +228,103 @@ fn writes_fill_value_for_unallocated_dataset() {
         array.as_slice_memory_order().unwrap(),
         &[-9999, -9999, -9999, -9999, -9999, -9999]
     );
+}
+
+#[test]
+fn writes_compact_dataset_inline() {
+    let values = [10_i16, 20, 30, 40];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("small", vec![2, 2], &values)
+                .unwrap()
+                .compact(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/small").unwrap();
+    assert_eq!(dataset.shape(), &[2, 2]);
+    let array = dataset.read_array::<i16>().unwrap();
+    assert_eq!(array.as_slice_memory_order().unwrap(), values);
+}
+
+#[test]
+fn rejects_oversized_compact_dataset() {
+    let values = vec![0_u8; usize::from(u16::MAX) + 1];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("too_large", vec![values.len() as u64], &values)
+                .unwrap()
+                .compact(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("compact HDF5 dataset data"));
+}
+
+#[test]
+fn writes_single_chunk_deflate_dataset() {
+    let values = (0_i32..12).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("compressed", vec![3, 4], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/compressed").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![3, 4]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[3, 4]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn rejects_multi_chunk_filtered_dataset() {
+    let values = (0_i32..16).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("compressed", vec![4, 4], &values)
+                .unwrap()
+                .chunked(vec![2, 2])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+
+    assert!(err.to_string().contains("single chunk"));
 }
 
 #[test]

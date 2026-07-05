@@ -452,6 +452,7 @@ dependencies = [
 name = "hdf5-writer"
 version = "0.7.0"
 dependencies = [
+ "flate2",
  "hdf5-core",
  "hdf5-reader",
  "tempfile",

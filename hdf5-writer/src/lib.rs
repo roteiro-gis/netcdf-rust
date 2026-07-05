@@ -5,6 +5,7 @@
 //! planning types. Full HDF5 serialization is intentionally gated until the
 //! object-header, heap, chunk-index, and checksum encoders are complete.
 
+use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
 
 pub use hdf5_core::{
@@ -24,6 +25,7 @@ const MSG_DATATYPE: u8 = 0x03;
 const MSG_FILL_VALUE: u8 = 0x05;
 const MSG_LINK: u8 = 0x06;
 const MSG_DATA_LAYOUT: u8 = 0x08;
+const MSG_FILTER_PIPELINE: u8 = 0x0b;
 const MSG_ATTRIBUTE: u8 = 0x0c;
 
 const SUPERBLOCK_V2_SIZE: usize = 48;
@@ -743,6 +745,7 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
 
 #[derive(Debug)]
 struct DatasetEmission<'a> {
+    dataset: &'a DatasetBuilder,
     raw_data: &'a [u8],
     header_address: u64,
     data_address: u64,
@@ -847,14 +850,16 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     let mut data_addresses = Vec::with_capacity(prepared.len());
     for prepared_dataset in &prepared {
         data_addresses.push(next_address);
-        next_address = align_u64(
-            checked_add_u64(
-                next_address,
-                prepared_dataset.raw_data.len() as u64,
-                "dataset raw data end",
-            )?,
-            8,
-        );
+        if !matches!(prepared_dataset.dataset.layout, PlannedLayout::Compact) {
+            next_address = align_u64(
+                checked_add_u64(
+                    next_address,
+                    prepared_dataset.raw_data.len() as u64,
+                    "dataset raw data end",
+                )?,
+                8,
+            );
+        }
     }
 
     let target_addresses = target_addresses(&prepared, &header_addresses);
@@ -894,6 +899,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         let header =
             encode_dataset_header(prepared_dataset, attributes, data_address, heap_address)?;
         emissions.push(DatasetEmission {
+            dataset: prepared_dataset.dataset,
             raw_data: &prepared_dataset.raw_data,
             header_address,
             data_address,
@@ -913,8 +919,10 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     for emission in &emissions {
-        pad_to_address(&mut file, emission.data_address)?;
-        file.extend_from_slice(emission.raw_data);
+        if !matches!(emission.dataset.layout, PlannedLayout::Compact) {
+            pad_to_address(&mut file, emission.data_address)?;
+            file.extend_from_slice(emission.raw_data);
+        }
     }
 
     if !heap.is_empty() {
@@ -946,14 +954,8 @@ fn prepare_datasets(
                 dataset.name
             )));
         }
-        if !dataset.filters.is_empty() {
-            return Err(Error::UnsupportedFeature(format!(
-                "filtered HDF5 datasets are not emitted yet: '{}'",
-                dataset.name
-            )));
-        }
-
         let element_size = datatype_element_size(&dataset.datatype)?;
+        validate_writer_filters(dataset)?;
         if let Some(datatype_order) = datatype_numeric_order(&dataset.datatype) {
             if datatype_order != options.byte_order {
                 return Err(Error::InvalidDefinition(format!(
@@ -973,12 +975,7 @@ fn prepare_datasets(
             }
             match &dataset.layout {
                 PlannedLayout::Contiguous => raw_data.to_vec(),
-                PlannedLayout::Compact => {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "compact HDF5 datasets are not emitted yet: '{}'",
-                        dataset.name
-                    )));
-                }
+                PlannedLayout::Compact => raw_data.to_vec(),
                 PlannedLayout::Chunked { chunk_shape } => {
                     chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
                 }
@@ -996,6 +993,11 @@ fn prepare_datasets(
                 "dataset '{}' has no raw data for binary emission",
                 dataset.name
             )));
+        };
+        let storage_data = if !dataset.filters.is_empty() && !storage_data.is_empty() {
+            apply_write_filters(&storage_data, &dataset.filters)?
+        } else {
+            storage_data
         };
         let data_size = u64::try_from(storage_data.len()).map_err(|_| {
             Error::InvalidDefinition(format!(
@@ -1245,6 +1247,12 @@ fn encode_dataset_header(
             payload: encode_fill_value_message(fill_value)?,
         });
     }
+    if !dataset.dataset.filters.is_empty() {
+        messages.push(HeaderMessage {
+            type_id: MSG_FILTER_PIPELINE,
+            payload: encode_filter_pipeline_message(&dataset.dataset.filters)?,
+        });
+    }
     messages.push(HeaderMessage {
         type_id: MSG_DATA_LAYOUT,
         payload: encode_data_layout_message(dataset, data_address)?,
@@ -1265,12 +1273,13 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
             dataset.data_size,
         )),
         PlannedLayout::Chunked { chunk_shape } => {
-            encode_implicit_chunked_layout_message(storage_address, chunk_shape)
+            if dataset.dataset.filters.is_empty() {
+                encode_implicit_chunked_layout_message(storage_address, chunk_shape)
+            } else {
+                encode_single_chunk_layout_message(storage_address, chunk_shape, dataset.data_size)
+            }
         }
-        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
-            "compact HDF5 datasets are not emitted yet: '{}'",
-            dataset.dataset.name
-        ))),
+        PlannedLayout::Compact => encode_compact_layout_message(&dataset.raw_data),
     }
 }
 
@@ -1484,6 +1493,20 @@ fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
     bytes
 }
 
+fn encode_compact_layout_message(data: &[u8]) -> Result<Vec<u8>> {
+    let size = u16::try_from(data.len()).map_err(|_| {
+        Error::UnsupportedFeature(
+            "compact HDF5 dataset data exceeds u16 byte length capacity".into(),
+        )
+    })?;
+    let mut bytes = Vec::with_capacity(4 + data.len());
+    bytes.push(3);
+    bytes.push(0);
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(data);
+    Ok(bytes)
+}
+
 fn encode_fill_value_message(fill_value: &[u8]) -> Result<Vec<u8>> {
     let size = u32::try_from(fill_value.len()).map_err(|_| {
         Error::UnsupportedFeature("HDF5 fill value exceeds u32 byte length capacity".into())
@@ -1493,6 +1516,75 @@ fn encode_fill_value_message(fill_value: &[u8]) -> Result<Vec<u8>> {
     bytes.push(0x10);
     bytes.extend_from_slice(&size.to_le_bytes());
     bytes.extend_from_slice(fill_value);
+    Ok(bytes)
+}
+
+fn encode_filter_pipeline_message(filters: &[FilterDescription]) -> Result<Vec<u8>> {
+    let filter_count = u8::try_from(filters.len()).map_err(|_| {
+        Error::UnsupportedFeature("HDF5 filter pipeline exceeds u8 filter count capacity".into())
+    })?;
+    let mut bytes = Vec::new();
+    bytes.push(2);
+    bytes.push(filter_count);
+    for filter in filters {
+        bytes.extend_from_slice(&filter.id.to_le_bytes());
+        if filter.id >= 256 {
+            let name_len = filter.name.as_ref().map_or(0usize, |name| name.len() + 1);
+            let name_len = u16::try_from(name_len).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "HDF5 filter {} name exceeds u16 byte length capacity",
+                    filter.id
+                ))
+            })?;
+            bytes.extend_from_slice(&name_len.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        let client_count = u16::try_from(filter.client_data.len()).map_err(|_| {
+            Error::UnsupportedFeature(format!(
+                "HDF5 filter {} client data exceeds u16 count capacity",
+                filter.id
+            ))
+        })?;
+        bytes.extend_from_slice(&client_count.to_le_bytes());
+        if filter.id >= 256 {
+            if let Some(name) = &filter.name {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(0);
+            }
+        }
+        for value in &filter.client_data {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+fn encode_single_chunk_layout_message(
+    address: u64,
+    chunk_shape: &[u64],
+    filtered_size: u64,
+) -> Result<Vec<u8>> {
+    if chunk_shape.len() > u8::MAX as usize {
+        return Err(Error::InvalidDefinition(
+            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(18 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    bytes.push(4);
+    bytes.push(2);
+    bytes.push(1);
+    bytes.push(chunk_shape.len() as u8);
+    bytes.push(4);
+    for &dim in chunk_shape {
+        let dim = u32::try_from(dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+        })?;
+        bytes.extend_from_slice(&dim.to_le_bytes());
+    }
+    bytes.push(1);
+    bytes.extend_from_slice(&filtered_size.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&address.to_le_bytes());
     Ok(bytes)
 }
 
@@ -1573,6 +1665,68 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
     }
 }
 
+fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
+    if dataset.filters.is_empty() {
+        return Ok(());
+    }
+    let PlannedLayout::Chunked { chunk_shape } = &dataset.layout else {
+        return Err(Error::InvalidDefinition(
+            "filtered HDF5 datasets must use chunked layout".into(),
+        ));
+    };
+    let chunk_count = chunk_count(&dataset.shape, chunk_shape)?;
+    if chunk_count > 1 {
+        return Err(Error::UnsupportedFeature(format!(
+            "filtered HDF5 dataset '{}' must fit in a single chunk until indexed filtered chunk storage is implemented",
+            dataset.name
+        )));
+    }
+    for filter in &dataset.filters {
+        match filter.id {
+            FILTER_DEFLATE => {
+                if filter.client_data.len() != 1 || filter.client_data[0] > 9 {
+                    return Err(Error::InvalidDefinition(
+                        "deflate filter requires one compression level in 0..=9".into(),
+                    ));
+                }
+                if filter.name.is_some() {
+                    return Err(Error::InvalidDefinition(
+                        "well-known HDF5 deflate filter must not carry a name".into(),
+                    ));
+                }
+            }
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "HDF5 filter id {other} is not implemented for writing"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_write_filters(data: &[u8], filters: &[FilterDescription]) -> Result<Vec<u8>> {
+    let mut current = data.to_vec();
+    for filter in filters {
+        current = match filter.id {
+            FILTER_DEFLATE => deflate_filter(&current, filter)?,
+            other => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "HDF5 filter id {other} is not implemented for writing"
+                )));
+            }
+        };
+    }
+    Ok(current)
+}
+
+fn deflate_filter(data: &[u8], filter: &FilterDescription) -> Result<Vec<u8>> {
+    let level = filter.client_data[0];
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(level));
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
+}
+
 fn ensure_datatype_matches_element<T: H5WriteElement>(datatype: &Datatype) -> Result<()> {
     let expected = T::hdf5_type_with_order(numeric_datatype_order(datatype)?);
     if &expected != datatype {
@@ -1581,6 +1735,18 @@ fn ensure_datatype_matches_element<T: H5WriteElement>(datatype: &Datatype) -> Re
         )));
     }
     Ok(())
+}
+
+fn chunk_count(shape: &[u64], chunk_shape: &[u64]) -> Result<u64> {
+    if shape.contains(&0) {
+        return Ok(0);
+    }
+    shape
+        .iter()
+        .zip(chunk_shape)
+        .try_fold(1u64, |acc, (&dim, &chunk_dim)| {
+            checked_mul_u64(acc, dim.div_ceil(chunk_dim), "chunk count")
+        })
 }
 
 fn chunked_storage_data(
