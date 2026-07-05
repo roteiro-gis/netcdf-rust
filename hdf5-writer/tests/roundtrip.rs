@@ -3,7 +3,7 @@ use std::io::Cursor;
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
-    WriteOptions, FILTER_DEFLATE, UNLIMITED,
+    WriteOptions, FILTER_DEFLATE, FILTER_SHUFFLE, UNLIMITED,
 };
 
 #[test]
@@ -443,6 +443,64 @@ fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
         slice.as_slice_memory_order().unwrap(),
         &[8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23, 26, 27, 28, 29]
     );
+}
+
+#[test]
+fn writes_shuffle_deflate_dataset() {
+    let values = (0_i32..30).map(|value| value * 257).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("compressed", vec![5, 6], &values)
+                .unwrap()
+                .chunked(vec![2, 3])
+                .filter(FilterDescription {
+                    id: FILTER_SHUFFLE,
+                    name: None,
+                    client_data: Vec::new(),
+                })
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/compressed").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[5, 6]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn rejects_shuffle_with_wrong_element_size() {
+    let values = (0_i32..12).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("bad_shuffle", vec![3, 4], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_SHUFFLE,
+                    name: None,
+                    client_data: vec![8],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+    assert!(err.to_string().contains("shuffle filter element size"));
 }
 
 #[test]
