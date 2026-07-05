@@ -248,6 +248,138 @@ fn writes_nc4_multidimensional_variable_with_hidden_dimension_scales() {
 }
 
 #[test]
+fn writes_nc4_unlimited_dimension_variables() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let time_var = builder.add_variable::<i32>("time", &[time]).unwrap();
+    let temp = builder
+        .add_variable::<f32>("temp", &[time, station])
+        .unwrap();
+
+    builder.write_variable(time_var, &[0_i32, 1, 2]).unwrap();
+    builder
+        .write_variable(temp, &[10.0_f32, 11.0, 20.0, 21.0, 30.0, 31.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert!(time_dim.is_unlimited);
+    assert!(!file.dimension("station").unwrap().is_unlimited);
+
+    let time_variable = file.variable("time").unwrap();
+    assert!(time_variable.is_coordinate_variable_for("time"));
+    let time_values = file.read_variable::<i32>("time").unwrap();
+    assert_eq!(time_values.as_slice_memory_order().unwrap(), &[0, 1, 2]);
+
+    let temp_values = file.read_variable::<f32>("temp").unwrap();
+    assert_eq!(temp_values.shape(), &[3, 2]);
+    assert_eq!(
+        temp_values.as_slice_memory_order().unwrap(),
+        &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
+    );
+}
+
+#[test]
+fn writes_nc4_zero_record_unlimited_dimension_variables() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let time_var = builder.add_variable::<i32>("time", &[time]).unwrap();
+    let temp = builder
+        .add_variable::<f32>("temp", &[time, station])
+        .unwrap();
+
+    builder.write_variable(time_var, &[] as &[i32]).unwrap();
+    builder.write_variable(temp, &[] as &[f32]).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    assert_eq!(time_dim.size, 0);
+    assert!(time_dim.is_unlimited);
+    assert!(!file.dimension("station").unwrap().is_unlimited);
+
+    let time_values = file.read_variable::<i32>("time").unwrap();
+    assert_eq!(time_values.shape(), &[0]);
+    assert!(time_values.as_slice_memory_order().unwrap().is_empty());
+
+    let temp_values = file.read_variable::<f32>("temp").unwrap();
+    assert_eq!(temp_values.shape(), &[0, 2]);
+    assert!(temp_values.as_slice_memory_order().unwrap().is_empty());
+}
+
+#[test]
+fn writes_nc4_multiple_unlimited_dimensions() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let time_var = builder.add_variable::<i32>("time", &[time]).unwrap();
+    let member_var = builder.add_variable::<i32>("member", &[member]).unwrap();
+    let temp = builder
+        .add_variable::<f32>("temp", &[time, member])
+        .unwrap();
+
+    builder.write_variable(time_var, &[0_i32, 1, 2]).unwrap();
+    builder.write_variable(member_var, &[10_i32, 20]).unwrap();
+    builder
+        .write_variable(temp, &[10.0_f32, 11.0, 20.0, 21.0, 30.0, 31.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    let member_dim = file.dimension("member").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert_eq!(member_dim.size, 2);
+    assert!(time_dim.is_unlimited);
+    assert!(member_dim.is_unlimited);
+
+    let temp_values = file.read_variable::<f32>("temp").unwrap();
+    assert_eq!(temp_values.shape(), &[3, 2]);
+    assert_eq!(
+        temp_values.as_slice_memory_order().unwrap(),
+        &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
+    );
+}
+
+#[test]
+fn rejects_nc4_classic_multiple_unlimited_dimensions() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let time_var = builder.add_variable::<i32>("time", &[time]).unwrap();
+    let member_var = builder.add_variable::<i32>("member", &[member]).unwrap();
+
+    builder.write_variable(time_var, &[0_i32, 1]).unwrap();
+    builder.write_variable(member_var, &[10_i32, 20]).unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("at most one unlimited"));
+}
+
+#[test]
 fn rejects_nc4_dimension_scale_name_conflict() {
     let mut builder = NcFileBuilder::new();
     let x = builder.add_dimension("x", 2).unwrap();

@@ -196,14 +196,13 @@ pub fn collect_implicit_chunk_entries(
     elem_size: usize,
     chunk_bounds: Option<(&[u64], &[u64])>,
 ) -> Result<Vec<ChunkEntry>> {
-    let chunk_elements = chunk_dims.iter().try_fold(1u64, |acc, &dim| {
-        checked_mul_u64(acc, u64::from(dim), "implicit chunk element count")
-    })?;
-    let elem_size = u64::try_from(elem_size).map_err(|_| {
-        Error::InvalidData("implicit chunk element size exceeds u64 capacity".to_string())
-    })?;
-    let chunk_bytes = checked_mul_u64(chunk_elements, elem_size, "implicit chunk byte size")?;
     let ndim = dataset_shape.len();
+    if chunk_dims.len() != ndim {
+        return Err(Error::InvalidData(format!(
+            "implicit chunk rank {} does not match dataset rank {ndim}",
+            chunk_dims.len()
+        )));
+    }
 
     // Compute how many chunks along each dimension
     let mut chunks_per_dim = Vec::with_capacity(ndim);
@@ -216,6 +215,17 @@ pub fn collect_implicit_chunk_entries(
         }
         chunks_per_dim.push(dataset_shape[i].div_ceil(chunk_dim));
     }
+    if dataset_shape.contains(&0) {
+        return Ok(Vec::new());
+    }
+
+    let chunk_elements = chunk_dims.iter().try_fold(1u64, |acc, &dim| {
+        checked_mul_u64(acc, u64::from(dim), "implicit chunk element count")
+    })?;
+    let elem_size = u64::try_from(elem_size).map_err(|_| {
+        Error::InvalidData("implicit chunk element size exceeds u64 capacity".to_string())
+    })?;
+    let chunk_bytes = checked_mul_u64(chunk_elements, elem_size, "implicit chunk byte size")?;
 
     if ndim == 0 {
         return Ok(vec![ChunkEntry {
@@ -344,6 +354,12 @@ mod tests {
         assert_eq!(entries[1].offsets, vec![0, 10]);
         assert_eq!(entries[2].offsets, vec![5, 0]);
         assert_eq!(entries[3].offsets, vec![5, 10]);
+    }
+
+    #[test]
+    fn implicit_chunk_entries_empty_extent() {
+        let entries = collect_implicit_chunk_entries(1000, &[0, 20], &[5, 10], 4, None).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

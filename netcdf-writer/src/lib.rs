@@ -15,6 +15,7 @@ use hdf5_writer::{
     DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype, Hdf5Builder, Hdf5Writer,
     ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
     StringPadding as H5StringPadding, VarLenKind as H5VarLenKind, WriteOptions as H5WriteOptions,
+    UNLIMITED as H5_UNLIMITED,
 };
 
 pub use netcdf_core::{
@@ -197,11 +198,6 @@ impl NcFileBuilder {
         let name = name.into();
         validate_name(&name, "dimension")?;
         self.ensure_unique_dimension(&name)?;
-        if self.dimensions.iter().any(|d| d.is_unlimited) {
-            return Err(Error::InvalidDefinition(
-                "classic NetCDF supports at most one unlimited dimension".into(),
-            ));
-        }
         let id = DimensionId(self.dimensions.len());
         self.dimensions.push(DimensionDef {
             name,
@@ -348,6 +344,7 @@ impl NcFileBuilder {
     #[cfg(feature = "netcdf4")]
     fn validate_for_nc4_bridge(&self, format: NcFormat) -> Result<()> {
         if format == NcFormat::Nc4Classic {
+            validate_nc4_classic_model(self)?;
             for variable in &self.variables {
                 validate_classic_type(&variable.dtype)?;
                 for attr in &variable.attributes {
@@ -358,17 +355,9 @@ impl NcFileBuilder {
                 validate_nc4_classic_attr_value(&attr.value)?;
             }
         }
-        if self
-            .dimensions
-            .iter()
-            .any(|dimension| dimension.is_unlimited)
-        {
-            return Err(Error::UnsupportedFeature(
-                "NetCDF-4 unlimited dimensions require chunked HDF5 emission".into(),
-            ));
-        }
+        let dimension_sizes = self.nc4_dimension_sizes()?;
         for variable in &self.variables {
-            let expected = expected_variable_bytes(self, variable, false)?;
+            let expected = expected_nc4_variable_bytes(variable, &dimension_sizes)?;
             if variable.data.len() != expected {
                 return Err(Error::DataLengthMismatch {
                     expected,
@@ -398,6 +387,7 @@ impl NcFileBuilder {
     #[cfg(feature = "netcdf4")]
     fn build_hdf5_plan(&self, format: NcFormat) -> Result<hdf5_writer::Hdf5WritePlan> {
         let mut builder = Hdf5Builder::new();
+        let dimension_sizes = self.nc4_dimension_sizes()?;
         if format == NcFormat::Nc4Classic {
             builder = builder.attribute(
                 H5AttributeBuilder::scalar("_nc3_strict", 1_i32)
@@ -415,22 +405,30 @@ impl NcFileBuilder {
             {
                 continue;
             }
-            let zeros = vec![0_i32; checked_usize(dimension.size, "dimension scale size")?];
-            let dataset =
-                H5DatasetBuilder::typed_data(&dimension.name, vec![dimension.size], &zeros)
-                    .map_err(hdf5_error_to_unsupported)?
-                    .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
-                    .attribute(H5AttributeBuilder::fixed_string(
-                        "NAME",
-                        format!(
-                            "This is a netCDF dimension but not a netCDF variable. {}",
-                            dimension.name
-                        ),
-                    ))
-                    .attribute(
-                        H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
-                            .map_err(hdf5_error_to_unsupported)?,
-                    );
+            let size = dimension_sizes[dim_id];
+            let zeros = vec![0_i32; checked_usize(size, "dimension scale size")?];
+            let mut dataset = H5DatasetBuilder::typed_data(&dimension.name, vec![size], &zeros)
+                .map_err(hdf5_error_to_unsupported)?
+                .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+                .attribute(H5AttributeBuilder::fixed_string(
+                    "NAME",
+                    format!(
+                        "This is a netCDF dimension but not a netCDF variable. {}",
+                        dimension.name
+                    ),
+                ))
+                .attribute(
+                    H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
+                        .map_err(hdf5_error_to_unsupported)?,
+                );
+            if dimension.is_unlimited {
+                dataset = dataset
+                    .max_shape(vec![H5_UNLIMITED])
+                    .chunked(nc4_default_chunk_shape(
+                        &[size],
+                        std::mem::size_of::<i32>(),
+                    )?);
+            }
             builder = builder.dataset(dataset);
         }
 
@@ -438,7 +436,7 @@ impl NcFileBuilder {
             let shape = variable
                 .dim_ids
                 .iter()
-                .map(|id| self.dimensions[id.0].size)
+                .map(|id| dimension_sizes[id.0])
                 .collect::<Vec<_>>();
             let data = convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?;
             let mut dataset = H5DatasetBuilder::new(
@@ -447,6 +445,11 @@ impl NcFileBuilder {
                 shape.clone(),
             )
             .raw_data(data);
+            if let Some(max_shape) = self.nc4_variable_max_shape(variable) {
+                dataset = dataset
+                    .max_shape(max_shape)
+                    .chunked(nc4_default_chunk_shape(&shape, variable.dtype.size()?)?);
+            }
 
             if self.variable_is_coordinate_scale(variable)? {
                 let dim_id = variable.dim_ids[0];
@@ -474,6 +477,33 @@ impl NcFileBuilder {
         }
 
         builder.into_plan().map_err(hdf5_error_to_unsupported)
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn nc4_dimension_sizes(&self) -> Result<Vec<u64>> {
+        infer_nc4_dimension_sizes(self)
+    }
+
+    #[cfg(feature = "netcdf4")]
+    fn nc4_variable_max_shape(&self, variable: &VariableDef) -> Option<Vec<u64>> {
+        variable
+            .dim_ids
+            .iter()
+            .any(|id| self.dimensions[id.0].is_unlimited)
+            .then(|| {
+                variable
+                    .dim_ids
+                    .iter()
+                    .map(|id| {
+                        let dimension = &self.dimensions[id.0];
+                        if dimension.is_unlimited {
+                            H5_UNLIMITED
+                        } else {
+                            dimension.size
+                        }
+                    })
+                    .collect()
+            })
     }
 
     #[cfg(feature = "netcdf4")]
@@ -1193,6 +1223,120 @@ fn expected_variable_bytes(
         .map_err(|_| Error::InvalidDefinition("variable byte size exceeds platform usize".into()))
 }
 
+#[cfg(feature = "netcdf4")]
+fn expected_nc4_variable_bytes(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<usize> {
+    let elements = variable.dim_ids.iter().try_fold(1u64, |acc, id| {
+        checked_mul_u64(
+            acc,
+            dimension_sizes[id.0],
+            "NetCDF-4 variable element count",
+        )
+    })?;
+    let bytes = checked_mul_u64(
+        elements,
+        variable.dtype.size()? as u64,
+        "NetCDF-4 variable byte size",
+    )?;
+    usize::try_from(bytes).map_err(|_| {
+        Error::InvalidDefinition("NetCDF-4 variable byte size exceeds platform usize".into())
+    })
+}
+
+#[cfg(feature = "netcdf4")]
+fn infer_nc4_dimension_sizes(builder: &NcFileBuilder) -> Result<Vec<u64>> {
+    let mut sizes = builder
+        .dimensions
+        .iter()
+        .map(|dimension| {
+            if dimension.is_unlimited {
+                None
+            } else {
+                Some(dimension.size)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    loop {
+        let mut changed = false;
+        for variable in &builder.variables {
+            changed |= infer_nc4_dimension_size_from_variable(builder, variable, &mut sizes)?;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for variable in &builder.variables {
+        let unresolved = variable
+            .dim_ids
+            .iter()
+            .copied()
+            .filter(|id| sizes[id.0].is_none())
+            .collect::<Vec<_>>();
+        if !unresolved.is_empty() && !variable.data.is_empty() {
+            let names = unresolved
+                .iter()
+                .map(|id| builder.dimensions[id.0].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidDefinition(format!(
+                "cannot infer current size for NetCDF-4 unlimited dimension(s) {names} from variable '{}'",
+                variable.name
+            )));
+        }
+    }
+
+    Ok(sizes.into_iter().map(|size| size.unwrap_or(0)).collect())
+}
+
+#[cfg(feature = "netcdf4")]
+fn infer_nc4_dimension_size_from_variable(
+    builder: &NcFileBuilder,
+    variable: &VariableDef,
+    sizes: &mut [Option<u64>],
+) -> Result<bool> {
+    let elem_size = variable.dtype.size()? as u64;
+    let data_len = variable.data.len() as u64;
+    if data_len % elem_size != 0 {
+        return Err(Error::DataLengthMismatch {
+            expected: usize::try_from((data_len / elem_size + 1) * elem_size).unwrap_or(usize::MAX),
+            actual: variable.data.len(),
+        });
+    }
+    let elements = data_len / elem_size;
+    let mut known_product = 1u64;
+    let mut unknown = Vec::new();
+    for dim_id in &variable.dim_ids {
+        match sizes[dim_id.0] {
+            Some(size) => {
+                known_product =
+                    checked_mul_u64(known_product, size, "NetCDF-4 known dimension product")?;
+            }
+            None if !unknown.contains(dim_id) => unknown.push(*dim_id),
+            None => {
+                return Err(Error::UnsupportedFeature(format!(
+                    "NetCDF-4 variable '{}' repeats unlimited dimension '{}'",
+                    variable.name, builder.dimensions[dim_id.0].name
+                )));
+            }
+        }
+    }
+
+    if unknown.len() != 1 || known_product == 0 {
+        return Ok(false);
+    }
+    if elements % known_product != 0 {
+        return Err(Error::DataLengthMismatch {
+            expected: usize::try_from((elements / known_product + 1) * known_product * elem_size)
+                .unwrap_or(usize::MAX),
+            actual: variable.data.len(),
+        });
+    }
+    let inferred = elements / known_product;
+    sizes[unknown[0].0] = Some(inferred);
+    Ok(true)
+}
+
 fn variable_shape_elements(
     builder: &NcFileBuilder,
     variable: &VariableDef,
@@ -1279,6 +1423,54 @@ fn validate_nc4_classic_attr_value(value: &NcAttrValue) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "netcdf4")]
+fn validate_nc4_classic_model(builder: &NcFileBuilder) -> Result<()> {
+    let unlimited_count = builder
+        .dimensions
+        .iter()
+        .filter(|dimension| dimension.is_unlimited)
+        .count();
+    if unlimited_count > 1 {
+        return Err(Error::InvalidDefinition(
+            "classic NetCDF supports at most one unlimited dimension".into(),
+        ));
+    }
+    for variable in &builder.variables {
+        if variable
+            .dim_ids
+            .iter()
+            .skip(1)
+            .any(|id| builder.dimensions[id.0].is_unlimited)
+        {
+            return Err(Error::InvalidDefinition(format!(
+                "record dimension must be first for variable '{}'",
+                variable.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc4_default_chunk_shape(shape: &[u64], element_size: usize) -> Result<Vec<u64>> {
+    if shape.is_empty() {
+        return Err(Error::InvalidDefinition(
+            "chunked NetCDF-4 scalar variables are not supported".into(),
+        ));
+    }
+    let element_size = element_size.max(1);
+    let target_elements = (1024usize * 1024usize / element_size).max(1) as u64;
+    let mut remaining = target_elements;
+    let mut chunk_shape = vec![1u64; shape.len()];
+    for dim in (0..shape.len()).rev() {
+        let extent = shape[dim].max(1);
+        let chunk = extent.min(remaining.max(1));
+        chunk_shape[dim] = chunk;
+        remaining = (remaining / chunk).max(1);
+    }
+    Ok(chunk_shape)
+}
+
 fn attr_requires_cdf5(value: &NcAttrValue) -> bool {
     matches!(
         value,
@@ -1363,6 +1555,12 @@ fn pad4_u64(value: u64) -> Result<u64> {
 
 fn checked_add(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
     lhs.checked_add(rhs)
+        .ok_or_else(|| Error::InvalidDefinition(format!("{context} overflow")))
+}
+
+#[cfg(feature = "netcdf4")]
+fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_mul(rhs)
         .ok_or_else(|| Error::InvalidDefinition(format!("{context} overflow")))
 }
 

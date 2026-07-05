@@ -97,3 +97,18 @@ fn writes_interleaved_record_variables() {
     let qc_data = file.read_variable::<i16>("qc").unwrap();
     assert_eq!(qc_data.as_slice_memory_order().unwrap(), &[1, 2, 3]);
 }
+
+#[test]
+fn rejects_multiple_unlimited_dimensions_for_classic_writes() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let time_var = builder.add_variable::<i32>("time", &[time]).unwrap();
+    let member_var = builder.add_variable::<i32>("member", &[member]).unwrap();
+
+    builder.write_variable(time_var, &[0_i32, 1]).unwrap();
+    builder.write_variable(member_var, &[10_i32, 20]).unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(err.to_string().contains("at most one unlimited"));
+}
