@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use hdf5_reader::Hdf5File;
+use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
     WriteOptions, FILTER_DEFLATE, UNLIMITED,
@@ -395,13 +395,13 @@ fn writes_single_chunk_deflate_dataset() {
 }
 
 #[test]
-fn rejects_multi_chunk_filtered_dataset() {
-    let values = (0_i32..16).collect::<Vec<_>>();
+fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
+    let values = (0_i32..30).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
         .dataset(
-            DatasetBuilder::typed_data("compressed", vec![4, 4], &values)
+            DatasetBuilder::typed_data("compressed", vec![5, 6], &values)
                 .unwrap()
-                .chunked(vec![2, 2])
+                .chunked(vec![2, 3])
                 .filter(FilterDescription {
                     id: FILTER_DEFLATE,
                     name: None,
@@ -411,11 +411,38 @@ fn rejects_multi_chunk_filtered_dataset() {
         .into_plan()
         .unwrap();
 
-    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
         .finish(plan)
-        .unwrap_err();
+        .unwrap();
+    let bytes = cursor.into_inner();
 
-    assert!(err.to_string().contains("single chunk"));
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/compressed").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[5, 6]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+
+    let selection = SliceInfo {
+        selections: vec![
+            SliceInfoElem::Slice {
+                start: 1,
+                end: 5,
+                step: 1,
+            },
+            SliceInfoElem::Slice {
+                start: 2,
+                end: 6,
+                step: 1,
+            },
+        ],
+    };
+    let slice = dataset.read_slice::<i32>(&selection).unwrap();
+    assert_eq!(slice.shape(), &[4, 4]);
+    assert_eq!(
+        slice.as_slice_memory_order().unwrap(),
+        &[8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23, 26, 27, 28, 29]
+    );
 }
 
 #[test]

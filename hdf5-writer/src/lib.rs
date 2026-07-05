@@ -764,12 +764,21 @@ struct DatasetEmission<'a> {
     header_address: u64,
     data_address: u64,
     header: Vec<u8>,
+    chunk_index: Option<FixedArrayChunkIndexEmission>,
 }
 
 #[derive(Debug)]
 struct GroupEmission {
     header_address: u64,
     header: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct FixedArrayChunkIndexEmission {
+    header_address: u64,
+    data_block_address: u64,
+    header: Vec<u8>,
+    data_block: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -917,6 +926,43 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         );
     }
 
+    let mut chunk_index_addresses = Vec::with_capacity(prepared.len());
+    for prepared_dataset in &prepared {
+        if let Some(chunk_index) = &prepared_dataset.chunk_index {
+            let header_address = next_address;
+            let placeholder_header =
+                encode_fixed_array_chunk_index_header(fixed_array_entry_count(chunk_index)?, 0)?;
+            next_address = align_u64(
+                checked_add_u64(
+                    next_address,
+                    placeholder_header.len() as u64,
+                    "fixed array chunk index header end",
+                )?,
+                8,
+            );
+
+            let data_block_address = next_address;
+            let placeholder_entries = fixed_array_entries(chunk_index, 0)?;
+            let placeholder_data_block =
+                encode_fixed_array_chunk_index_data_block(header_address, &placeholder_entries)?;
+            next_address = align_u64(
+                checked_add_u64(
+                    next_address,
+                    placeholder_data_block.len() as u64,
+                    "fixed array chunk index data block end",
+                )?,
+                8,
+            );
+
+            chunk_index_addresses.push(Some(FixedArrayChunkIndexAddresses {
+                header: header_address,
+                data_block: data_block_address,
+            }));
+        } else {
+            chunk_index_addresses.push(None);
+        }
+    }
+
     let mut data_addresses = Vec::with_capacity(prepared.len());
     for prepared_dataset in &prepared {
         data_addresses.push(next_address);
@@ -979,20 +1025,40 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
-    for (((prepared_dataset, attributes), header_address), data_address) in prepared
-        .iter()
-        .zip(&planned_attributes.datasets)
-        .zip(header_addresses.iter().copied())
-        .zip(data_addresses.iter().copied())
+    for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
+        prepared
+            .iter()
+            .zip(&planned_attributes.datasets)
+            .zip(header_addresses.iter().copied())
+            .zip(data_addresses.iter().copied())
+            .zip(chunk_index_addresses.iter().copied())
     {
+        let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
-            encode_dataset_header(prepared_dataset, attributes, data_address, heap_address)?;
+            encode_dataset_header(prepared_dataset, attributes, layout_address, heap_address)?;
+        let chunk_index = if let (Some(chunk_index), Some(addresses)) =
+            (&prepared_dataset.chunk_index, chunk_index_address)
+        {
+            let entries = fixed_array_entries(chunk_index, data_address)?;
+            Some(FixedArrayChunkIndexEmission {
+                header_address: addresses.header,
+                data_block_address: addresses.data_block,
+                header: encode_fixed_array_chunk_index_header(
+                    fixed_array_entry_count(chunk_index)?,
+                    addresses.data_block,
+                )?,
+                data_block: encode_fixed_array_chunk_index_data_block(addresses.header, &entries)?,
+            })
+        } else {
+            None
+        };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
             raw_data: &prepared_dataset.raw_data,
             header_address,
             data_address,
             header,
+            chunk_index,
         });
     }
 
@@ -1010,6 +1076,15 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     for emission in &emissions {
         pad_to_address(&mut file, emission.header_address)?;
         file.extend_from_slice(&emission.header);
+    }
+
+    for emission in &emissions {
+        if let Some(chunk_index) = &emission.chunk_index {
+            pad_to_address(&mut file, chunk_index.header_address)?;
+            file.extend_from_slice(&chunk_index.header);
+            pad_to_address(&mut file, chunk_index.data_block_address)?;
+            file.extend_from_slice(&chunk_index.data_block);
+        }
     }
 
     for emission in &emissions {
@@ -1033,6 +1108,25 @@ struct PreparedDataset<'a> {
     dataset: &'a DatasetBuilder,
     raw_data: Vec<u8>,
     data_size: u64,
+    chunk_index: Option<PreparedChunkIndex>,
+}
+
+#[derive(Debug)]
+struct PreparedChunkIndex {
+    chunks: Vec<PreparedChunkIndexEntry>,
+}
+
+#[derive(Debug)]
+struct PreparedChunkIndexEntry {
+    relative_address: u64,
+    size: u64,
+    filter_mask: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FixedArrayChunkIndexAddresses {
+    header: u64,
+    data_block: u64,
 }
 
 fn prepare_datasets(
@@ -1053,7 +1147,7 @@ fn prepare_datasets(
             }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
-        let storage_data = if let Some(raw_data) = dataset.raw_data.as_deref() {
+        let (storage_data, chunk_index) = if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
                     "dataset '{}' expects {expected} data bytes, got {}",
@@ -1062,10 +1156,40 @@ fn prepare_datasets(
                 )));
             }
             match &dataset.layout {
-                PlannedLayout::Contiguous => raw_data.to_vec(),
-                PlannedLayout::Compact => raw_data.to_vec(),
+                PlannedLayout::Contiguous => (raw_data.to_vec(), None),
+                PlannedLayout::Compact => (raw_data.to_vec(), None),
                 PlannedLayout::Chunked { chunk_shape } => {
-                    chunked_storage_data(raw_data, &dataset.shape, chunk_shape, element_size)?
+                    if dataset.filters.is_empty() {
+                        (
+                            chunked_storage_data(
+                                raw_data,
+                                &dataset.shape,
+                                chunk_shape,
+                                element_size,
+                            )?,
+                            None,
+                        )
+                    } else if chunk_count(&dataset.shape, chunk_shape)? <= 1 {
+                        let storage_data = chunked_storage_data(
+                            raw_data,
+                            &dataset.shape,
+                            chunk_shape,
+                            element_size,
+                        )?;
+                        if storage_data.is_empty() {
+                            (storage_data, None)
+                        } else {
+                            (apply_write_filters(&storage_data, &dataset.filters)?, None)
+                        }
+                    } else {
+                        filtered_chunk_storage_data(
+                            raw_data,
+                            &dataset.shape,
+                            chunk_shape,
+                            element_size,
+                            &dataset.filters,
+                        )?
+                    }
                 }
             }
         } else if dataset.fill_value.is_some() {
@@ -1075,17 +1199,12 @@ fn prepare_datasets(
                     dataset.name
                 )));
             }
-            Vec::new()
+            (Vec::new(), None)
         } else {
             return Err(Error::InvalidDefinition(format!(
                 "dataset '{}' has no raw data for binary emission",
                 dataset.name
             )));
-        };
-        let storage_data = if !dataset.filters.is_empty() && !storage_data.is_empty() {
-            apply_write_filters(&storage_data, &dataset.filters)?
-        } else {
-            storage_data
         };
         let data_size = u64::try_from(storage_data.len()).map_err(|_| {
             Error::InvalidDefinition(format!(
@@ -1098,6 +1217,7 @@ fn prepare_datasets(
             dataset,
             raw_data: storage_data,
             data_size,
+            chunk_index,
         });
     }
     Ok(prepared)
@@ -1265,6 +1385,40 @@ fn resolve_planned_links(
             Ok((link.name.clone(), address))
         })
         .collect()
+}
+
+#[derive(Debug)]
+struct FixedArrayChunkEntry {
+    address: u64,
+    size: u64,
+    filter_mask: u32,
+}
+
+fn fixed_array_entries(
+    chunk_index: &PreparedChunkIndex,
+    data_address: u64,
+) -> Result<Vec<FixedArrayChunkEntry>> {
+    chunk_index
+        .chunks
+        .iter()
+        .map(|chunk| {
+            Ok(FixedArrayChunkEntry {
+                address: checked_add_u64(
+                    data_address,
+                    chunk.relative_address,
+                    "fixed array chunk address",
+                )?,
+                size: chunk.size,
+                filter_mask: chunk.filter_mask,
+            })
+        })
+        .collect()
+}
+
+fn fixed_array_entry_count(chunk_index: &PreparedChunkIndex) -> Result<u64> {
+    u64::try_from(chunk_index.chunks.len()).map_err(|_| {
+        Error::InvalidDefinition("fixed array chunk entry count exceeds u64 capacity".into())
+    })
 }
 
 fn plan_attributes(
@@ -1506,6 +1660,8 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
         PlannedLayout::Chunked { chunk_shape } => {
             if dataset.dataset.filters.is_empty() {
                 encode_implicit_chunked_layout_message(storage_address, chunk_shape)
+            } else if dataset.chunk_index.is_some() {
+                encode_fixed_array_chunked_layout_message(storage_address, chunk_shape)
             } else {
                 encode_single_chunk_layout_message(storage_address, chunk_shape, dataset.data_size)
             }
@@ -1842,6 +1998,75 @@ fn encode_implicit_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> 
     Ok(bytes)
 }
 
+fn encode_fixed_array_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> Result<Vec<u8>> {
+    if chunk_shape.len() > u8::MAX as usize {
+        return Err(Error::InvalidDefinition(
+            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(7 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    bytes.push(4);
+    bytes.push(2);
+    bytes.push(1);
+    bytes.push(chunk_shape.len() as u8);
+    bytes.push(4);
+    for &dim in chunk_shape {
+        let dim = u32::try_from(dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+        })?;
+        bytes.extend_from_slice(&dim.to_le_bytes());
+    }
+    bytes.push(3);
+    bytes.push(0);
+    bytes.extend_from_slice(&address.to_le_bytes());
+    Ok(bytes)
+}
+
+fn encode_fixed_array_chunk_index_header(
+    num_entries: u64,
+    data_block_address: u64,
+) -> Result<Vec<u8>> {
+    let entry_size = u8::try_from(usize::from(OFFSET_SIZE) + usize::from(LENGTH_SIZE) + 4)
+        .map_err(|_| Error::UnsupportedFeature("fixed array entry size exceeds u8".into()))?;
+    let mut bytes = Vec::with_capacity(4 + 1 + 1 + 1 + 1 + 8 + 8 + 4);
+    bytes.extend_from_slice(b"FAHD");
+    bytes.push(0);
+    bytes.push(1);
+    bytes.push(entry_size);
+    bytes.push(0);
+    bytes.extend_from_slice(&num_entries.to_le_bytes());
+    bytes.extend_from_slice(&data_block_address.to_le_bytes());
+    let checksum = jenkins_lookup3(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
+fn encode_fixed_array_chunk_index_data_block(
+    header_address: u64,
+    entries: &[FixedArrayChunkEntry],
+) -> Result<Vec<u8>> {
+    let entry_size = usize::from(OFFSET_SIZE) + usize::from(LENGTH_SIZE) + 4;
+    let entries_len = checked_mul_usize(entries.len(), entry_size, "fixed array entries size")?;
+    let capacity = checked_add_usize(
+        4 + 1 + 1 + usize::from(OFFSET_SIZE),
+        checked_add_usize(entries_len, 4, "fixed array data block size")?,
+        "fixed array data block size",
+    )?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(b"FADB");
+    bytes.push(0);
+    bytes.push(1);
+    bytes.extend_from_slice(&header_address.to_le_bytes());
+    for entry in entries {
+        bytes.extend_from_slice(&entry.address.to_le_bytes());
+        bytes.extend_from_slice(&entry.size.to_le_bytes());
+        bytes.extend_from_slice(&entry.filter_mask.to_le_bytes());
+    }
+    let checksum = jenkins_lookup3(&bytes);
+    bytes.extend_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
 fn class_word(class: u8, version: u8, flags: u32) -> u32 {
     u32::from(class) | (u32::from(version) << 4) | (flags << 8)
 }
@@ -1905,13 +2130,7 @@ fn validate_writer_filters(dataset: &DatasetBuilder) -> Result<()> {
             "filtered HDF5 datasets must use chunked layout".into(),
         ));
     };
-    let chunk_count = chunk_count(&dataset.shape, chunk_shape)?;
-    if chunk_count > 1 {
-        return Err(Error::UnsupportedFeature(format!(
-            "filtered HDF5 dataset '{}' must fit in a single chunk until indexed filtered chunk storage is implemented",
-            dataset.name
-        )));
-    }
+    let _ = chunk_count(&dataset.shape, chunk_shape)?;
     for filter in &dataset.filters {
         match filter.id {
             FILTER_DEFLATE => {
@@ -2070,6 +2289,112 @@ fn chunked_storage_data(
     }
 
     Ok(storage)
+}
+
+fn filtered_chunk_storage_data(
+    raw_data: &[u8],
+    shape: &[u64],
+    chunk_shape: &[u64],
+    element_size: usize,
+    filters: &[FilterDescription],
+) -> Result<(Vec<u8>, Option<PreparedChunkIndex>)> {
+    if shape.is_empty() {
+        return Err(Error::InvalidDefinition(
+            "chunked scalar HDF5 datasets are not supported".into(),
+        ));
+    }
+    if chunk_shape.len() != shape.len() {
+        return Err(Error::InvalidDefinition(
+            "chunk shape rank must match dataset rank".into(),
+        ));
+    }
+
+    let mut chunks_per_dim = Vec::with_capacity(shape.len());
+    for (&dim, &chunk_dim) in shape.iter().zip(chunk_shape) {
+        if chunk_dim == 0 {
+            return Err(Error::InvalidDefinition(
+                "chunk dimensions must be non-zero".into(),
+            ));
+        }
+        u32::try_from(chunk_dim).map_err(|_| {
+            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
+        })?;
+        chunks_per_dim.push(dim.div_ceil(chunk_dim));
+    }
+    if shape.contains(&0) {
+        return Ok((Vec::new(), None));
+    }
+
+    let chunk_elements = chunk_shape.iter().try_fold(1u64, |acc, &dim| {
+        checked_mul_u64(acc, dim, "chunk element count")
+    })?;
+    let element_size_u64 = u64::try_from(element_size).map_err(|_| {
+        Error::InvalidDefinition("datatype element size exceeds u64 capacity".into())
+    })?;
+    let chunk_bytes_u64 = checked_mul_u64(chunk_elements, element_size_u64, "chunk byte length")?;
+    let chunk_bytes = checked_usize(chunk_bytes_u64, "chunk byte length")?;
+    let total_chunks = chunks_per_dim.iter().try_fold(1u64, |acc, &count| {
+        checked_mul_u64(acc, count, "chunk count")
+    })?;
+
+    let dataset_strides = row_major_strides(shape, "dataset stride")?;
+    let chunk_strides = row_major_strides(chunk_shape, "chunk stride")?;
+    let mut chunk_indices = vec![0u64; shape.len()];
+    let mut storage = Vec::new();
+    let mut entries = Vec::with_capacity(checked_usize(total_chunks, "chunk count")?);
+
+    for _ in 0..total_chunks {
+        let mut starts = Vec::with_capacity(shape.len());
+        let mut counts = Vec::with_capacity(shape.len());
+        for ((&chunk_index, &chunk_dim), &dim) in chunk_indices.iter().zip(chunk_shape).zip(shape) {
+            let start = checked_mul_u64(chunk_index, chunk_dim, "chunk start")?;
+            starts.push(start);
+            counts.push((dim - start).min(chunk_dim));
+        }
+        let src_start =
+            starts
+                .iter()
+                .zip(&dataset_strides)
+                .try_fold(0u64, |acc, (&start, &stride)| {
+                    checked_add_u64(
+                        acc,
+                        checked_mul_u64(start, stride, "chunk source element offset")?,
+                        "chunk source element offset",
+                    )
+                })?;
+
+        let mut chunk = vec![0u8; chunk_bytes];
+        copy_chunk_rows(
+            raw_data,
+            &mut chunk,
+            element_size,
+            &dataset_strides,
+            &chunk_strides,
+            &counts,
+            0,
+            src_start,
+            0,
+            0,
+        )?;
+
+        let encoded = apply_write_filters(&chunk, filters)?;
+        let relative_address = u64::try_from(storage.len()).map_err(|_| {
+            Error::InvalidDefinition("filtered chunk storage exceeds u64 capacity".into())
+        })?;
+        let size = u64::try_from(encoded.len()).map_err(|_| {
+            Error::InvalidDefinition("filtered chunk byte length exceeds u64 capacity".into())
+        })?;
+        storage.extend_from_slice(&encoded);
+        entries.push(PreparedChunkIndexEntry {
+            relative_address,
+            size,
+            filter_mask: 0,
+        });
+
+        increment_row_major_index(&mut chunk_indices, &chunks_per_dim);
+    }
+
+    Ok((storage, Some(PreparedChunkIndex { chunks: entries })))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2288,6 +2613,12 @@ fn checked_usize(value: u64, context: &str) -> Result<usize> {
 
 fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
+        Error::InvalidDefinition(format!("{context} exceeds platform usize capacity"))
+    })
+}
+
+fn checked_add_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
         Error::InvalidDefinition(format!("{context} exceeds platform usize capacity"))
     })
 }
