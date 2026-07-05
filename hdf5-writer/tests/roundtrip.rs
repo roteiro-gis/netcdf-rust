@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use hdf5_reader::Hdf5File;
+use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
     WriteOptions, FILTER_DEFLATE, UNLIMITED,
@@ -82,6 +82,97 @@ fn writes_multiple_root_datasets() {
 
     assert_eq!(read_floats.as_slice_memory_order().unwrap(), floats);
     assert_eq!(read_ints.as_slice_memory_order().unwrap(), ints);
+}
+
+#[test]
+fn writes_nested_group_paths() {
+    let x_values = [0_i32, 1];
+    let temperatures = [280.0_f32, 281.5];
+    let quality = [1_i16, 2];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("science/x", vec![2], &x_values)
+                .unwrap()
+                .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE")),
+        )
+        .dataset(
+            DatasetBuilder::typed_data("science/temperature", vec![2], &temperatures)
+                .unwrap()
+                .attribute(AttributeBuilder::vlen_object_references(
+                    "DIMENSION_LIST",
+                    vec![vec!["science/x".to_string()]],
+                )),
+        )
+        .dataset(DatasetBuilder::typed_data("science/quality/qc", vec![2], &quality).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let science = file.group("/science").unwrap();
+    let quality_group = file.group("/science/quality").unwrap();
+    assert_eq!(science.name(), "science");
+    assert_eq!(quality_group.name(), "quality");
+    assert!(file.dataset("/temperature").is_err());
+
+    let x = file.dataset("/science/x").unwrap();
+    let temperature = file.dataset("/science/temperature").unwrap();
+    let qc = file.dataset("/science/quality/qc").unwrap();
+    assert_eq!(
+        x.read_array::<i32>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        x_values
+    );
+    assert_eq!(
+        temperature
+            .read_array::<f32>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        temperatures
+    );
+    assert_eq!(
+        qc.read_array::<i16>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        quality
+    );
+
+    let attr = temperature.attribute("DIMENSION_LIST").unwrap();
+    let heap_addr = u64::from_le_bytes(attr.raw_data[4..12].try_into().unwrap());
+    let heap_index = u32::from_le_bytes(attr.raw_data[12..16].try_into().unwrap()) as u16;
+    let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+        file.storage(),
+        heap_addr,
+        file.superblock().offset_size,
+        file.superblock().length_size,
+    )
+    .unwrap();
+    let heap_object = heap.get_object(heap_index).unwrap();
+    let refs = hdf5_reader::reference::read_object_references(
+        &heap_object.data,
+        file.superblock().offset_size,
+    )
+    .unwrap();
+    assert_eq!(refs, vec![x.address()]);
+}
+
+#[test]
+fn rejects_dataset_path_that_is_also_group() {
+    let err = Hdf5Builder::new()
+        .dataset(DatasetBuilder::typed_data("science", vec![1], &[1_i32]).unwrap())
+        .dataset(DatasetBuilder::typed_data("science/temp", vec![1], &[2_i32]).unwrap())
+        .into_plan()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("implicit HDF5 group"));
 }
 
 #[test]
@@ -304,13 +395,13 @@ fn writes_single_chunk_deflate_dataset() {
 }
 
 #[test]
-fn rejects_multi_chunk_filtered_dataset() {
-    let values = (0_i32..16).collect::<Vec<_>>();
+fn writes_multi_chunk_deflate_dataset_with_fixed_array_index() {
+    let values = (0_i32..30).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
         .dataset(
-            DatasetBuilder::typed_data("compressed", vec![4, 4], &values)
+            DatasetBuilder::typed_data("compressed", vec![5, 6], &values)
                 .unwrap()
-                .chunked(vec![2, 2])
+                .chunked(vec![2, 3])
                 .filter(FilterDescription {
                     id: FILTER_DEFLATE,
                     name: None,
@@ -320,11 +411,38 @@ fn rejects_multi_chunk_filtered_dataset() {
         .into_plan()
         .unwrap();
 
-    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
         .finish(plan)
-        .unwrap_err();
+        .unwrap();
+    let bytes = cursor.into_inner();
 
-    assert!(err.to_string().contains("single chunk"));
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/compressed").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[5, 6]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+
+    let selection = SliceInfo {
+        selections: vec![
+            SliceInfoElem::Slice {
+                start: 1,
+                end: 5,
+                step: 1,
+            },
+            SliceInfoElem::Slice {
+                start: 2,
+                end: 6,
+                step: 1,
+            },
+        ],
+    };
+    let slice = dataset.read_slice::<i32>(&selection).unwrap();
+    assert_eq!(slice.shape(), &[4, 4]);
+    assert_eq!(
+        slice.as_slice_memory_order().unwrap(),
+        &[8, 9, 10, 11, 14, 15, 16, 17, 20, 21, 22, 23, 26, 27, 28, 29]
+    );
 }
 
 #[test]
