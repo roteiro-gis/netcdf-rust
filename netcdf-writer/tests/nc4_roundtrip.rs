@@ -161,6 +161,62 @@ fn writes_nc4_string_vector_attributes() {
 }
 
 #[test]
+fn writes_nc4_string_variable() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 3).unwrap();
+    let variable = builder
+        .add_string_variable("station_name", &[station])
+        .unwrap();
+    builder
+        .write_string_variable(variable, &["alpha", "bravo", "charlie"])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let variable = file.variable("station_name").unwrap();
+    assert_eq!(variable.dtype(), &netcdf_writer::NcType::String);
+    assert_eq!(variable.shape(), vec![3]);
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec![
+            "alpha".to_string(),
+            "bravo".to_string(),
+            "charlie".to_string()
+        ]
+    );
+}
+
+#[test]
+fn writes_nc4_unlimited_string_variable() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_unlimited_dimension("obs").unwrap();
+    let variable = builder.add_string_variable("quality", &[obs]).unwrap();
+    builder
+        .write_string_variable(variable, &["good", "suspect", "bad"])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let obs_dim = file.dimension("obs").unwrap();
+    assert_eq!(obs_dim.size, 3);
+    assert!(obs_dim.is_unlimited);
+    assert_eq!(
+        file.read_variable_as_strings("quality").unwrap(),
+        vec!["good".to_string(), "suspect".to_string(), "bad".to_string()]
+    );
+}
+
+#[test]
 fn writes_nc4_classic_marker() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<f64>("value", &[]).unwrap();
@@ -198,6 +254,23 @@ fn rejects_nc4_classic_string_attributes() {
         .unwrap_err();
 
     assert!(err.to_string().contains("NC_STRING attributes"));
+}
+
+#[test]
+fn rejects_nc4_classic_string_variable() {
+    let mut builder = NcFileBuilder::new();
+    let variable = builder.add_string_variable("name", &[]).unwrap();
+    builder
+        .write_string_variable(variable, &["enhanced"])
+        .unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires NetCDF-4"));
 }
 
 #[test]

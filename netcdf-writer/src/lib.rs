@@ -161,6 +161,7 @@ struct VariableDef {
     dtype: NcType,
     attributes: Vec<NcAttribute>,
     data: Vec<u8>,
+    string_values: Option<Vec<String>>,
 }
 
 /// Builder for a single NetCDF file.
@@ -231,6 +232,14 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, NcType::Char)
     }
 
+    pub fn add_string_variable(
+        &mut self,
+        name: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_with_type(name, dimensions, NcType::String)
+    }
+
     pub fn add_variable_attribute(
         &mut self,
         variable: VariableId,
@@ -263,6 +272,7 @@ impl NcFileBuilder {
             value.write_one_be(&mut data);
         }
         variable.data = data;
+        variable.string_values = None;
         Ok(())
     }
 
@@ -275,6 +285,35 @@ impl NcFileBuilder {
             });
         }
         variable.data = bytes.to_vec();
+        variable.string_values = None;
+        Ok(())
+    }
+
+    pub fn write_string_variable<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        values: &[S],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        if variable.dtype != NcType::String {
+            return Err(Error::TypeMismatch {
+                expected: "String".into(),
+                actual: format!("{:?}", variable.dtype),
+            });
+        }
+
+        let mut strings = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "NC_STRING variable values cannot contain NUL bytes".into(),
+                ));
+            }
+            strings.push(value.to_string());
+        }
+        variable.data.clear();
+        variable.string_values = Some(strings);
         Ok(())
     }
 
@@ -357,13 +396,7 @@ impl NcFileBuilder {
         }
         let dimension_sizes = self.nc4_dimension_sizes()?;
         for variable in &self.variables {
-            let expected = expected_nc4_variable_bytes(variable, &dimension_sizes)?;
-            if variable.data.len() != expected {
-                return Err(Error::DataLengthMismatch {
-                    expected,
-                    actual: variable.data.len(),
-                });
-            }
+            validate_nc4_variable_data(variable, &dimension_sizes)?;
         }
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
             let dimension_id = DimensionId(dim_id);
@@ -438,17 +471,31 @@ impl NcFileBuilder {
                 .iter()
                 .map(|id| dimension_sizes[id.0])
                 .collect::<Vec<_>>();
-            let data = convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?;
-            let mut dataset = H5DatasetBuilder::new(
-                &variable.name,
-                nc_type_to_hdf5(&variable.dtype)?,
-                shape.clone(),
-            )
-            .raw_data(data);
+            let mut dataset = if variable.dtype == NcType::String {
+                let values = variable.string_values.as_ref().ok_or_else(|| {
+                    Error::InvalidDefinition(format!(
+                        "NC_STRING variable '{}' has no string data",
+                        variable.name
+                    ))
+                })?;
+                H5DatasetBuilder::vlen_string_data(&variable.name, shape.clone(), values)
+                    .map_err(hdf5_error_to_unsupported)?
+            } else {
+                let data = convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?;
+                H5DatasetBuilder::new(
+                    &variable.name,
+                    nc_type_to_hdf5(&variable.dtype)?,
+                    shape.clone(),
+                )
+                .raw_data(data)
+            };
             if let Some(max_shape) = self.nc4_variable_max_shape(variable) {
                 dataset = dataset
                     .max_shape(max_shape)
-                    .chunked(nc4_default_chunk_shape(&shape, variable.dtype.size()?)?);
+                    .chunked(nc4_default_chunk_shape(
+                        &shape,
+                        nc4_hdf5_element_size(&variable.dtype)?,
+                    )?);
             }
 
             if self.variable_is_coordinate_scale(variable)? {
@@ -558,6 +605,7 @@ impl NcFileBuilder {
             dtype,
             attributes: Vec::new(),
             data: Vec::new(),
+            string_values: None,
         });
         Ok(id)
     }
@@ -1046,9 +1094,22 @@ fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
             encoding: H5StringEncoding::Ascii,
             padding: H5StringPadding::NullPad,
         }),
+        NcType::String => Ok(H5Datatype::String {
+            size: H5StringSize::Variable,
+            encoding: H5StringEncoding::Utf8,
+            padding: H5StringPadding::NullTerminate,
+        }),
         other => Err(Error::UnsupportedFeature(format!(
             "NetCDF-4 type emission is not implemented for {other:?}"
         ))),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc4_hdf5_element_size(dtype: &NcType) -> Result<usize> {
+    match dtype {
+        NcType::String => Ok(16),
+        other => other.size().map_err(Error::Core),
     }
 }
 
@@ -1226,7 +1287,44 @@ fn expected_variable_bytes(
 }
 
 #[cfg(feature = "netcdf4")]
-fn expected_nc4_variable_bytes(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<usize> {
+fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<()> {
+    let elements = nc4_variable_elements(variable, dimension_sizes)?;
+    if variable.dtype == NcType::String {
+        let values = variable.string_values.as_ref().ok_or_else(|| {
+            Error::InvalidDefinition(format!(
+                "NC_STRING variable '{}' has no string data",
+                variable.name
+            ))
+        })?;
+        let expected = checked_usize(elements, "NetCDF-4 string variable element count")?;
+        if values.len() != expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                actual: values.len(),
+            });
+        }
+        return Ok(());
+    }
+
+    let bytes = checked_mul_u64(
+        elements,
+        variable.dtype.size()? as u64,
+        "NetCDF-4 variable byte size",
+    )?;
+    let expected = usize::try_from(bytes).map_err(|_| {
+        Error::InvalidDefinition("NetCDF-4 variable byte size exceeds platform usize".into())
+    })?;
+    if variable.data.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: variable.data.len(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc4_variable_elements(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<u64> {
     let elements = variable.dim_ids.iter().try_fold(1u64, |acc, id| {
         checked_mul_u64(
             acc,
@@ -1234,14 +1332,7 @@ fn expected_nc4_variable_bytes(variable: &VariableDef, dimension_sizes: &[u64]) 
             "NetCDF-4 variable element count",
         )
     })?;
-    let bytes = checked_mul_u64(
-        elements,
-        variable.dtype.size()? as u64,
-        "NetCDF-4 variable byte size",
-    )?;
-    usize::try_from(bytes).map_err(|_| {
-        Error::InvalidDefinition("NetCDF-4 variable byte size exceeds platform usize".into())
-    })
+    Ok(elements)
 }
 
 #[cfg(feature = "netcdf4")]
@@ -1275,7 +1366,7 @@ fn infer_nc4_dimension_sizes(builder: &NcFileBuilder) -> Result<Vec<u64>> {
             .copied()
             .filter(|id| sizes[id.0].is_none())
             .collect::<Vec<_>>();
-        if !unresolved.is_empty() && !variable.data.is_empty() {
+        if !unresolved.is_empty() && variable_has_data(variable) {
             let names = unresolved
                 .iter()
                 .map(|id| builder.dimensions[id.0].name.as_str())
@@ -1297,15 +1388,7 @@ fn infer_nc4_dimension_size_from_variable(
     variable: &VariableDef,
     sizes: &mut [Option<u64>],
 ) -> Result<bool> {
-    let elem_size = variable.dtype.size()? as u64;
-    let data_len = variable.data.len() as u64;
-    if data_len % elem_size != 0 {
-        return Err(Error::DataLengthMismatch {
-            expected: usize::try_from((data_len / elem_size + 1) * elem_size).unwrap_or(usize::MAX),
-            actual: variable.data.len(),
-        });
-    }
-    let elements = data_len / elem_size;
+    let (elements, elem_size, actual_bytes) = variable_payload_element_count(variable)?;
     let mut known_product = 1u64;
     let mut unknown = Vec::new();
     for dim_id in &variable.dim_ids {
@@ -1331,12 +1414,49 @@ fn infer_nc4_dimension_size_from_variable(
         return Err(Error::DataLengthMismatch {
             expected: usize::try_from((elements / known_product + 1) * known_product * elem_size)
                 .unwrap_or(usize::MAX),
-            actual: variable.data.len(),
+            actual: actual_bytes,
         });
     }
     let inferred = elements / known_product;
     sizes[unknown[0].0] = Some(inferred);
     Ok(true)
+}
+
+#[cfg(feature = "netcdf4")]
+fn variable_has_data(variable: &VariableDef) -> bool {
+    match variable.dtype {
+        NcType::String => variable
+            .string_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty()),
+        _ => !variable.data.is_empty(),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn variable_payload_element_count(variable: &VariableDef) -> Result<(u64, u64, usize)> {
+    if variable.dtype == NcType::String {
+        let values = variable.string_values.as_ref().map_or(0usize, Vec::len);
+        return Ok((
+            u64::try_from(values).map_err(|_| {
+                Error::InvalidDefinition(
+                    "NC_STRING variable element count exceeds u64 capacity".into(),
+                )
+            })?,
+            1,
+            values,
+        ));
+    }
+
+    let elem_size = variable.dtype.size()? as u64;
+    let data_len = variable.data.len() as u64;
+    if data_len % elem_size != 0 {
+        return Err(Error::DataLengthMismatch {
+            expected: usize::try_from((data_len / elem_size + 1) * elem_size).unwrap_or(usize::MAX),
+            actual: variable.data.len(),
+        });
+    }
+    Ok((data_len / elem_size, elem_size, variable.data.len()))
 }
 
 fn variable_shape_elements(

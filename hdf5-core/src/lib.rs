@@ -76,6 +76,39 @@ pub fn jenkins_lookup3(data: &[u8]) -> u32 {
     c
 }
 
+/// Fletcher-32 checksum used by the HDF5 filter pipeline.
+///
+/// Matches HDF5's `H5_checksum_fletcher32`: reads 16-bit big-endian words,
+/// accumulates in batches of 360, and reduces with `(x & 0xffff) + (x >> 16)`.
+pub fn fletcher32(data: &[u8]) -> u32 {
+    let mut sum1: u32 = 0;
+    let mut sum2: u32 = 0;
+    let total_words = data.len() / 2;
+
+    let mut offset = 0usize;
+    let mut remaining = total_words;
+
+    while remaining > 0 {
+        let batch = remaining.min(360);
+        remaining -= batch;
+
+        for _ in 0..batch {
+            let word = ((data[offset] as u32) << 8) | (data[offset + 1] as u32);
+            sum1 += word;
+            sum2 += sum1;
+            offset += 2;
+        }
+
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+    }
+
+    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+
+    (sum2 << 16) | sum1
+}
+
 #[inline]
 fn jenkins_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
     *a = a.wrapping_sub(*c);
@@ -417,5 +450,19 @@ mod tests {
 
         assert_ne!(jenkins_lookup3(&twelve), jenkins_lookup3(&thirteen));
         assert_eq!(jenkins_lookup3(&twelve), jenkins_lookup3(&twelve));
+    }
+
+    #[test]
+    fn fletcher32_is_deterministic() {
+        let data = [0x01, 0x02, 0x03, 0x04];
+
+        assert_eq!(fletcher32(&data), fletcher32(&data));
+    }
+
+    #[test]
+    fn fletcher32_matches_known_reference() {
+        let data = [0x00, 0x01, 0x00, 0x02];
+
+        assert_eq!(fletcher32(&data), 0x0004_0003);
     }
 }

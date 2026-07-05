@@ -9,10 +9,11 @@ use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
 
 pub use hdf5_core::{
-    jenkins_lookup3, ByteOrder, ChunkIndexing, DataLayout, DataspaceMessage, DataspaceType,
-    Datatype, FillTime, FillValueMessage, FilterDescription, FilterPipelineMessage, ReferenceType,
-    StringEncoding, StringPadding, StringSize, VarLenKind, FILTER_DEFLATE, FILTER_FLETCHER32,
-    FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP, UNLIMITED,
+    fletcher32, jenkins_lookup3, ByteOrder, ChunkIndexing, DataLayout, DataspaceMessage,
+    DataspaceType, Datatype, FillTime, FillValueMessage, FilterDescription, FilterPipelineMessage,
+    ReferenceType, StringEncoding, StringPadding, StringSize, VarLenKind, FILTER_DEFLATE,
+    FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP,
+    UNLIMITED,
 };
 
 const HDF5_MAGIC: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -211,6 +212,7 @@ pub struct DatasetBuilder {
     filters: Vec<FilterDescription>,
     fill_value: Option<Vec<u8>>,
     raw_data: Option<Vec<u8>>,
+    vlen_string_values: Option<Vec<String>>,
     attributes: Vec<AttributeBuilder>,
 }
 
@@ -232,6 +234,7 @@ impl DatasetBuilder {
             filters: Vec::new(),
             fill_value: None,
             raw_data: None,
+            vlen_string_values: None,
             attributes: Vec::new(),
         }
     }
@@ -275,6 +278,55 @@ impl DatasetBuilder {
         Ok(Self::new(name, datatype, shape).raw_data(raw_data))
     }
 
+    pub fn vlen_string_data<S: AsRef<str>>(
+        name: impl Into<String>,
+        shape: impl Into<Vec<u64>>,
+        values: &[S],
+    ) -> Result<Self> {
+        let name = name.into();
+        let shape = shape.into();
+        let expected = expected_element_count(&shape)?;
+        if values.len() != expected {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' expects {expected} string elements, got {}",
+                name,
+                values.len()
+            )));
+        }
+
+        let mut strings = Vec::with_capacity(values.len());
+        let mut encoding = StringEncoding::Ascii;
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "variable-length string values cannot contain NUL bytes".into(),
+                ));
+            }
+            if !value.is_ascii() {
+                encoding = StringEncoding::Utf8;
+            }
+            strings.push(value.to_string());
+        }
+
+        Ok(Self {
+            name,
+            datatype: Datatype::String {
+                size: StringSize::Variable,
+                encoding,
+                padding: StringPadding::NullTerminate,
+            },
+            shape,
+            max_shape: None,
+            layout: PlannedLayout::Contiguous,
+            filters: Vec::new(),
+            fill_value: None,
+            raw_data: None,
+            vlen_string_values: Some(strings),
+            attributes: Vec::new(),
+        })
+    }
+
     pub fn max_shape(mut self, max_shape: impl Into<Vec<u64>>) -> Self {
         self.max_shape = Some(max_shape.into());
         self
@@ -304,6 +356,7 @@ impl DatasetBuilder {
 
     pub fn raw_data(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.raw_data = Some(bytes.into());
+        self.vlen_string_values = None;
         self
     }
 
@@ -324,6 +377,7 @@ impl DatasetBuilder {
             value.write_one(byte_order, &mut bytes);
         }
         self.raw_data = Some(bytes);
+        self.vlen_string_values = None;
         Ok(self)
     }
 
@@ -760,7 +814,7 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
 #[derive(Debug)]
 struct DatasetEmission<'a> {
     dataset: &'a DatasetBuilder,
-    raw_data: &'a [u8],
+    raw_data: Vec<u8>,
     header_address: u64,
     data_address: u64,
     header: Vec<u8>,
@@ -818,6 +872,7 @@ struct GlobalHeapObjectPlan {
 struct PlannedAttributes {
     root: Vec<PlannedAttribute>,
     datasets: Vec<Vec<PlannedAttribute>>,
+    dataset_vlen_refs: Vec<Option<Vec<VLenHeapReference>>>,
     heap_objects: Vec<GlobalHeapObjectPlan>,
 }
 
@@ -845,17 +900,20 @@ impl PlannedAttribute {
         match &self.raw_data {
             PlannedAttributeRaw::Inline(raw_data) => raw_data.clone(),
             PlannedAttributeRaw::GlobalHeapVLenReferences(refs) => {
-                let mut raw_data =
-                    Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
-                for reference in refs {
-                    raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
-                    raw_data.extend_from_slice(&heap_address.to_le_bytes());
-                    raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
-                }
-                raw_data
+                encode_vlen_heap_references(refs, heap_address)
             }
         }
     }
+}
+
+fn encode_vlen_heap_references(refs: &[VLenHeapReference], heap_address: u64) -> Vec<u8> {
+    let mut raw_data = Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
+    for reference in refs {
+        raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
+        raw_data.extend_from_slice(&heap_address.to_le_bytes());
+        raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
+    }
+    raw_data
 }
 
 fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u8>> {
@@ -1025,13 +1083,16 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
-    for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
-        prepared
-            .iter()
-            .zip(&planned_attributes.datasets)
-            .zip(header_addresses.iter().copied())
-            .zip(data_addresses.iter().copied())
-            .zip(chunk_index_addresses.iter().copied())
+    for (
+        dataset_index,
+        ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address),
+    ) in prepared
+        .iter()
+        .zip(&planned_attributes.datasets)
+        .zip(header_addresses.iter().copied())
+        .zip(data_addresses.iter().copied())
+        .zip(chunk_index_addresses.iter().copied())
+        .enumerate()
     {
         let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
@@ -1052,9 +1113,14 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         } else {
             None
         };
+        let raw_data = if let Some(refs) = &planned_attributes.dataset_vlen_refs[dataset_index] {
+            dataset_vlen_string_storage_data(prepared_dataset.dataset, refs, heap_address)?
+        } else {
+            prepared_dataset.raw_data.clone()
+        };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
-            raw_data: &prepared_dataset.raw_data,
+            raw_data,
             header_address,
             data_address,
             header,
@@ -1090,7 +1156,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     for emission in &emissions {
         if !matches!(emission.dataset.layout, PlannedLayout::Compact) {
             pad_to_address(&mut file, emission.data_address)?;
-            file.extend_from_slice(emission.raw_data);
+            file.extend_from_slice(&emission.raw_data);
         }
     }
 
@@ -1148,7 +1214,43 @@ fn prepare_datasets(
             }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
-        let (storage_data, chunk_index) = if let Some(raw_data) = dataset.raw_data.as_deref() {
+        let (storage_data, chunk_index) = if let Some(values) = &dataset.vlen_string_values {
+            if dataset.fill_value.is_some() {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' cannot combine variable-length strings with a fill value",
+                    dataset.name
+                )));
+            }
+            if matches!(dataset.layout, PlannedLayout::Compact) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compact variable-length string HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            if !filters.is_empty() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "filtered variable-length string HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            let refs = placeholder_vlen_string_references(&dataset.name, values)?;
+            let raw_data = encode_vlen_heap_references(&refs, 0);
+            if raw_data.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' expects {expected} vlen reference bytes, got {}",
+                    dataset.name,
+                    raw_data.len()
+                )));
+            }
+            match &dataset.layout {
+                PlannedLayout::Contiguous => (raw_data, None),
+                PlannedLayout::Chunked { chunk_shape } => (
+                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
+                    None,
+                ),
+                PlannedLayout::Compact => unreachable!("compact vlen string datasets rejected"),
+            }
+        } else if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
                     "dataset '{}' expects {expected} data bytes, got {}",
@@ -1439,9 +1541,15 @@ fn plan_attributes(
             plan_attribute_list(&dataset.attributes, target_addresses, &mut heap_objects)
         })
         .collect::<Result<Vec<_>>>()?;
+    let dataset_vlen_refs = plan
+        .datasets
+        .iter()
+        .map(|dataset| plan_dataset_vlen_strings(dataset, &mut heap_objects))
+        .collect::<Result<Vec<_>>>()?;
     Ok(PlannedAttributes {
         root,
         datasets,
+        dataset_vlen_refs,
         heap_objects,
     })
 }
@@ -1464,28 +1572,7 @@ fn plan_attribute(
 ) -> Result<PlannedAttribute> {
     attribute.validate()?;
     if let Some(values) = &attribute.vlen_string_values {
-        let mut refs = Vec::with_capacity(values.len());
-        for value in values {
-            let index = checked_heap_index(heap_objects.len() + 1)?;
-            let mut data = Vec::with_capacity(value.len() + 1);
-            data.extend_from_slice(value.as_bytes());
-            data.push(0);
-            let sequence_len = u32::try_from(data.len()).map_err(|_| {
-                Error::UnsupportedFeature(format!(
-                    "attribute '{}' vlen string exceeds u32 capacity",
-                    attribute.name
-                ))
-            })?;
-            heap_objects.push(GlobalHeapObjectPlan {
-                index,
-                reference_count: 1,
-                data,
-            });
-            refs.push(VLenHeapReference {
-                sequence_len,
-                heap_index: index,
-            });
-        }
+        let refs = plan_vlen_string_heap_references(&attribute.name, values, heap_objects)?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -1535,6 +1622,89 @@ fn plan_attribute(
             shape: attribute.shape.clone(),
             raw_data: PlannedAttributeRaw::Inline(attribute.raw_data.clone()),
         })
+    }
+}
+
+fn plan_dataset_vlen_strings(
+    dataset: &DatasetBuilder,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Option<Vec<VLenHeapReference>>> {
+    dataset
+        .vlen_string_values
+        .as_ref()
+        .map(|values| plan_vlen_string_heap_references(&dataset.name, values, heap_objects))
+        .transpose()
+}
+
+fn plan_vlen_string_heap_references(
+    context: &str,
+    values: &[String],
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Vec<VLenHeapReference>> {
+    let mut refs = Vec::with_capacity(values.len());
+    for value in values {
+        let index = checked_heap_index(heap_objects.len() + 1)?;
+        let mut data = Vec::with_capacity(value.len() + 1);
+        data.extend_from_slice(value.as_bytes());
+        data.push(0);
+        let sequence_len = u32::try_from(data.len()).map_err(|_| {
+            Error::UnsupportedFeature(format!(
+                "'{context}' variable-length string exceeds u32 capacity"
+            ))
+        })?;
+        heap_objects.push(GlobalHeapObjectPlan {
+            index,
+            reference_count: 1,
+            data,
+        });
+        refs.push(VLenHeapReference {
+            sequence_len,
+            heap_index: index,
+        });
+    }
+    Ok(refs)
+}
+
+fn placeholder_vlen_string_references(
+    context: &str,
+    values: &[String],
+) -> Result<Vec<VLenHeapReference>> {
+    values
+        .iter()
+        .map(|value| {
+            let sequence_len = value
+                .len()
+                .checked_add(1)
+                .and_then(|len| u32::try_from(len).ok())
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "'{context}' variable-length string exceeds u32 capacity"
+                    ))
+                })?;
+            Ok(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            })
+        })
+        .collect()
+}
+
+fn dataset_vlen_string_storage_data(
+    dataset: &DatasetBuilder,
+    refs: &[VLenHeapReference],
+    heap_address: u64,
+) -> Result<Vec<u8>> {
+    let element_size = datatype_element_size(&dataset.datatype)?;
+    let raw_data = encode_vlen_heap_references(refs, heap_address);
+    match &dataset.layout {
+        PlannedLayout::Contiguous => Ok(raw_data),
+        PlannedLayout::Chunked { chunk_shape } => {
+            chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)
+        }
+        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
+            "compact variable-length string HDF5 datasets are not emitted yet: '{}'",
+            dataset.name
+        ))),
     }
 }
 
@@ -2139,9 +2309,6 @@ fn validate_writer_filters(
         ));
     };
     let _ = chunk_count(&dataset.shape, chunk_shape)?;
-    let element_size_client_data = u32::try_from(element_size).map_err(|_| {
-        Error::UnsupportedFeature("shuffle filter element size exceeds u32 capacity".into())
-    })?;
     let mut filters = Vec::with_capacity(dataset.filters.len());
     for filter in &dataset.filters {
         match filter.id {
@@ -2164,6 +2331,11 @@ fn validate_writer_filters(
                         "well-known HDF5 shuffle filter must not carry a name".into(),
                     ));
                 }
+                let element_size_client_data = u32::try_from(element_size).map_err(|_| {
+                    Error::UnsupportedFeature(
+                        "shuffle filter element size exceeds u32 capacity".into(),
+                    )
+                })?;
                 match filter.client_data.as_slice() {
                     [] => filters.push(FilterDescription {
                         id: FILTER_SHUFFLE,
@@ -2182,6 +2354,19 @@ fn validate_writer_filters(
                         ));
                     }
                 }
+            }
+            FILTER_FLETCHER32 => {
+                if filter.name.is_some() {
+                    return Err(Error::InvalidDefinition(
+                        "well-known HDF5 Fletcher32 filter must not carry a name".into(),
+                    ));
+                }
+                if !filter.client_data.is_empty() {
+                    return Err(Error::InvalidDefinition(
+                        "Fletcher32 filter must not carry client data".into(),
+                    ));
+                }
+                filters.push(filter.clone());
             }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -2203,6 +2388,7 @@ fn apply_write_filters(
         current = match filter.id {
             FILTER_SHUFFLE => shuffle_filter(&current, element_size),
             FILTER_DEFLATE => deflate_filter(&current, filter)?,
+            FILTER_FLETCHER32 => fletcher32_filter(&current),
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "HDF5 filter id {other} is not implemented for writing"
@@ -2235,6 +2421,13 @@ fn shuffle_filter(data: &[u8], element_size: usize) -> Vec<u8> {
     if complete < data.len() {
         output[complete..].copy_from_slice(&data[complete..]);
     }
+    output
+}
+
+fn fletcher32_filter(data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(data.len() + 4);
+    output.extend_from_slice(data);
+    output.extend_from_slice(&fletcher32(data).to_le_bytes());
     output
 }
 

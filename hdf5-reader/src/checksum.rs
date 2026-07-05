@@ -1,39 +1,4 @@
-pub use hdf5_core::jenkins_lookup3;
-
-/// Fletcher-32 checksum used by the HDF5 filter pipeline.
-///
-/// Matches the HDF5 library's `H5_checksum_fletcher32`: reads 16-bit
-/// big-endian words, accumulates in batches of 360, and reduces with
-/// `(x & 0xffff) + (x >> 16)` (not `% 65535`).
-pub fn fletcher32(data: &[u8]) -> u32 {
-    let mut sum1: u32 = 0;
-    let mut sum2: u32 = 0;
-    let total_words = data.len() / 2;
-
-    let mut offset = 0usize;
-    let mut remaining = total_words;
-
-    while remaining > 0 {
-        let batch = remaining.min(360);
-        remaining -= batch;
-
-        for _ in 0..batch {
-            let word = ((data[offset] as u32) << 8) | (data[offset + 1] as u32);
-            sum1 += word;
-            sum2 += sum1;
-            offset += 2;
-        }
-
-        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
-        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
-    }
-
-    // Final reduction
-    sum1 = (sum1 & 0xffff) + (sum1 >> 16);
-    sum2 = (sum2 & 0xffff) + (sum2 >> 16);
-
-    (sum2 << 16) | sum1
-}
+pub use hdf5_core::{fletcher32, jenkins_lookup3};
 
 #[cfg(test)]
 mod tests {
@@ -84,7 +49,7 @@ mod tests {
         let ck = fletcher32(&payload);
         let mut data = payload.clone();
         data.extend_from_slice(&ck.to_le_bytes());
-        // The filter stores checksum in big-endian
+        // The filter stores checksum in little-endian.
         let stripped = crate::filters::fletcher32::verify_and_strip(&data).unwrap();
         assert_eq!(stripped, payload);
     }

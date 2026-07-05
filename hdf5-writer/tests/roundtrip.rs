@@ -3,7 +3,7 @@ use std::io::Cursor;
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
-    WriteOptions, FILTER_DEFLATE, FILTER_SHUFFLE, UNLIMITED,
+    WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, UNLIMITED,
 };
 
 #[test]
@@ -206,6 +206,62 @@ fn writes_fixed_string_arrays() {
     assert_eq!(
         file.dataset("/labels").unwrap().read_strings().unwrap(),
         vec!["red".to_string(), "green".to_string(), "blue".to_string()]
+    );
+}
+
+#[test]
+fn writes_vlen_string_dataset_backed_by_global_heap() {
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data("names", vec![3], &["alpha", "beta", "gamma"])
+                .unwrap(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.dataset("/names").unwrap().read_strings().unwrap(),
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+    );
+}
+
+#[test]
+fn writes_chunked_vlen_string_dataset_backed_by_global_heap() {
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data(
+                "names",
+                vec![2, 2],
+                &["alpha", "beta", "gamma", "delta"],
+            )
+            .unwrap()
+            .chunked(vec![1, 2]),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/names").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 2]);
+    assert_eq!(
+        dataset.read_strings().unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string()
+        ]
     );
 }
 
@@ -478,6 +534,99 @@ fn writes_shuffle_deflate_dataset() {
     let array = dataset.read_array::<i32>().unwrap();
     assert_eq!(array.shape(), &[5, 6]);
     assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn writes_fletcher32_dataset() {
+    let values = (0_i16..35).map(|value| value * 11).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("checked", vec![5, 7], &values)
+                .unwrap()
+                .chunked(vec![2, 3])
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: Vec::new(),
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/checked").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i16>().unwrap();
+    assert_eq!(array.shape(), &[5, 7]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn writes_shuffle_deflate_fletcher32_pipeline() {
+    let values = (0_i32..42).map(|value| value * 4099).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("filtered", vec![6, 7], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_SHUFFLE,
+                    name: None,
+                    client_data: Vec::new(),
+                })
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![4],
+                })
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: Vec::new(),
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/filtered").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![3, 4]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[6, 7]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn rejects_fletcher32_client_data() {
+    let values = (0_i16..12).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("bad_checksum", vec![3, 4], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: vec![1],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+    assert!(err.to_string().contains("Fletcher32 filter"));
 }
 
 #[test]
