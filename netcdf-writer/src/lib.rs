@@ -164,6 +164,7 @@ struct VariableDef {
     data: Vec<u8>,
     data_encoding: VariableDataEncoding,
     string_values: Option<Vec<String>>,
+    vlen_values: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +293,7 @@ impl NcFileBuilder {
         variable.data = data;
         variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
         variable.string_values = None;
+        variable.vlen_values = None;
         Ok(())
     }
 
@@ -306,6 +308,7 @@ impl NcFileBuilder {
         variable.data = bytes.to_vec();
         variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
         variable.string_values = None;
+        variable.vlen_values = None;
         Ok(())
     }
 
@@ -315,10 +318,43 @@ impl NcFileBuilder {
         bytes: &[u8],
     ) -> Result<()> {
         let variable = self.variable_mut(variable)?;
-        validate_supported_user_defined_type(&variable.dtype)?;
+        validate_fixed_width_user_defined_type(&variable.dtype)?;
         variable.data = bytes.to_vec();
         variable.data_encoding = VariableDataEncoding::Hdf5Native;
         variable.string_values = None;
+        variable.vlen_values = None;
+        Ok(())
+    }
+
+    pub fn write_vlen_variable_bytes<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        values: &[S],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let NcType::VLen { base } = &variable.dtype else {
+            return Err(Error::TypeMismatch {
+                expected: "VLen".into(),
+                actual: format!("{:?}", variable.dtype),
+            });
+        };
+        validate_vlen_base_nc4_type(base)?;
+        let base_size = base.size()?;
+        let mut sequences = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    value.len()
+                )));
+            }
+            sequences.push(value.to_vec());
+        }
+        variable.data.clear();
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
+        variable.string_values = None;
+        variable.vlen_values = Some(sequences);
         Ok(())
     }
 
@@ -348,6 +384,7 @@ impl NcFileBuilder {
         variable.data.clear();
         variable.data_encoding = VariableDataEncoding::Hdf5Native;
         variable.string_values = Some(strings);
+        variable.vlen_values = None;
         Ok(())
     }
 
@@ -514,6 +551,20 @@ impl NcFileBuilder {
                 })?;
                 H5DatasetBuilder::vlen_string_data(&variable.name, shape.clone(), values)
                     .map_err(hdf5_error_to_unsupported)?
+            } else if let NcType::VLen { base } = &variable.dtype {
+                let values = variable.vlen_values.as_ref().ok_or_else(|| {
+                    Error::InvalidDefinition(format!(
+                        "NC_VLEN variable '{}' has no sequence data",
+                        variable.name
+                    ))
+                })?;
+                H5DatasetBuilder::vlen_sequence_data(
+                    &variable.name,
+                    nc_type_to_hdf5(base)?,
+                    shape.clone(),
+                    values.clone(),
+                )
+                .map_err(hdf5_error_to_unsupported)?
             } else {
                 let data = match variable.data_encoding {
                     VariableDataEncoding::ClassicBigEndian => {
@@ -646,6 +697,7 @@ impl NcFileBuilder {
             data: Vec::new(),
             data_encoding: VariableDataEncoding::ClassicBigEndian,
             string_values: None,
+            vlen_values: None,
         });
         Ok(id)
     }
@@ -1185,9 +1237,15 @@ fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
             base: Box::new(nc_type_to_hdf5(base)?),
             dims: dims.clone(),
         }),
-        other => Err(Error::UnsupportedFeature(format!(
-            "NetCDF-4 type emission is not implemented for {other:?}"
-        ))),
+        NcType::VLen { base } => {
+            validate_vlen_base_nc4_type(base)?;
+            Ok(H5Datatype::VarLen {
+                base: Box::new(nc_type_to_hdf5(base)?),
+                kind: H5VarLenKind::Sequence,
+                encoding: H5StringEncoding::Ascii,
+                padding: H5StringPadding::NullTerminate,
+            })
+        }
     }
 }
 
@@ -1211,7 +1269,7 @@ fn nc_enum_value_to_hdf5(base: &NcType, value: NcIntegerValue) -> Result<Vec<u8>
 #[cfg(feature = "netcdf4")]
 fn nc4_hdf5_element_size(dtype: &NcType) -> Result<usize> {
     match dtype {
-        NcType::String => Ok(16),
+        NcType::String | NcType::VLen { .. } => Ok(16),
         other => other.size().map_err(Error::Core),
     }
 }
@@ -1408,6 +1466,33 @@ fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -
         }
         return Ok(());
     }
+    if let NcType::VLen { base } = &variable.dtype {
+        let values = variable.vlen_values.as_ref().ok_or_else(|| {
+            Error::InvalidDefinition(format!(
+                "NC_VLEN variable '{}' has no sequence data",
+                variable.name
+            ))
+        })?;
+        validate_vlen_base_nc4_type(base)?;
+        let expected = checked_usize(elements, "NetCDF-4 vlen variable element count")?;
+        if values.len() != expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                actual: values.len(),
+            });
+        }
+        let base_size = base.size()?;
+        for value in values {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "NC_VLEN variable '{}' sequence byte length {} is not a multiple of base element size {base_size}",
+                    variable.name,
+                    value.len()
+                )));
+            }
+        }
+        return Ok(());
+    }
 
     let bytes = checked_mul_u64(
         elements,
@@ -1527,9 +1612,13 @@ fn infer_nc4_dimension_size_from_variable(
 
 #[cfg(feature = "netcdf4")]
 fn variable_has_data(variable: &VariableDef) -> bool {
-    match variable.dtype {
+    match &variable.dtype {
         NcType::String => variable
             .string_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty()),
+        NcType::VLen { .. } => variable
+            .vlen_values
             .as_ref()
             .is_some_and(|values| !values.is_empty()),
         _ => !variable.data.is_empty(),
@@ -1544,6 +1633,18 @@ fn variable_payload_element_count(variable: &VariableDef) -> Result<(u64, u64, u
             u64::try_from(values).map_err(|_| {
                 Error::InvalidDefinition(
                     "NC_STRING variable element count exceeds u64 capacity".into(),
+                )
+            })?,
+            1,
+            values,
+        ));
+    }
+    if matches!(&variable.dtype, NcType::VLen { .. }) {
+        let values = variable.vlen_values.as_ref().map_or(0usize, Vec::len);
+        return Ok((
+            u64::try_from(values).map_err(|_| {
+                Error::InvalidDefinition(
+                    "NC_VLEN variable element count exceeds u64 capacity".into(),
                 )
             })?,
             1,
@@ -1639,6 +1740,9 @@ fn validate_classic_type(dtype: &NcType) -> Result<()> {
 }
 
 fn validate_supported_user_defined_type(dtype: &NcType) -> Result<()> {
+    if let NcType::VLen { base } = dtype {
+        return validate_vlen_base_nc4_type(base);
+    }
     if !matches!(
         dtype,
         NcType::Enum { .. }
@@ -1647,7 +1751,22 @@ fn validate_supported_user_defined_type(dtype: &NcType) -> Result<()> {
             | NcType::Array { .. }
     ) {
         return Err(Error::InvalidDefinition(format!(
-            "user-defined variables require enum, compound, opaque, or fixed-size array type, got {dtype:?}"
+            "user-defined variables require enum, compound, opaque, fixed-size array, or vlen type, got {dtype:?}"
+        )));
+    }
+    validate_fixed_width_nc4_type(dtype)
+}
+
+fn validate_fixed_width_user_defined_type(dtype: &NcType) -> Result<()> {
+    if !matches!(
+        dtype,
+        NcType::Enum { .. }
+            | NcType::Compound { .. }
+            | NcType::Opaque { .. }
+            | NcType::Array { .. }
+    ) {
+        return Err(Error::InvalidDefinition(format!(
+            "raw user-defined variable bytes require enum, compound, opaque, or fixed-size array type, got {dtype:?}"
         )));
     }
     validate_fixed_width_nc4_type(dtype)
@@ -1689,6 +1808,39 @@ fn validate_fixed_width_nc4_type(dtype: &NcType) -> Result<()> {
         NcType::Array { base, .. } => validate_fixed_width_nc4_type(base),
         NcType::String | NcType::VLen { .. } => Err(Error::UnsupportedFeature(format!(
             "{dtype:?} user-defined variable payloads require heap-backed sequence writing"
+        ))),
+    }
+}
+
+fn validate_vlen_base_nc4_type(dtype: &NcType) -> Result<()> {
+    if dtype.size()? == 0 {
+        return Err(Error::InvalidDefinition(
+            "vlen base type must have non-zero byte size".into(),
+        ));
+    }
+    match dtype {
+        NcType::Byte
+        | NcType::Char
+        | NcType::Short
+        | NcType::Int
+        | NcType::Float
+        | NcType::Double
+        | NcType::UByte
+        | NcType::UShort
+        | NcType::UInt
+        | NcType::Int64
+        | NcType::UInt64
+        | NcType::Opaque { .. } => Ok(()),
+        NcType::Enum { .. } => validate_fixed_width_nc4_type(dtype),
+        NcType::Compound { fields, .. } => {
+            for field in fields {
+                validate_vlen_base_nc4_type(&field.dtype)?;
+            }
+            Ok(())
+        }
+        NcType::Array { base, .. } => validate_vlen_base_nc4_type(base),
+        NcType::String | NcType::VLen { .. } => Err(Error::UnsupportedFeature(format!(
+            "{dtype:?} cannot be used as a vlen base until recursive heap-backed payload writing is implemented"
         ))),
     }
 }

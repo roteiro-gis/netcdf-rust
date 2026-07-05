@@ -352,6 +352,60 @@ fn writes_nc4_user_defined_variables() {
 }
 
 #[test]
+fn writes_nc4_vlen_sequence_variable() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_unlimited_dimension("obs").unwrap();
+    let dtype = NcType::VLen {
+        base: Box::new(NcType::Short),
+    };
+    let ragged = builder
+        .add_user_defined_variable("ragged", &[obs], dtype.clone())
+        .unwrap();
+    let values = vec![
+        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_i16.to_le_bytes(),
+            11_i16.to_le_bytes(),
+            12_i16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    builder.write_vlen_variable_bytes(ragged, &values).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let obs_dim = file.dimension("obs").unwrap();
+    assert_eq!(obs_dim.size, 3);
+    assert!(obs_dim.is_unlimited);
+    assert_eq!(file.variable("ragged").unwrap().dtype(), &dtype);
+
+    let decoded = file.read_variable_user_defined("ragged").unwrap();
+    let values = decoded.as_slice().unwrap();
+    assert_eq!(
+        values[0],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Short(1),
+            netcdf_reader::NcValue::Short(2)
+        ])
+    );
+    assert_eq!(values[1], netcdf_reader::NcValue::VLen(Vec::new()));
+    assert_eq!(
+        values[2],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Short(10),
+            netcdf_reader::NcValue::Short(11),
+            netcdf_reader::NcValue::Short(12)
+        ])
+    );
+}
+
+#[test]
 fn writes_nc4_classic_marker() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<f64>("value", &[]).unwrap();

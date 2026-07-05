@@ -213,6 +213,7 @@ pub struct DatasetBuilder {
     fill_value: Option<Vec<u8>>,
     raw_data: Option<Vec<u8>>,
     vlen_string_values: Option<Vec<String>>,
+    vlen_sequence_values: Option<Vec<Vec<u8>>>,
     attributes: Vec<AttributeBuilder>,
 }
 
@@ -235,6 +236,7 @@ impl DatasetBuilder {
             fill_value: None,
             raw_data: None,
             vlen_string_values: None,
+            vlen_sequence_values: None,
             attributes: Vec::new(),
         }
     }
@@ -323,6 +325,55 @@ impl DatasetBuilder {
             fill_value: None,
             raw_data: None,
             vlen_string_values: Some(strings),
+            vlen_sequence_values: None,
+            attributes: Vec::new(),
+        })
+    }
+
+    pub fn vlen_sequence_data(
+        name: impl Into<String>,
+        base: Datatype,
+        shape: impl Into<Vec<u64>>,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let shape = shape.into();
+        let expected = expected_element_count(&shape)?;
+        if values.len() != expected {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' expects {expected} vlen sequence elements, got {}",
+                name,
+                values.len()
+            )));
+        }
+        validate_vlen_sequence_base(&base)?;
+        let base_size = datatype_element_size(&base)?;
+        for value in &values {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    name,
+                    value.len()
+                )));
+            }
+        }
+
+        Ok(Self {
+            name,
+            datatype: Datatype::VarLen {
+                base: Box::new(base),
+                kind: VarLenKind::Sequence,
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullTerminate,
+            },
+            shape,
+            max_shape: None,
+            layout: PlannedLayout::Contiguous,
+            filters: Vec::new(),
+            fill_value: None,
+            raw_data: None,
+            vlen_string_values: None,
+            vlen_sequence_values: Some(values),
             attributes: Vec::new(),
         })
     }
@@ -357,6 +408,7 @@ impl DatasetBuilder {
     pub fn raw_data(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.raw_data = Some(bytes.into());
         self.vlen_string_values = None;
+        self.vlen_sequence_values = None;
         self
     }
 
@@ -378,6 +430,7 @@ impl DatasetBuilder {
         }
         self.raw_data = Some(bytes);
         self.vlen_string_values = None;
+        self.vlen_sequence_values = None;
         Ok(self)
     }
 
@@ -449,6 +502,37 @@ impl DatasetBuilder {
                     self.name,
                     fill_value.len()
                 )));
+            }
+        }
+        if let Some(values) = &self.vlen_sequence_values {
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &self.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence values require a sequence datatype",
+                    self.name
+                )));
+            };
+            let expected = expected_element_count(&self.shape)?;
+            if values.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence shape must match value count",
+                    self.name
+                )));
+            }
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            for value in values {
+                if value.len() % base_size != 0 {
+                    return Err(Error::InvalidDefinition(format!(
+                        "dataset '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                        self.name,
+                        value.len()
+                    )));
+                }
             }
         }
         validate_attributes(&self.attributes)?;
@@ -1114,7 +1198,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
             None
         };
         let raw_data = if let Some(refs) = &planned_attributes.dataset_vlen_refs[dataset_index] {
-            dataset_vlen_string_storage_data(prepared_dataset.dataset, refs, heap_address)?
+            dataset_vlen_storage_data(prepared_dataset.dataset, refs, heap_address)?
         } else {
             prepared_dataset.raw_data.clone()
         };
@@ -1249,6 +1333,55 @@ fn prepare_datasets(
                     None,
                 ),
                 PlannedLayout::Compact => unreachable!("compact vlen string datasets rejected"),
+            }
+        } else if let Some(values) = &dataset.vlen_sequence_values {
+            if dataset.fill_value.is_some() {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' cannot combine variable-length sequences with a fill value",
+                    dataset.name
+                )));
+            }
+            if matches!(dataset.layout, PlannedLayout::Compact) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compact variable-length sequence HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            if !filters.is_empty() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "filtered variable-length sequence HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &dataset.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence values require a sequence datatype",
+                    dataset.name
+                )));
+            };
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            let refs = placeholder_vlen_sequence_references(&dataset.name, values, base_size)?;
+            let raw_data = encode_vlen_heap_references(&refs, 0);
+            if raw_data.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' expects {expected} vlen reference bytes, got {}",
+                    dataset.name,
+                    raw_data.len()
+                )));
+            }
+            match &dataset.layout {
+                PlannedLayout::Contiguous => (raw_data, None),
+                PlannedLayout::Chunked { chunk_shape } => (
+                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
+                    None,
+                ),
+                PlannedLayout::Compact => unreachable!("compact vlen sequence datasets rejected"),
             }
         } else if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
@@ -1544,7 +1677,7 @@ fn plan_attributes(
     let dataset_vlen_refs = plan
         .datasets
         .iter()
-        .map(|dataset| plan_dataset_vlen_strings(dataset, &mut heap_objects))
+        .map(|dataset| plan_dataset_vlen_values(dataset, &mut heap_objects))
         .collect::<Result<Vec<_>>>()?;
     Ok(PlannedAttributes {
         root,
@@ -1625,15 +1758,31 @@ fn plan_attribute(
     }
 }
 
-fn plan_dataset_vlen_strings(
+fn plan_dataset_vlen_values(
     dataset: &DatasetBuilder,
     heap_objects: &mut Vec<GlobalHeapObjectPlan>,
 ) -> Result<Option<Vec<VLenHeapReference>>> {
-    dataset
-        .vlen_string_values
-        .as_ref()
-        .map(|values| plan_vlen_string_heap_references(&dataset.name, values, heap_objects))
-        .transpose()
+    if let Some(values) = dataset.vlen_string_values.as_ref() {
+        return plan_vlen_string_heap_references(&dataset.name, values, heap_objects).map(Some);
+    }
+    if let Some(values) = dataset.vlen_sequence_values.as_ref() {
+        let Datatype::VarLen {
+            base,
+            kind: VarLenKind::Sequence,
+            ..
+        } = &dataset.datatype
+        else {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' vlen sequence values require a sequence datatype",
+                dataset.name
+            )));
+        };
+        validate_vlen_sequence_base(base)?;
+        let base_size = datatype_element_size(base)?;
+        return plan_vlen_sequence_heap_references(&dataset.name, values, base_size, heap_objects)
+            .map(Some);
+    }
+    Ok(None)
 }
 
 fn plan_vlen_string_heap_references(
@@ -1689,7 +1838,74 @@ fn placeholder_vlen_string_references(
         .collect()
 }
 
-fn dataset_vlen_string_storage_data(
+fn plan_vlen_sequence_heap_references(
+    context: &str,
+    values: &[Vec<u8>],
+    base_size: usize,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Vec<VLenHeapReference>> {
+    let mut refs = Vec::with_capacity(values.len());
+    for value in values {
+        if value.len() % base_size != 0 {
+            return Err(Error::InvalidDefinition(format!(
+                "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
+                value.len()
+            )));
+        }
+        let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
+            Error::UnsupportedFeature(format!(
+                "'{context}' variable-length sequence exceeds u32 element capacity"
+            ))
+        })?;
+        if sequence_len == 0 {
+            refs.push(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            });
+            continue;
+        }
+        let index = checked_heap_index(heap_objects.len() + 1)?;
+        heap_objects.push(GlobalHeapObjectPlan {
+            index,
+            reference_count: 1,
+            data: value.clone(),
+        });
+        refs.push(VLenHeapReference {
+            sequence_len,
+            heap_index: index,
+        });
+    }
+    Ok(refs)
+}
+
+fn placeholder_vlen_sequence_references(
+    context: &str,
+    values: &[Vec<u8>],
+    base_size: usize,
+) -> Result<Vec<VLenHeapReference>> {
+    values
+        .iter()
+        .map(|value| {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
+                    value.len()
+                )));
+            }
+            let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "'{context}' variable-length sequence exceeds u32 element capacity"
+                ))
+            })?;
+            Ok(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            })
+        })
+        .collect()
+}
+
+fn dataset_vlen_storage_data(
     dataset: &DatasetBuilder,
     refs: &[VLenHeapReference],
     heap_address: u64,
@@ -1702,7 +1918,7 @@ fn dataset_vlen_string_storage_data(
             chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)
         }
         PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
-            "compact variable-length string HDF5 datasets are not emitted yet: '{}'",
+            "compact variable-length HDF5 datasets are not emitted yet: '{}'",
             dataset.name
         ))),
     }
@@ -2474,6 +2690,41 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
             ..
         } => Ok(16),
         Datatype::VarLen { .. } => Ok(16),
+    }
+}
+
+fn validate_vlen_sequence_base(datatype: &Datatype) -> Result<()> {
+    if datatype_element_size(datatype)? == 0 {
+        return Err(Error::InvalidDefinition(
+            "variable-length sequence base datatype must have non-zero byte size".into(),
+        ));
+    }
+    match datatype {
+        Datatype::String {
+            size: StringSize::Variable,
+            ..
+        }
+        | Datatype::VarLen { .. } => Err(Error::UnsupportedFeature(
+            "nested heap-backed variable-length sequence bases are not emitted yet".into(),
+        )),
+        Datatype::Compound { fields, .. } => {
+            for field in fields {
+                validate_vlen_sequence_base(&field.datatype)?;
+            }
+            Ok(())
+        }
+        Datatype::Array { base, .. } | Datatype::Enum { base, .. } => {
+            validate_vlen_sequence_base(base)
+        }
+        Datatype::FixedPoint { .. }
+        | Datatype::FloatingPoint { .. }
+        | Datatype::Bitfield { .. }
+        | Datatype::Reference { .. }
+        | Datatype::String {
+            size: StringSize::Fixed(_),
+            ..
+        }
+        | Datatype::Opaque { .. } => Ok(()),
     }
 }
 

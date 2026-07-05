@@ -3,8 +3,8 @@ use std::io::Cursor;
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, CompoundField, DatasetBuilder, Datatype, EnumMember,
-    FilterDescription, Hdf5Builder, Hdf5Writer, WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32,
-    FILTER_SHUFFLE, UNLIMITED,
+    FilterDescription, Hdf5Builder, Hdf5Writer, StringEncoding, StringPadding, VarLenKind,
+    WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, UNLIMITED,
 };
 
 #[test]
@@ -382,6 +382,57 @@ fn writes_chunked_vlen_string_dataset_backed_by_global_heap() {
             "delta".to_string()
         ]
     );
+}
+
+#[test]
+fn writes_vlen_sequence_dataset_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: true,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let values = vec![
+        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_i16.to_le_bytes(),
+            11_i16.to_le_bytes(),
+            12_i16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_sequence_data("ragged", base.clone(), vec![3], values.clone())
+                .unwrap(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/ragged").unwrap();
+    assert_eq!(
+        dataset.dtype(),
+        &Datatype::VarLen {
+            base: Box::new(base),
+            kind: VarLenKind::Sequence,
+            encoding: StringEncoding::Ascii,
+            padding: StringPadding::NullTerminate,
+        }
+    );
+
+    let raw = dataset.read_raw_bytes().unwrap();
+    let ref_size = dataset.vlen_reference_size();
+    let decoded = raw
+        .chunks_exact(ref_size)
+        .map(|reference| dataset.resolve_vlen_reference_bytes(reference, 2).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, values);
 }
 
 #[test]
