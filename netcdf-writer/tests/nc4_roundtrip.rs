@@ -1,7 +1,10 @@
 #![cfg(feature = "netcdf4")]
 
 use netcdf_reader::{NcFile, NcFormat};
-use netcdf_writer::{NcAttrValue, NcFileBuilder, NcWriteFormat, NcWriteOptions};
+use netcdf_writer::{
+    NcAttrValue, NcCompoundField, NcEnumMember, NcFileBuilder, NcIntegerValue, NcType,
+    NcWriteFormat, NcWriteOptions,
+};
 
 #[test]
 fn writes_nc4_coordinate_variable() {
@@ -214,6 +217,138 @@ fn writes_nc4_unlimited_string_variable() {
         file.read_variable_as_strings("quality").unwrap(),
         vec!["good".to_string(), "suspect".to_string(), "bad".to_string()]
     );
+}
+
+#[test]
+fn writes_nc4_user_defined_variables() {
+    let mut builder = NcFileBuilder::new();
+    let n = builder.add_dimension("n", 2).unwrap();
+    let quality_type = NcType::Enum {
+        base: Box::new(NcType::UByte),
+        members: vec![
+            NcEnumMember {
+                name: "bad".to_string(),
+                value: NcIntegerValue::U8(1),
+            },
+            NcEnumMember {
+                name: "good".to_string(),
+                value: NcIntegerValue::U8(2),
+            },
+        ],
+    };
+    let samples_type = NcType::Array {
+        base: Box::new(NcType::Short),
+        dims: vec![3],
+    };
+    let obs_type = NcType::Compound {
+        size: 12,
+        fields: vec![
+            NcCompoundField {
+                name: "temp".to_string(),
+                offset: 0,
+                dtype: NcType::Float,
+            },
+            NcCompoundField {
+                name: "quality".to_string(),
+                offset: 4,
+                dtype: quality_type.clone(),
+            },
+            NcCompoundField {
+                name: "samples".to_string(),
+                offset: 6,
+                dtype: samples_type.clone(),
+            },
+        ],
+    };
+
+    let quality = builder
+        .add_user_defined_variable("quality", &[n], quality_type.clone())
+        .unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[n],
+            NcType::Opaque {
+                size: 4,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+    let obs = builder
+        .add_user_defined_variable("obs", &[], obs_type.clone())
+        .unwrap();
+
+    builder
+        .write_user_defined_variable_bytes(quality, &[2, 1])
+        .unwrap();
+    builder
+        .write_user_defined_variable_bytes(blob, &[1, 2, 3, 4, 5, 6, 7, 8])
+        .unwrap();
+    let mut obs_bytes = Vec::new();
+    obs_bytes.extend_from_slice(&12.5_f32.to_le_bytes());
+    obs_bytes.push(2);
+    obs_bytes.push(0);
+    obs_bytes.extend_from_slice(&10_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&11_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&12_i16.to_le_bytes());
+    builder
+        .write_user_defined_variable_bytes(obs, &obs_bytes)
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.variable("quality").unwrap().dtype(), &quality_type);
+    assert_eq!(file.read_variable_raw_bytes("quality").unwrap(), vec![2, 1]);
+
+    let quality_values = file.read_variable_user_defined("quality").unwrap();
+    match &quality_values.as_slice().unwrap()[0] {
+        netcdf_reader::NcValue::Enum(value) => {
+            assert_eq!(value.value, NcIntegerValue::U8(2));
+            assert_eq!(value.member.as_deref(), Some("good"));
+        }
+        other => panic!("expected enum value, got {other:?}"),
+    }
+
+    let blob_values = file.read_variable_user_defined("blob").unwrap();
+    assert_eq!(
+        blob_values.as_slice().unwrap()[1],
+        netcdf_reader::NcValue::Opaque(vec![5, 6, 7, 8])
+    );
+
+    assert_eq!(file.variable("obs").unwrap().dtype(), &obs_type);
+    let obs_values = file.read_variable_user_defined("obs").unwrap();
+    match &obs_values.as_slice().unwrap()[0] {
+        netcdf_reader::NcValue::Compound(fields) => {
+            assert_eq!(fields[0].name, "temp");
+            assert_eq!(fields[0].value, netcdf_reader::NcValue::Float(12.5));
+            match &fields[1].value {
+                netcdf_reader::NcValue::Enum(value) => {
+                    assert_eq!(value.member.as_deref(), Some("good"));
+                }
+                other => panic!("expected enum field, got {other:?}"),
+            }
+            match &fields[2].value {
+                netcdf_reader::NcValue::Array(array) => {
+                    assert_eq!(array.dims, vec![3]);
+                    assert_eq!(
+                        array.values,
+                        vec![
+                            netcdf_reader::NcValue::Short(10),
+                            netcdf_reader::NcValue::Short(11),
+                            netcdf_reader::NcValue::Short(12),
+                        ]
+                    );
+                }
+                other => panic!("expected array field, got {other:?}"),
+            }
+        }
+        other => panic!("expected compound value, got {other:?}"),
+    }
 }
 
 #[test]

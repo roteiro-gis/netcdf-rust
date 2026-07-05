@@ -12,15 +12,16 @@ use std::io::Write;
 #[cfg(feature = "netcdf4")]
 use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
-    DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype, Hdf5Builder, Hdf5Writer,
-    ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
-    StringPadding as H5StringPadding, StringSize as H5StringSize, VarLenKind as H5VarLenKind,
-    WriteOptions as H5WriteOptions, UNLIMITED as H5_UNLIMITED,
+    CompoundField as H5CompoundField, DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype,
+    EnumMember as H5EnumMember, Hdf5Builder, Hdf5Writer, ReferenceType as H5ReferenceType,
+    StringEncoding as H5StringEncoding, StringPadding as H5StringPadding,
+    StringSize as H5StringSize, VarLenKind as H5VarLenKind, WriteOptions as H5WriteOptions,
+    UNLIMITED as H5_UNLIMITED,
 };
 
 pub use netcdf_core::{
-    NcAttrValue, NcAttribute, NcDimension, NcFormat, NcGroup, NcSliceInfo, NcSliceInfoElem, NcType,
-    NcVariable,
+    NcAttrValue, NcAttribute, NcCompoundField, NcDimension, NcEnumMember, NcFormat, NcGroup,
+    NcIntegerValue, NcSliceInfo, NcSliceInfoElem, NcType, NcVariable,
 };
 
 const ABSENT: u32 = 0x0000_0000;
@@ -161,7 +162,14 @@ struct VariableDef {
     dtype: NcType,
     attributes: Vec<NcAttribute>,
     data: Vec<u8>,
+    data_encoding: VariableDataEncoding,
     string_values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VariableDataEncoding {
+    ClassicBigEndian,
+    Hdf5Native,
 }
 
 /// Builder for a single NetCDF file.
@@ -240,6 +248,16 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, NcType::String)
     }
 
+    pub fn add_user_defined_variable(
+        &mut self,
+        name: impl Into<String>,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
+        validate_supported_user_defined_type(&dtype)?;
+        self.add_variable_with_type(name, dimensions, dtype)
+    }
+
     pub fn add_variable_attribute(
         &mut self,
         variable: VariableId,
@@ -272,6 +290,7 @@ impl NcFileBuilder {
             value.write_one_be(&mut data);
         }
         variable.data = data;
+        variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
         variable.string_values = None;
         Ok(())
     }
@@ -285,6 +304,20 @@ impl NcFileBuilder {
             });
         }
         variable.data = bytes.to_vec();
+        variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
+        variable.string_values = None;
+        Ok(())
+    }
+
+    pub fn write_user_defined_variable_bytes(
+        &mut self,
+        variable: VariableId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        validate_supported_user_defined_type(&variable.dtype)?;
+        variable.data = bytes.to_vec();
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
         variable.string_values = None;
         Ok(())
     }
@@ -313,6 +346,7 @@ impl NcFileBuilder {
             strings.push(value.to_string());
         }
         variable.data.clear();
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
         variable.string_values = Some(strings);
         Ok(())
     }
@@ -481,7 +515,12 @@ impl NcFileBuilder {
                 H5DatasetBuilder::vlen_string_data(&variable.name, shape.clone(), values)
                     .map_err(hdf5_error_to_unsupported)?
             } else {
-                let data = convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?;
+                let data = match variable.data_encoding {
+                    VariableDataEncoding::ClassicBigEndian => {
+                        convert_classic_be_data_to_hdf5_le(&variable.dtype, &variable.data)?
+                    }
+                    VariableDataEncoding::Hdf5Native => variable.data.clone(),
+                };
                 H5DatasetBuilder::new(
                     &variable.name,
                     nc_type_to_hdf5(&variable.dtype)?,
@@ -605,6 +644,7 @@ impl NcFileBuilder {
             dtype,
             attributes: Vec::new(),
             data: Vec::new(),
+            data_encoding: VariableDataEncoding::ClassicBigEndian,
             string_values: None,
         });
         Ok(id)
@@ -1099,8 +1139,71 @@ fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
             encoding: H5StringEncoding::Utf8,
             padding: H5StringPadding::NullTerminate,
         }),
+        NcType::Enum { base, members } => {
+            let h5_base = nc_type_to_hdf5(base)?;
+            let members = members
+                .iter()
+                .map(|member| {
+                    Ok(H5EnumMember {
+                        name: member.name.clone(),
+                        value: nc_enum_value_to_hdf5(base, member.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(H5Datatype::Enum {
+                base: Box::new(h5_base),
+                members,
+            })
+        }
+        NcType::Compound { size, fields } => {
+            let fields = fields
+                .iter()
+                .map(|field| {
+                    let byte_offset = u32::try_from(field.offset).map_err(|_| {
+                        Error::UnsupportedFeature(format!(
+                            "compound field '{}' offset exceeds HDF5 u32 capacity",
+                            field.name
+                        ))
+                    })?;
+                    Ok(H5CompoundField {
+                        name: field.name.clone(),
+                        byte_offset,
+                        datatype: nc_type_to_hdf5(&field.dtype)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(H5Datatype::Compound {
+                size: *size,
+                fields,
+            })
+        }
+        NcType::Opaque { size, tag } => Ok(H5Datatype::Opaque {
+            size: *size,
+            tag: tag.clone(),
+        }),
+        NcType::Array { base, dims } => Ok(H5Datatype::Array {
+            base: Box::new(nc_type_to_hdf5(base)?),
+            dims: dims.clone(),
+        }),
         other => Err(Error::UnsupportedFeature(format!(
             "NetCDF-4 type emission is not implemented for {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc_enum_value_to_hdf5(base: &NcType, value: NcIntegerValue) -> Result<Vec<u8>> {
+    match (base, value) {
+        (NcType::Byte, NcIntegerValue::I8(value)) => Ok(vec![value as u8]),
+        (NcType::UByte, NcIntegerValue::U8(value)) => Ok(vec![value]),
+        (NcType::Short, NcIntegerValue::I16(value)) => Ok(value.to_le_bytes().to_vec()),
+        (NcType::UShort, NcIntegerValue::U16(value)) => Ok(value.to_le_bytes().to_vec()),
+        (NcType::Int, NcIntegerValue::I32(value)) => Ok(value.to_le_bytes().to_vec()),
+        (NcType::UInt, NcIntegerValue::U32(value)) => Ok(value.to_le_bytes().to_vec()),
+        (NcType::Int64, NcIntegerValue::I64(value)) => Ok(value.to_le_bytes().to_vec()),
+        (NcType::UInt64, NcIntegerValue::U64(value)) => Ok(value.to_le_bytes().to_vec()),
+        (base, value) => Err(Error::InvalidDefinition(format!(
+            "enum value {value:?} is incompatible with base type {base:?}"
         ))),
     }
 }
@@ -1533,6 +1636,61 @@ fn validate_classic_type(dtype: &NcType) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_supported_user_defined_type(dtype: &NcType) -> Result<()> {
+    if !matches!(
+        dtype,
+        NcType::Enum { .. }
+            | NcType::Compound { .. }
+            | NcType::Opaque { .. }
+            | NcType::Array { .. }
+    ) {
+        return Err(Error::InvalidDefinition(format!(
+            "user-defined variables require enum, compound, opaque, or fixed-size array type, got {dtype:?}"
+        )));
+    }
+    validate_fixed_width_nc4_type(dtype)
+}
+
+fn validate_fixed_width_nc4_type(dtype: &NcType) -> Result<()> {
+    match dtype {
+        NcType::Byte
+        | NcType::Char
+        | NcType::Short
+        | NcType::Int
+        | NcType::Float
+        | NcType::Double
+        | NcType::UByte
+        | NcType::UShort
+        | NcType::UInt
+        | NcType::Int64
+        | NcType::UInt64
+        | NcType::Opaque { .. } => Ok(()),
+        NcType::Enum { base, .. } => match base.as_ref() {
+            NcType::Byte
+            | NcType::UByte
+            | NcType::Short
+            | NcType::UShort
+            | NcType::Int
+            | NcType::UInt
+            | NcType::Int64
+            | NcType::UInt64 => Ok(()),
+            other => Err(Error::InvalidDefinition(format!(
+                "enum base type must be fixed-width integer, got {other:?}"
+            ))),
+        },
+        NcType::Compound { fields, .. } => {
+            for field in fields {
+                validate_fixed_width_nc4_type(&field.dtype)?;
+            }
+            Ok(())
+        }
+        NcType::Array { base, .. } => validate_fixed_width_nc4_type(base),
+        NcType::String | NcType::VLen { .. } => Err(Error::UnsupportedFeature(format!(
+            "{dtype:?} user-defined variable payloads require heap-backed sequence writing"
+        ))),
+    }
 }
 
 #[cfg(feature = "netcdf4")]
