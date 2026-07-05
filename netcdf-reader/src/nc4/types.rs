@@ -25,7 +25,7 @@
 //!
 //! * Some NetCDF-4 string variables are stored as HDF5 vlen bytes.
 
-use hdf5_reader::messages::datatype::{Datatype, VarLenKind};
+use hdf5_reader::messages::datatype::{Datatype, StringSize, VarLenKind};
 use hdf5_reader::ByteOrder;
 
 use crate::error::{Error, Result};
@@ -56,6 +56,10 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
                 size
             ))),
         },
+        Datatype::String {
+            size: StringSize::Fixed(1),
+            ..
+        } => Ok(NcType::Char),
         Datatype::String { .. } => Ok(NcType::String),
         Datatype::Enum { base, members } => Ok(NcType::Enum {
             base: Box::new(hdf5_to_nc_type(base)?),
@@ -266,6 +270,19 @@ mod tests {
             })
             .unwrap(),
             NcType::String
+        );
+    }
+
+    #[test]
+    fn fixed_one_byte_string_maps_to_char() {
+        assert_eq!(
+            hdf5_to_nc_type(&Datatype::String {
+                size: StringSize::Fixed(1),
+                encoding: hdf5_reader::StringEncoding::Ascii,
+                padding: hdf5_reader::StringPadding::NullPad,
+            })
+            .unwrap(),
+            NcType::Char
         );
     }
 

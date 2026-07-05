@@ -25,7 +25,7 @@ use ndarray::ArrayD;
 use rayon::ThreadPool;
 
 use crate::error::{Error, Result};
-use crate::types::{NcGroup, NcType};
+use crate::types::{checked_shape_elements, checked_usize_from_u64, NcGroup, NcType};
 
 /// Dispatch on `NcType` to read data and promote to `f64`.
 ///
@@ -333,13 +333,18 @@ impl Nc4File {
         let normalized = normalize_dataset_path(path)?;
         let dataset = self.hdf5.dataset(normalized)?;
         let dtype = dataset_nc_type(&dataset)?;
-        if dtype != NcType::String {
-            return Err(Error::TypeMismatch {
-                expected: "String".to_string(),
+        match dtype {
+            NcType::String => Ok(dataset.read_strings()?),
+            NcType::Char => {
+                let variable = self.variable(path)?;
+                let raw = dataset.read_raw_bytes()?;
+                decode_char_variable_strings(variable, &raw)
+            }
+            _ => Err(Error::TypeMismatch {
+                expected: "String or Char".to_string(),
                 actual: format!("{dtype:?}"),
-            });
+            }),
         }
-        Ok(dataset.read_strings()?)
     }
 
     /// Read a variable containing NetCDF-4 user-defined values.
@@ -379,6 +384,52 @@ impl Nc4File {
         let dataset = self.hdf5.dataset(normalized)?;
         Ok(dataset.read_array_in_pool::<T>(pool)?)
     }
+}
+
+fn decode_char_variable_strings(
+    variable: &crate::types::NcVariable,
+    bytes: &[u8],
+) -> Result<Vec<String>> {
+    let shape = variable.shape();
+    if shape.len() <= 1 {
+        return Ok(vec![decode_char_string(bytes)]);
+    }
+
+    let string_len = checked_usize_from_u64(
+        *shape
+            .last()
+            .ok_or_else(|| Error::InvalidData("char variable missing string axis".into()))?,
+        "char string length",
+    )?;
+    let string_count_u64 = checked_shape_elements(&shape[..shape.len() - 1], "char string count")?;
+    let string_count = checked_usize_from_u64(string_count_u64, "char string count")?;
+    let expected_bytes = string_count.checked_mul(string_len).ok_or_else(|| {
+        Error::InvalidData("char string byte count exceeds platform usize".to_string())
+    })?;
+
+    if bytes.len() < expected_bytes {
+        return Err(Error::InvalidData(format!(
+            "char variable '{}' data too short: need {} bytes, have {}",
+            variable.name,
+            expected_bytes,
+            bytes.len()
+        )));
+    }
+
+    if string_len == 0 {
+        return Ok(vec![String::new(); string_count]);
+    }
+
+    Ok(bytes[..expected_bytes]
+        .chunks_exact(string_len)
+        .map(decode_char_string)
+        .collect())
+}
+
+fn decode_char_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 impl Nc4File {

@@ -79,6 +79,38 @@ fn writes_nc4_scalar_variable() {
 }
 
 #[test]
+fn writes_nc4_char_variable() {
+    let mut builder = NcFileBuilder::new();
+    let name = builder.add_dimension("name", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let variable = builder
+        .add_char_variable("station_name", &[name, strlen])
+        .unwrap();
+    builder
+        .write_char_variable(variable, b"alphabeta\0")
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let variable = file.variable("station_name").unwrap();
+    assert_eq!(variable.dtype(), &netcdf_writer::NcType::Char);
+    assert_eq!(variable.shape(), vec![2, 5]);
+    assert_eq!(
+        file.read_variable_raw_bytes("station_name").unwrap(),
+        b"alphabeta\0"
+    );
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
 fn writes_nc4_string_vector_attributes() {
     let mut builder = NcFileBuilder::new();
     builder

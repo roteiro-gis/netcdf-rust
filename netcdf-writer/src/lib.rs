@@ -14,8 +14,8 @@ use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
     DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype, Hdf5Builder, Hdf5Writer,
     ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
-    StringPadding as H5StringPadding, VarLenKind as H5VarLenKind, WriteOptions as H5WriteOptions,
-    UNLIMITED as H5_UNLIMITED,
+    StringPadding as H5StringPadding, StringSize as H5StringSize, VarLenKind as H5VarLenKind,
+    WriteOptions as H5WriteOptions, UNLIMITED as H5_UNLIMITED,
 };
 
 pub use netcdf_core::{
@@ -1041,9 +1041,11 @@ fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
             size: 8,
             byte_order,
         }),
-        NcType::Char => Err(Error::UnsupportedFeature(
-            "NetCDF-4 NC_CHAR variable emission is not implemented yet".into(),
-        )),
+        NcType::Char => Ok(H5Datatype::String {
+            size: H5StringSize::Fixed(1),
+            encoding: H5StringEncoding::Ascii,
+            padding: H5StringPadding::NullPad,
+        }),
         other => Err(Error::UnsupportedFeature(format!(
             "NetCDF-4 type emission is not implemented for {other:?}"
         ))),
