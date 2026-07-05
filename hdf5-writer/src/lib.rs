@@ -637,11 +637,25 @@ impl Hdf5Builder {
 
     pub fn validate(&self) -> Result<()> {
         let mut names = std::collections::BTreeSet::new();
+        let mut implicit_group_paths = std::collections::BTreeSet::new();
         for dataset in &self.datasets {
             dataset.validate()?;
             if !names.insert(dataset.name.as_str()) {
                 return Err(Error::InvalidDefinition(format!(
                     "duplicate root dataset '{}'",
+                    dataset.name
+                )));
+            }
+            let mut parent = parent_path(&dataset.name);
+            while let Some(path) = parent {
+                implicit_group_paths.insert(path);
+                parent = parent_path(path);
+            }
+        }
+        for dataset in &self.datasets {
+            if implicit_group_paths.contains(dataset.name.as_str()) {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' conflicts with an implicit HDF5 group at the same path",
                     dataset.name
                 )));
             }
@@ -753,6 +767,12 @@ struct DatasetEmission<'a> {
 }
 
 #[derive(Debug)]
+struct GroupEmission {
+    header_address: u64,
+    header: Vec<u8>,
+}
+
+#[derive(Debug)]
 struct HeaderMessage {
     type_id: u8,
     payload: Vec<u8>,
@@ -792,6 +812,25 @@ struct PlannedAttributes {
     heap_objects: Vec<GlobalHeapObjectPlan>,
 }
 
+#[derive(Debug, Clone)]
+struct GroupHierarchy {
+    paths: Vec<String>,
+    root_links: Vec<PlannedLink>,
+    group_links: Vec<Vec<PlannedLink>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedLink {
+    name: String,
+    target: PlannedLinkTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedLinkTarget {
+    Group(usize),
+    Dataset(usize),
+}
+
 impl PlannedAttribute {
     fn raw_data(&self, heap_address: u64) -> Vec<u8> {
         match &self.raw_data {
@@ -819,9 +858,20 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let prepared = prepare_datasets(plan, options)?;
-    let placeholder_targets = placeholder_target_addresses(&prepared);
+    let groups = plan_group_hierarchy(&prepared)?;
+    let placeholder_group_addresses = vec![0; groups.paths.len()];
+    let placeholder_dataset_addresses = vec![0; prepared.len()];
+    let placeholder_targets =
+        placeholder_target_addresses(&prepared, &groups, &placeholder_group_addresses);
     let placeholder_attributes = plan_attributes(plan, &placeholder_targets)?;
-    let root_header_size = encode_root_header(&prepared, &placeholder_attributes.root, 0)?.len();
+    let root_header_size = encode_group_header_from_plan(
+        &groups.root_links,
+        &placeholder_group_addresses,
+        &placeholder_dataset_addresses,
+        &placeholder_attributes.root,
+        0,
+    )?
+    .len();
     let mut next_address = align_u64(SUPERBLOCK_V2_SIZE as u64, 8);
     let root_address = next_address;
     next_address = align_u64(
@@ -832,6 +882,26 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         )?,
         8,
     );
+
+    let mut group_addresses = Vec::with_capacity(groups.paths.len());
+    for group_links in &groups.group_links {
+        group_addresses.push(next_address);
+        let placeholder = encode_group_header_from_plan(
+            group_links,
+            &placeholder_group_addresses,
+            &placeholder_dataset_addresses,
+            &[],
+            0,
+        )?;
+        next_address = align_u64(
+            checked_add_u64(
+                next_address,
+                placeholder.len() as u64,
+                "group object header end",
+            )?,
+            8,
+        );
+    }
 
     let mut header_addresses = Vec::with_capacity(prepared.len());
     for (prepared_dataset, attributes) in prepared.iter().zip(&placeholder_attributes.datasets) {
@@ -862,14 +932,9 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         }
     }
 
-    let target_addresses = target_addresses(&prepared, &header_addresses);
+    let target_addresses =
+        target_addresses(&prepared, &header_addresses, &groups, &group_addresses);
     let planned_attributes = plan_attributes(plan, &target_addresses)?;
-
-    let links: Vec<_> = prepared
-        .iter()
-        .zip(header_addresses.iter().copied())
-        .map(|(prepared_dataset, address)| (prepared_dataset.dataset.name.as_str(), address))
-        .collect();
 
     let heap_address = if planned_attributes.heap_objects.is_empty() {
         0
@@ -886,8 +951,32 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         8,
     );
 
-    let root_header =
-        encode_root_header_from_links(&links, &planned_attributes.root, heap_address)?;
+    let root_header = encode_group_header_from_plan(
+        &groups.root_links,
+        &group_addresses,
+        &header_addresses,
+        &planned_attributes.root,
+        heap_address,
+    )?;
+
+    let mut group_emissions = Vec::with_capacity(groups.paths.len());
+    for (group_links, header_address) in groups
+        .group_links
+        .iter()
+        .zip(group_addresses.iter().copied())
+    {
+        let header = encode_group_header_from_plan(
+            group_links,
+            &group_addresses,
+            &header_addresses,
+            &[],
+            heap_address,
+        )?;
+        group_emissions.push(GroupEmission {
+            header_address,
+            header,
+        });
+    }
 
     let mut emissions = Vec::with_capacity(prepared.len());
     for (((prepared_dataset, attributes), header_address), data_address) in prepared
@@ -912,6 +1001,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     file.extend_from_slice(&encode_superblock_v2(root_address, eof_address));
     pad_to_address(&mut file, root_address)?;
     file.extend_from_slice(&root_header);
+
+    for emission in &group_emissions {
+        pad_to_address(&mut file, emission.header_address)?;
+        file.extend_from_slice(&emission.header);
+    }
 
     for emission in &emissions {
         pad_to_address(&mut file, emission.header_address)?;
@@ -948,12 +1042,6 @@ fn prepare_datasets(
     plan.validate()?;
     let mut prepared = Vec::with_capacity(plan.datasets.len());
     for dataset in &plan.datasets {
-        if dataset.name.contains('/') {
-            return Err(Error::UnsupportedFeature(format!(
-                "nested HDF5 paths are not emitted yet: '{}'",
-                dataset.name
-            )));
-        }
         let element_size = datatype_element_size(&dataset.datatype)?;
         validate_writer_filters(dataset)?;
         if let Some(datatype_order) = datatype_numeric_order(&dataset.datatype) {
@@ -1015,23 +1103,167 @@ fn prepare_datasets(
     Ok(prepared)
 }
 
+fn plan_group_hierarchy(prepared: &[PreparedDataset<'_>]) -> Result<GroupHierarchy> {
+    let mut group_paths = std::collections::BTreeSet::new();
+    for prepared_dataset in prepared {
+        let mut parent = parent_path(&prepared_dataset.dataset.name);
+        while let Some(path) = parent {
+            group_paths.insert(path.to_string());
+            parent = parent_path(path);
+        }
+    }
+
+    for prepared_dataset in prepared {
+        if group_paths.contains(&prepared_dataset.dataset.name) {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' conflicts with an implicit HDF5 group at the same path",
+                prepared_dataset.dataset.name
+            )));
+        }
+    }
+
+    let paths: Vec<_> = group_paths.into_iter().collect();
+    let group_indices: std::collections::BTreeMap<_, _> = paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.as_str(), index))
+        .collect();
+    let mut root_names = std::collections::BTreeSet::new();
+    let mut group_names = vec![std::collections::BTreeSet::new(); paths.len()];
+    let mut root_links = Vec::new();
+    let mut group_links = vec![Vec::new(); paths.len()];
+
+    for (group_index, path) in paths.iter().enumerate() {
+        let link = PlannedLink {
+            name: path_basename(path).to_string(),
+            target: PlannedLinkTarget::Group(group_index),
+        };
+        if let Some(parent) = parent_path(path) {
+            let parent_index = group_indices[parent];
+            push_group_link(
+                &mut group_links[parent_index],
+                &mut group_names[parent_index],
+                link,
+            )?;
+        } else {
+            push_group_link(&mut root_links, &mut root_names, link)?;
+        }
+    }
+
+    for (dataset_index, prepared_dataset) in prepared.iter().enumerate() {
+        let path = prepared_dataset.dataset.name.as_str();
+        let link = PlannedLink {
+            name: path_basename(path).to_string(),
+            target: PlannedLinkTarget::Dataset(dataset_index),
+        };
+        if let Some(parent) = parent_path(path) {
+            let parent_index = group_indices[parent];
+            push_group_link(
+                &mut group_links[parent_index],
+                &mut group_names[parent_index],
+                link,
+            )?;
+        } else {
+            push_group_link(&mut root_links, &mut root_names, link)?;
+        }
+    }
+
+    Ok(GroupHierarchy {
+        paths,
+        root_links,
+        group_links,
+    })
+}
+
+fn push_group_link(
+    links: &mut Vec<PlannedLink>,
+    names: &mut std::collections::BTreeSet<String>,
+    link: PlannedLink,
+) -> Result<()> {
+    if !names.insert(link.name.clone()) {
+        return Err(Error::InvalidDefinition(format!(
+            "duplicate HDF5 link name '{}'",
+            link.name
+        )));
+    }
+    links.push(link);
+    Ok(())
+}
+
+fn parent_path(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(parent, _)| parent)
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
 fn placeholder_target_addresses(
     prepared: &[PreparedDataset<'_>],
+    groups: &GroupHierarchy,
+    group_addresses: &[u64],
 ) -> std::collections::BTreeMap<String, u64> {
-    prepared
-        .iter()
-        .map(|prepared_dataset| (prepared_dataset.dataset.name.clone(), 0))
-        .collect()
+    object_target_addresses(prepared, &vec![0; prepared.len()], groups, group_addresses)
 }
 
 fn target_addresses(
     prepared: &[PreparedDataset<'_>],
     header_addresses: &[u64],
+    groups: &GroupHierarchy,
+    group_addresses: &[u64],
 ) -> std::collections::BTreeMap<String, u64> {
-    prepared
+    object_target_addresses(prepared, header_addresses, groups, group_addresses)
+}
+
+fn object_target_addresses(
+    prepared: &[PreparedDataset<'_>],
+    header_addresses: &[u64],
+    groups: &GroupHierarchy,
+    group_addresses: &[u64],
+) -> std::collections::BTreeMap<String, u64> {
+    let mut target_addresses: std::collections::BTreeMap<String, u64> = groups
+        .paths
         .iter()
-        .zip(header_addresses.iter().copied())
-        .map(|(prepared_dataset, address)| (prepared_dataset.dataset.name.clone(), address))
+        .zip(group_addresses.iter().copied())
+        .map(|(path, address)| (path.clone(), address))
+        .collect();
+    target_addresses.extend(
+        prepared
+            .iter()
+            .zip(header_addresses.iter().copied())
+            .map(|(prepared_dataset, address)| (prepared_dataset.dataset.name.clone(), address)),
+    );
+    target_addresses
+}
+
+fn resolve_planned_links(
+    links: &[PlannedLink],
+    group_addresses: &[u64],
+    dataset_addresses: &[u64],
+) -> Result<Vec<(String, u64)>> {
+    links
+        .iter()
+        .map(|link| {
+            let address = match link.target {
+                PlannedLinkTarget::Group(index) => {
+                    *group_addresses.get(index).ok_or_else(|| {
+                        Error::InvalidDefinition(format!(
+                            "missing planned address for HDF5 group '{}'",
+                            link.name
+                        ))
+                    })?
+                }
+                PlannedLinkTarget::Dataset(index) => {
+                    *dataset_addresses.get(index).ok_or_else(|| {
+                        Error::InvalidDefinition(format!(
+                            "missing planned address for HDF5 dataset '{}'",
+                            link.name
+                        ))
+                    })?
+                }
+            };
+            Ok((link.name.clone(), address))
+        })
         .collect()
 }
 
@@ -1192,20 +1424,19 @@ fn encode_superblock_v2(root_address: u64, eof_address: u64) -> Vec<u8> {
     bytes
 }
 
-fn encode_root_header(
-    prepared: &[PreparedDataset<'_>],
+fn encode_group_header_from_plan(
+    links: &[PlannedLink],
+    group_addresses: &[u64],
+    dataset_addresses: &[u64],
     attributes: &[PlannedAttribute],
     heap_address: u64,
 ) -> Result<Vec<u8>> {
-    let links: Vec<_> = prepared
-        .iter()
-        .map(|prepared_dataset| (prepared_dataset.dataset.name.as_str(), 0u64))
-        .collect();
-    encode_root_header_from_links(&links, attributes, heap_address)
+    let resolved_links = resolve_planned_links(links, group_addresses, dataset_addresses)?;
+    encode_group_header_from_links(&resolved_links, attributes, heap_address)
 }
 
-fn encode_root_header_from_links(
-    links: &[(&str, u64)],
+fn encode_group_header_from_links(
+    links: &[(String, u64)],
     attributes: &[PlannedAttribute],
     heap_address: u64,
 ) -> Result<Vec<u8>> {
@@ -1215,7 +1446,7 @@ fn encode_root_header_from_links(
         .map(|(name, address)| {
             Ok(HeaderMessage {
                 type_id: MSG_LINK,
-                payload: encode_hard_link_message(name, *address)?,
+                payload: encode_hard_link_message(name.as_str(), *address)?,
             })
         })
         .collect();

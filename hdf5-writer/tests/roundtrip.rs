@@ -85,6 +85,97 @@ fn writes_multiple_root_datasets() {
 }
 
 #[test]
+fn writes_nested_group_paths() {
+    let x_values = [0_i32, 1];
+    let temperatures = [280.0_f32, 281.5];
+    let quality = [1_i16, 2];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("science/x", vec![2], &x_values)
+                .unwrap()
+                .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE")),
+        )
+        .dataset(
+            DatasetBuilder::typed_data("science/temperature", vec![2], &temperatures)
+                .unwrap()
+                .attribute(AttributeBuilder::vlen_object_references(
+                    "DIMENSION_LIST",
+                    vec![vec!["science/x".to_string()]],
+                )),
+        )
+        .dataset(DatasetBuilder::typed_data("science/quality/qc", vec![2], &quality).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let science = file.group("/science").unwrap();
+    let quality_group = file.group("/science/quality").unwrap();
+    assert_eq!(science.name(), "science");
+    assert_eq!(quality_group.name(), "quality");
+    assert!(file.dataset("/temperature").is_err());
+
+    let x = file.dataset("/science/x").unwrap();
+    let temperature = file.dataset("/science/temperature").unwrap();
+    let qc = file.dataset("/science/quality/qc").unwrap();
+    assert_eq!(
+        x.read_array::<i32>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        x_values
+    );
+    assert_eq!(
+        temperature
+            .read_array::<f32>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        temperatures
+    );
+    assert_eq!(
+        qc.read_array::<i16>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        quality
+    );
+
+    let attr = temperature.attribute("DIMENSION_LIST").unwrap();
+    let heap_addr = u64::from_le_bytes(attr.raw_data[4..12].try_into().unwrap());
+    let heap_index = u32::from_le_bytes(attr.raw_data[12..16].try_into().unwrap()) as u16;
+    let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+        file.storage(),
+        heap_addr,
+        file.superblock().offset_size,
+        file.superblock().length_size,
+    )
+    .unwrap();
+    let heap_object = heap.get_object(heap_index).unwrap();
+    let refs = hdf5_reader::reference::read_object_references(
+        &heap_object.data,
+        file.superblock().offset_size,
+    )
+    .unwrap();
+    assert_eq!(refs, vec![x.address()]);
+}
+
+#[test]
+fn rejects_dataset_path_that_is_also_group() {
+    let err = Hdf5Builder::new()
+        .dataset(DatasetBuilder::typed_data("science", vec![1], &[1_i32]).unwrap())
+        .dataset(DatasetBuilder::typed_data("science/temp", vec![1], &[2_i32]).unwrap())
+        .into_plan()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("implicit HDF5 group"));
+}
+
+#[test]
 fn writes_fixed_string_arrays() {
     let plan = Hdf5Builder::new()
         .attribute(
