@@ -549,6 +549,7 @@ pub struct AttributeBuilder {
     raw_data: Vec<u8>,
     vlen_object_reference_targets: Option<Vec<Vec<String>>>,
     vlen_string_values: Option<Vec<String>>,
+    vlen_sequence_values: Option<Vec<Vec<u8>>>,
 }
 
 impl AttributeBuilder {
@@ -565,6 +566,7 @@ impl AttributeBuilder {
             raw_data: raw_data.into(),
             vlen_object_reference_targets: None,
             vlen_string_values: None,
+            vlen_sequence_values: None,
         }
     }
 
@@ -643,6 +645,7 @@ impl AttributeBuilder {
             raw_data: Vec::new(),
             vlen_object_reference_targets: Some(target_sequences),
             vlen_string_values: None,
+            vlen_sequence_values: None,
         }
     }
 
@@ -681,6 +684,46 @@ impl AttributeBuilder {
             raw_data: Vec::new(),
             vlen_object_reference_targets: None,
             vlen_string_values: Some(strings),
+            vlen_sequence_values: None,
+        })
+    }
+
+    pub fn vlen_sequences(
+        name: impl Into<String>,
+        base: Datatype,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_vlen_sequence_base(&base)?;
+        let base_size = datatype_element_size(&base)?;
+        for value in &values {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    name,
+                    value.len()
+                )));
+            }
+        }
+        let element_count = u64::try_from(values.len()).map_err(|_| {
+            Error::InvalidDefinition(
+                "vlen sequence attribute element count exceeds u64 capacity".into(),
+            )
+        })?;
+
+        Ok(Self {
+            name,
+            datatype: Datatype::VarLen {
+                base: Box::new(base),
+                kind: VarLenKind::Sequence,
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullTerminate,
+            },
+            shape: vec![element_count],
+            raw_data: Vec::new(),
+            vlen_object_reference_targets: None,
+            vlen_string_values: None,
+            vlen_sequence_values: Some(values),
         })
     }
 
@@ -714,6 +757,37 @@ impl AttributeBuilder {
                     return Err(Error::InvalidDefinition(format!(
                         "attribute '{}' vlen string values cannot contain NUL bytes",
                         self.name
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(values) = &self.vlen_sequence_values {
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &self.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence values require a sequence datatype",
+                    self.name
+                )));
+            };
+            if self.shape != [values.len() as u64] {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence shape must match value count",
+                    self.name
+                )));
+            }
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            for value in values {
+                if value.len() % base_size != 0 {
+                    return Err(Error::InvalidDefinition(format!(
+                        "attribute '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                        self.name,
+                        value.len()
                     )));
                 }
             }
@@ -1706,6 +1780,28 @@ fn plan_attribute(
     attribute.validate()?;
     if let Some(values) = &attribute.vlen_string_values {
         let refs = plan_vlen_string_heap_references(&attribute.name, values, heap_objects)?;
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::GlobalHeapVLenReferences(refs),
+        })
+    } else if let Some(values) = &attribute.vlen_sequence_values {
+        let Datatype::VarLen {
+            base,
+            kind: VarLenKind::Sequence,
+            ..
+        } = &attribute.datatype
+        else {
+            return Err(Error::InvalidDefinition(format!(
+                "attribute '{}' vlen sequence values require a sequence datatype",
+                attribute.name
+            )));
+        };
+        validate_vlen_sequence_base(base)?;
+        let base_size = datatype_element_size(base)?;
+        let refs =
+            plan_vlen_sequence_heap_references(&attribute.name, values, base_size, heap_objects)?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),

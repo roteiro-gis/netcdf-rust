@@ -848,6 +848,75 @@ fn writes_vlen_string_attribute_backed_by_global_heap() {
 }
 
 #[test]
+fn writes_vlen_sequence_attribute_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: false,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let sequences = vec![
+        [1_u16.to_le_bytes(), 2_u16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_u16.to_le_bytes(),
+            11_u16.to_le_bytes(),
+            12_u16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .attribute(
+            AttributeBuilder::vlen_sequences("ragged", base.clone(), sequences.clone()).unwrap(),
+        )
+        .dataset(DatasetBuilder::typed_data("data", vec![1], &[1_i32]).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let attr = file.root_group().unwrap().attribute("ragged").unwrap();
+    assert_eq!(
+        &attr.datatype,
+        &Datatype::VarLen {
+            base: Box::new(base),
+            kind: VarLenKind::Sequence,
+            encoding: StringEncoding::Ascii,
+            padding: StringPadding::NullTerminate,
+        }
+    );
+    assert_eq!(attr.shape, vec![3]);
+    assert_eq!(attr.raw_data.len(), 48);
+
+    let decoded = attr
+        .raw_data
+        .chunks_exact(16)
+        .map(|reference| {
+            let seq_len = u32::from_le_bytes(reference[0..4].try_into().unwrap()) as usize;
+            let heap_addr = u64::from_le_bytes(reference[4..12].try_into().unwrap());
+            let heap_index = u32::from_le_bytes(reference[12..16].try_into().unwrap()) as u16;
+            if heap_index == 0 {
+                assert_eq!(seq_len, 0);
+                return Vec::new();
+            }
+            let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+                file.storage(),
+                heap_addr,
+                file.superblock().offset_size,
+                file.superblock().length_size,
+            )
+            .unwrap();
+            let object = heap.get_object(heap_index).unwrap();
+            object.data[..seq_len * 2].to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, sequences);
+}
+
+#[test]
 fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
     let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
         .unwrap()
