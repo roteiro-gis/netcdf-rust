@@ -113,6 +113,12 @@ pub struct VariableId(usize);
 pub trait NcWriteType: Copy {
     fn nc_type() -> NcType;
     fn write_one_be(self, dst: &mut Vec<u8>);
+
+    fn write_one_le(self, dst: &mut Vec<u8>) {
+        let start = dst.len();
+        self.write_one_be(dst);
+        dst[start..].reverse();
+    }
 }
 
 macro_rules! impl_write_type {
@@ -393,6 +399,29 @@ impl NcFileBuilder {
         Ok(())
     }
 
+    pub fn write_enum_variable(
+        &mut self,
+        variable: VariableId,
+        values: &[NcIntegerValue],
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let NcType::Enum { base, .. } = &variable.dtype else {
+            return Err(Error::TypeMismatch {
+                expected: "Enum".into(),
+                actual: format!("{:?}", variable.dtype),
+            });
+        };
+        let mut data = Vec::with_capacity(values.len() * base.size()?);
+        for &value in values {
+            data.extend_from_slice(&nc_enum_value_to_le_bytes(base, value)?);
+        }
+        variable.data = data;
+        variable.data_encoding = VariableDataEncoding::Hdf5Native;
+        variable.string_values = None;
+        variable.vlen_values = None;
+        Ok(())
+    }
+
     pub fn write_vlen_variable_bytes<S: AsRef<[u8]>>(
         &mut self,
         variable: VariableId,
@@ -422,6 +451,41 @@ impl NcFileBuilder {
         variable.data_encoding = VariableDataEncoding::Hdf5Native;
         variable.string_values = None;
         variable.vlen_values = Some(sequences);
+        Ok(())
+    }
+
+    pub fn write_vlen_variable<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        values: &[Vec<T>],
+    ) -> Result<()> {
+        let variable_def = self.variable_mut(variable)?;
+        let NcType::VLen { base } = &variable_def.dtype else {
+            return Err(Error::TypeMismatch {
+                expected: "VLen".into(),
+                actual: format!("{:?}", variable_def.dtype),
+            });
+        };
+        let expected = T::nc_type();
+        if base.as_ref() != &expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", base),
+                actual: format!("{expected:?}"),
+            });
+        }
+
+        let mut sequences = Vec::with_capacity(values.len());
+        for sequence in values {
+            let mut bytes = Vec::with_capacity(std::mem::size_of_val(sequence.as_slice()));
+            for &value in sequence {
+                value.write_one_le(&mut bytes);
+            }
+            sequences.push(bytes);
+        }
+        variable_def.data.clear();
+        variable_def.data_encoding = VariableDataEncoding::Hdf5Native;
+        variable_def.string_values = None;
+        variable_def.vlen_values = Some(sequences);
         Ok(())
     }
 
@@ -1331,6 +1395,10 @@ fn nc_type_to_hdf5(dtype: &NcType) -> Result<H5Datatype> {
 
 #[cfg(feature = "netcdf4")]
 fn nc_enum_value_to_hdf5(base: &NcType, value: NcIntegerValue) -> Result<Vec<u8>> {
+    nc_enum_value_to_le_bytes(base, value)
+}
+
+fn nc_enum_value_to_le_bytes(base: &NcType, value: NcIntegerValue) -> Result<Vec<u8>> {
     match (base, value) {
         (NcType::Byte, NcIntegerValue::I8(value)) => Ok(vec![value as u8]),
         (NcType::UByte, NcIntegerValue::U8(value)) => Ok(vec![value]),

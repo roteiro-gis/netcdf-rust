@@ -279,7 +279,7 @@ fn writes_nc4_user_defined_variables() {
         .unwrap();
 
     builder
-        .write_user_defined_variable_bytes(quality, &[2, 1])
+        .write_enum_variable(quality, &[NcIntegerValue::U8(2), NcIntegerValue::U8(1)])
         .unwrap();
     builder
         .write_user_defined_variable_bytes(blob, &[1, 2, 3, 4, 5, 6, 7, 8])
@@ -361,17 +361,8 @@ fn writes_nc4_vlen_sequence_variable() {
     let ragged = builder
         .add_user_defined_variable("ragged", &[obs], dtype.clone())
         .unwrap();
-    let values = vec![
-        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
-        Vec::new(),
-        [
-            10_i16.to_le_bytes(),
-            11_i16.to_le_bytes(),
-            12_i16.to_le_bytes(),
-        ]
-        .concat(),
-    ];
-    builder.write_vlen_variable_bytes(ragged, &values).unwrap();
+    let sequences = vec![vec![1_i16, 2], Vec::<i16>::new(), vec![10_i16, 11, 12]];
+    builder.write_vlen_variable(ragged, &sequences).unwrap();
 
     let (_format, bytes) = builder
         .to_vec(NcWriteOptions {
