@@ -655,6 +655,46 @@ fn writes_nc4_multiple_unlimited_dimensions() {
 }
 
 #[test]
+fn writes_nc4_filtered_chunked_variable() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 5).unwrap();
+    let x = builder.add_dimension("x", 6).unwrap();
+    let temp = builder.add_variable::<i32>("temp", &[y, x]).unwrap();
+    builder.set_variable_chunking(temp, vec![2, 3]).unwrap();
+    builder.set_variable_deflate(temp, Some(6), true).unwrap();
+    builder.set_variable_fletcher32(temp, true).unwrap();
+    let values = (0_i32..30).map(|value| value * 257).collect::<Vec<_>>();
+    builder.write_variable(temp, &values).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let decoded = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(decoded.shape(), &[5, 6]);
+    assert_eq!(decoded.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn rejects_classic_variable_storage_options() {
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 4).unwrap();
+    let value = builder.add_variable::<i32>("value", &[x]).unwrap();
+    builder.set_variable_chunking(value, vec![2]).unwrap();
+    builder.write_variable(value, &[1_i32, 2, 3, 4]).unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Classic,
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("NetCDF-4 storage options"));
+}
+
+#[test]
 fn rejects_nc4_classic_multiple_unlimited_dimensions() {
     let mut builder = NcFileBuilder::new();
     let time = builder.add_unlimited_dimension("time").unwrap();

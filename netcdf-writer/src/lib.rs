@@ -13,9 +13,11 @@ use std::io::Write;
 use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
     CompoundField as H5CompoundField, DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype,
-    EnumMember as H5EnumMember, Hdf5Builder, Hdf5Writer, ReferenceType as H5ReferenceType,
-    StringEncoding as H5StringEncoding, StringPadding as H5StringPadding,
-    StringSize as H5StringSize, VarLenKind as H5VarLenKind, WriteOptions as H5WriteOptions,
+    EnumMember as H5EnumMember, FilterDescription as H5FilterDescription, Hdf5Builder, Hdf5Writer,
+    ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
+    StringPadding as H5StringPadding, StringSize as H5StringSize, VarLenKind as H5VarLenKind,
+    WriteOptions as H5WriteOptions, FILTER_DEFLATE as H5_FILTER_DEFLATE,
+    FILTER_FLETCHER32 as H5_FILTER_FLETCHER32, FILTER_SHUFFLE as H5_FILTER_SHUFFLE,
     UNLIMITED as H5_UNLIMITED,
 };
 
@@ -165,12 +167,31 @@ struct VariableDef {
     data_encoding: VariableDataEncoding,
     string_values: Option<Vec<String>>,
     vlen_values: Option<Vec<Vec<u8>>>,
+    storage: VariableStorageDef,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VariableDataEncoding {
     ClassicBigEndian,
     Hdf5Native,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VariableStorageDef {
+    chunk_shape: Option<Vec<u64>>,
+    shuffle: bool,
+    deflate_level: Option<u8>,
+    fletcher32: bool,
+}
+
+impl VariableStorageDef {
+    fn has_filters(&self) -> bool {
+        self.shuffle || self.deflate_level.is_some() || self.fletcher32
+    }
+
+    fn has_nc4_options(&self) -> bool {
+        self.chunk_shape.is_some() || self.has_filters()
+    }
 }
 
 /// Builder for a single NetCDF file.
@@ -270,6 +291,52 @@ impl NcFileBuilder {
         let variable = self.variable_mut(variable)?;
         ensure_unique_attr(&variable.attributes, &name)?;
         variable.attributes.push(NcAttribute { name, value });
+        Ok(())
+    }
+
+    pub fn set_variable_chunking(
+        &mut self,
+        variable: VariableId,
+        chunk_shape: impl Into<Vec<u64>>,
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let chunk_shape = chunk_shape.into();
+        validate_chunk_shape_for_variable(variable, &chunk_shape)?;
+        variable.storage.chunk_shape = Some(chunk_shape);
+        Ok(())
+    }
+
+    pub fn set_variable_shuffle(&mut self, variable: VariableId, enabled: bool) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        reject_scalar_filtered_variable(variable)?;
+        variable.storage.shuffle = enabled;
+        Ok(())
+    }
+
+    pub fn set_variable_deflate(
+        &mut self,
+        variable: VariableId,
+        level: Option<u8>,
+        shuffle: bool,
+    ) -> Result<()> {
+        if let Some(level) = level {
+            if level > 9 {
+                return Err(Error::InvalidDefinition(
+                    "deflate level must be in 0..=9".into(),
+                ));
+            }
+        }
+        let variable = self.variable_mut(variable)?;
+        reject_scalar_filtered_variable(variable)?;
+        variable.storage.deflate_level = level;
+        variable.storage.shuffle = shuffle;
+        Ok(())
+    }
+
+    pub fn set_variable_fletcher32(&mut self, variable: VariableId, enabled: bool) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        reject_scalar_filtered_variable(variable)?;
+        variable.storage.fletcher32 = enabled;
         Ok(())
     }
 
@@ -579,13 +646,19 @@ impl NcFileBuilder {
                 )
                 .raw_data(data)
             };
+            let chunk_shape = nc4_variable_chunk_shape(
+                variable,
+                &shape,
+                self.nc4_variable_max_shape(variable).is_some(),
+            )?;
             if let Some(max_shape) = self.nc4_variable_max_shape(variable) {
-                dataset = dataset
-                    .max_shape(max_shape)
-                    .chunked(nc4_default_chunk_shape(
-                        &shape,
-                        nc4_hdf5_element_size(&variable.dtype)?,
-                    )?);
+                dataset = dataset.max_shape(max_shape);
+            }
+            if let Some(chunk_shape) = chunk_shape {
+                dataset = dataset.chunked(chunk_shape);
+            }
+            for filter in nc4_variable_filters(variable) {
+                dataset = dataset.filter(filter);
             }
 
             if self.variable_is_coordinate_scale(variable)? {
@@ -698,6 +771,7 @@ impl NcFileBuilder {
             data_encoding: VariableDataEncoding::ClassicBigEndian,
             string_values: None,
             vlen_values: None,
+            storage: VariableStorageDef::default(),
         });
         Ok(id)
     }
@@ -795,6 +869,12 @@ impl NcFileBuilder {
             ));
         }
         for variable in &self.variables {
+            if variable.storage.has_nc4_options() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "variable '{}' uses NetCDF-4 storage options",
+                    variable.name
+                )));
+            }
             validate_classic_type(&variable.dtype)?;
             let is_record = variable_is_record(self, variable)?;
             if variable
@@ -1450,6 +1530,7 @@ fn expected_variable_bytes(
 #[cfg(feature = "netcdf4")]
 fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<()> {
     let elements = nc4_variable_elements(variable, dimension_sizes)?;
+    validate_nc4_variable_storage(variable)?;
     if variable.dtype == NcType::String {
         let values = variable.string_values.as_ref().ok_or_else(|| {
             Error::InvalidDefinition(format!(
@@ -1737,6 +1818,103 @@ fn validate_classic_type(dtype: &NcType) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_chunk_shape_for_variable(variable: &VariableDef, chunk_shape: &[u64]) -> Result<()> {
+    if variable.dim_ids.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "chunked NetCDF-4 scalar variables are not supported: '{}'",
+            variable.name
+        )));
+    }
+    if chunk_shape.len() != variable.dim_ids.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "variable '{}' chunk rank must match variable rank: expected {}, got {}",
+            variable.name,
+            variable.dim_ids.len(),
+            chunk_shape.len()
+        )));
+    }
+    if chunk_shape.contains(&0) {
+        return Err(Error::InvalidDefinition(format!(
+            "variable '{}' chunk dimensions must be non-zero",
+            variable.name
+        )));
+    }
+    Ok(())
+}
+
+fn reject_scalar_filtered_variable(variable: &VariableDef) -> Result<()> {
+    if variable.dim_ids.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "filtered NetCDF-4 scalar variables are not supported: '{}'",
+            variable.name
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn validate_nc4_variable_storage(variable: &VariableDef) -> Result<()> {
+    if let Some(chunk_shape) = &variable.storage.chunk_shape {
+        validate_chunk_shape_for_variable(variable, chunk_shape)?;
+    }
+    if variable.storage.has_filters() {
+        reject_scalar_filtered_variable(variable)?;
+        if matches!(&variable.dtype, NcType::String | NcType::VLen { .. }) {
+            return Err(Error::UnsupportedFeature(format!(
+                "filtered NetCDF-4 variable-length variable '{}' is not supported yet",
+                variable.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc4_variable_chunk_shape(
+    variable: &VariableDef,
+    shape: &[u64],
+    requires_chunking: bool,
+) -> Result<Option<Vec<u64>>> {
+    if let Some(chunk_shape) = &variable.storage.chunk_shape {
+        validate_chunk_shape_for_variable(variable, chunk_shape)?;
+        return Ok(Some(chunk_shape.clone()));
+    }
+    if requires_chunking || variable.storage.has_filters() {
+        return Ok(Some(nc4_default_chunk_shape(
+            shape,
+            nc4_hdf5_element_size(&variable.dtype)?,
+        )?));
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "netcdf4")]
+fn nc4_variable_filters(variable: &VariableDef) -> Vec<H5FilterDescription> {
+    let mut filters = Vec::new();
+    if variable.storage.shuffle {
+        filters.push(H5FilterDescription {
+            id: H5_FILTER_SHUFFLE,
+            name: None,
+            client_data: Vec::new(),
+        });
+    }
+    if let Some(level) = variable.storage.deflate_level {
+        filters.push(H5FilterDescription {
+            id: H5_FILTER_DEFLATE,
+            name: None,
+            client_data: vec![u32::from(level)],
+        });
+    }
+    if variable.storage.fletcher32 {
+        filters.push(H5FilterDescription {
+            id: H5_FILTER_FLETCHER32,
+            name: None,
+            client_data: Vec::new(),
+        });
+    }
+    filters
 }
 
 fn validate_supported_user_defined_type(dtype: &NcType) -> Result<()> {
