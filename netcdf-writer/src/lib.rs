@@ -121,6 +121,16 @@ pub trait NcWriteType: Copy {
     }
 }
 
+/// Rust primitive types that can be used as a NetCDF variable fill value.
+///
+/// Setting a fill value writes the canonical `_FillValue` variable attribute.
+/// NetCDF-4 output also records the value as an HDF5 dataset fill value, which
+/// allows fixed-size datasets to be represented without eagerly materializing
+/// every element.
+pub trait NcFillValueType: NcWriteType {
+    fn fill_attr_value(self) -> NcAttrValue;
+}
+
 macro_rules! impl_write_type {
     ($ty:ty, $nc_type:expr, $write:expr) => {
         impl NcWriteType for $ty {
@@ -130,6 +140,16 @@ macro_rules! impl_write_type {
 
             fn write_one_be(self, dst: &mut Vec<u8>) {
                 $write(self, dst)
+            }
+        }
+    };
+}
+
+macro_rules! impl_fill_value_type {
+    ($ty:ty, $attr:ident) => {
+        impl NcFillValueType for $ty {
+            fn fill_attr_value(self) -> NcAttrValue {
+                NcAttrValue::$attr(vec![self])
             }
         }
     };
@@ -156,6 +176,19 @@ impl_write_type!(f32, NcType::Float, |value: f32, dst: &mut Vec<u8>| dst
 impl_write_type!(f64, NcType::Double, |value: f64, dst: &mut Vec<u8>| dst
     .extend_from_slice(&value.to_be_bytes()));
 
+impl_fill_value_type!(i8, Bytes);
+impl_fill_value_type!(u8, UBytes);
+impl_fill_value_type!(i16, Shorts);
+impl_fill_value_type!(u16, UShorts);
+impl_fill_value_type!(i32, Ints);
+impl_fill_value_type!(u32, UInts);
+impl_fill_value_type!(i64, Int64s);
+impl_fill_value_type!(u64, UInt64s);
+impl_fill_value_type!(f32, Floats);
+impl_fill_value_type!(f64, Doubles);
+
+const FILL_VALUE_ATTR_NAME: &str = "_FillValue";
+
 #[derive(Debug, Clone)]
 struct DimensionDef {
     name: String,
@@ -174,12 +207,19 @@ struct VariableDef {
     string_values: Option<Vec<String>>,
     vlen_values: Option<Vec<Vec<u8>>>,
     storage: VariableStorageDef,
+    fill_value: Option<VariableFillValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VariableDataEncoding {
     ClassicBigEndian,
     Hdf5Native,
+}
+
+#[derive(Debug, Clone)]
+struct VariableFillValue {
+    #[cfg(feature = "netcdf4")]
+    hdf5_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -298,6 +338,25 @@ impl NcFileBuilder {
         ensure_unique_attr(&variable.attributes, &name)?;
         variable.attributes.push(NcAttribute { name, value });
         Ok(())
+    }
+
+    pub fn set_variable_fill_value<T: NcFillValueType>(
+        &mut self,
+        variable: VariableId,
+        value: T,
+    ) -> Result<()> {
+        let variable = self.variable_mut(variable)?;
+        let expected = T::nc_type();
+        if variable.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", variable.dtype),
+                actual: format!("{expected:?}"),
+            });
+        }
+
+        let mut hdf5_bytes = Vec::with_capacity(expected.size()?);
+        value.write_one_le(&mut hdf5_bytes);
+        set_variable_fill_value_metadata(variable, value.fill_attr_value(), hdf5_bytes)
     }
 
     pub fn set_variable_chunking(
@@ -766,13 +825,20 @@ impl NcFileBuilder {
                     }
                     VariableDataEncoding::Hdf5Native => variable.data.clone(),
                 };
-                H5DatasetBuilder::new(
+                let dataset = H5DatasetBuilder::new(
                     &variable.name,
                     nc_type_to_hdf5(&variable.dtype)?,
                     shape.clone(),
-                )
-                .raw_data(data)
+                );
+                if data.is_empty() && variable.fill_value.is_some() {
+                    dataset
+                } else {
+                    dataset.raw_data(data)
+                }
             };
+            if let Some(fill_value) = &variable.fill_value {
+                dataset = dataset.fill_value(fill_value.hdf5_bytes.clone());
+            }
             let chunk_shape = nc4_variable_chunk_shape(
                 variable,
                 &shape,
@@ -899,6 +965,7 @@ impl NcFileBuilder {
             string_values: None,
             vlen_values: None,
             storage: VariableStorageDef::default(),
+            fill_value: None,
         });
         Ok(id)
     }
@@ -1662,6 +1729,7 @@ fn expected_variable_bytes(
 fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<()> {
     let elements = nc4_variable_elements(variable, dimension_sizes)?;
     validate_nc4_variable_storage(variable)?;
+    validate_nc4_variable_fill_value(variable)?;
     if variable.dtype == NcType::String {
         let values = variable.string_values.as_ref().ok_or_else(|| {
             Error::InvalidDefinition(format!(
@@ -1714,11 +1782,36 @@ fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -
     let expected = usize::try_from(bytes).map_err(|_| {
         Error::InvalidDefinition("NetCDF-4 variable byte size exceeds platform usize".into())
     })?;
+    if variable.data.is_empty() && variable.fill_value.is_some() {
+        return Ok(());
+    }
     if variable.data.len() != expected {
         return Err(Error::DataLengthMismatch {
             expected,
             actual: variable.data.len(),
         });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "netcdf4")]
+fn validate_nc4_variable_fill_value(variable: &VariableDef) -> Result<()> {
+    let Some(fill_value) = &variable.fill_value else {
+        return Ok(());
+    };
+    if matches!(&variable.dtype, NcType::String | NcType::VLen { .. }) {
+        return Err(Error::UnsupportedFeature(format!(
+            "NetCDF-4 variable-length fill values are not supported yet: '{}'",
+            variable.name
+        )));
+    }
+    let expected = nc4_hdf5_element_size(&variable.dtype)?;
+    if fill_value.hdf5_bytes.len() != expected {
+        return Err(Error::InvalidDefinition(format!(
+            "variable '{}' fill value byte length must match datatype element size: expected {expected}, got {}",
+            variable.name,
+            fill_value.hdf5_bytes.len()
+        )));
     }
     Ok(())
 }
@@ -2243,6 +2336,37 @@ fn ensure_unique_attr(attrs: &[NcAttribute], name: &str) -> Result<()> {
             "duplicate attribute '{name}'"
         )));
     }
+    Ok(())
+}
+
+fn set_variable_fill_value_metadata(
+    variable: &mut VariableDef,
+    value: NcAttrValue,
+    #[cfg_attr(not(feature = "netcdf4"), allow(unused_variables))] hdf5_bytes: Vec<u8>,
+) -> Result<()> {
+    if let Some(attribute) = variable
+        .attributes
+        .iter_mut()
+        .find(|attribute| attribute.name == FILL_VALUE_ATTR_NAME)
+    {
+        if variable.fill_value.is_none() {
+            return Err(Error::InvalidDefinition(format!(
+                "variable '{}' already has a manual _FillValue attribute",
+                variable.name
+            )));
+        }
+        attribute.value = value;
+    } else {
+        variable.attributes.push(NcAttribute {
+            name: FILL_VALUE_ATTR_NAME.to_string(),
+            value,
+        });
+    }
+
+    variable.fill_value = Some(VariableFillValue {
+        #[cfg(feature = "netcdf4")]
+        hdf5_bytes,
+    });
     Ok(())
 }
 

@@ -82,6 +82,36 @@ fn writes_nc4_scalar_variable() {
 }
 
 #[test]
+fn writes_nc4_fill_value_for_unwritten_variable() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 2).unwrap();
+    let x = builder.add_dimension("x", 3).unwrap();
+    let temp = builder.add_variable::<i16>("temp", &[y, x]).unwrap();
+    builder.set_variable_fill_value(temp, -999_i16).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let variable = file.variable("temp").unwrap();
+    assert_eq!(variable.shape(), vec![2, 3]);
+    assert_eq!(
+        variable.attribute("_FillValue").unwrap().value,
+        NcAttrValue::Shorts(vec![-999])
+    );
+
+    let values = file.read_variable::<i16>("temp").unwrap();
+    assert_eq!(values.shape(), &[2, 3]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[-999_i16, -999, -999, -999, -999, -999]
+    );
+}
+
+#[test]
 fn writes_nc4_char_variable() {
     let mut builder = NcFileBuilder::new();
     let name = builder.add_dimension("name", 2).unwrap();
