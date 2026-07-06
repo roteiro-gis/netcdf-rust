@@ -321,3 +321,31 @@ fn rejects_multiple_unlimited_dimensions_for_classic_writes() {
     let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
     assert!(err.to_string().contains("at most one unlimited"));
 }
+
+#[test]
+fn rejects_group_paths_for_classic_writes() {
+    let mut builder = NcFileBuilder::new();
+    let dim = builder.add_dimension_path("science/x", 2).unwrap();
+    let variable = builder
+        .add_variable_path::<i32>("science/value", &[dim])
+        .unwrap();
+    builder.write_variable(variable, &[1_i32, 2]).unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_group_attributes_for_classic_writes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "science",
+            "title",
+            NcAttrValue::Chars("enhanced model".to_string()),
+        )
+        .unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}

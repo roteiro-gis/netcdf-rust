@@ -61,6 +61,91 @@ fn writes_nc4_coordinate_variable() {
 }
 
 #[test]
+fn writes_nc4_group_dimension_and_variable_paths() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "/science/",
+            "title",
+            NcAttrValue::Chars("science profile".to_string()),
+        )
+        .unwrap();
+    builder
+        .add_group_attribute(
+            "metadata",
+            "Conventions",
+            NcAttrValue::Chars("CF-1.11".to_string()),
+        )
+        .unwrap();
+    let z = builder.add_dimension_path("science/z", 3).unwrap();
+    let temp = builder
+        .add_variable_path::<f32>("science/temp", &[z])
+        .unwrap();
+    builder
+        .write_variable(temp, &[280.0_f32, 281.0, 282.0])
+        .unwrap();
+
+    let x = builder.add_dimension_path("/science/x/", 3).unwrap();
+    let coordinate = builder.add_variable_path::<f32>("science/x", &[x]).unwrap();
+    builder
+        .write_variable(coordinate, &[0.0_f32, 1.0, 2.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let group = file.group("science").unwrap();
+    assert_eq!(group.name, "science");
+    assert_eq!(
+        group.attribute("title").unwrap().value.as_string().unwrap(),
+        "science profile"
+    );
+    assert_eq!(
+        file.global_attribute("science/title")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "science profile"
+    );
+    assert_eq!(
+        file.group("metadata")
+            .unwrap()
+            .attribute("Conventions")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "CF-1.11"
+    );
+    assert_eq!(group.dimension("z").unwrap().size, 3);
+    assert_eq!(group.dimension("x").unwrap().size, 3);
+    assert_eq!(file.dimension("science/z").unwrap().size, 3);
+    assert_eq!(file.dimension("science/x").unwrap().size, 3);
+
+    let temp_variable = file.variable("science/temp").unwrap();
+    assert_eq!(temp_variable.shape(), vec![3]);
+    assert!(!temp_variable.is_coordinate_variable());
+    let temp_values = file.read_variable::<f32>("science/temp").unwrap();
+    assert_eq!(
+        temp_values.as_slice_memory_order().unwrap(),
+        &[280.0, 281.0, 282.0]
+    );
+
+    let coordinate_variable = file.variable("science/x").unwrap();
+    assert!(coordinate_variable.is_coordinate_variable_for("x"));
+    let coordinate_values = file.read_variable::<f32>("science/x").unwrap();
+    assert_eq!(
+        coordinate_values.as_slice_memory_order().unwrap(),
+        &[0.0, 1.0, 2.0]
+    );
+}
+
+#[test]
 fn writes_nc4_scalar_variable() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<i32>("answer", &[]).unwrap();
@@ -796,6 +881,44 @@ fn rejects_nc4_classic_string_variable() {
     let variable = builder.add_string_variable("name", &[]).unwrap();
     builder
         .write_string_variable(variable, &["enhanced"])
+        .unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_nc4_classic_group_paths() {
+    let mut builder = NcFileBuilder::new();
+    let dim = builder.add_dimension_path("science/x", 2).unwrap();
+    let variable = builder
+        .add_variable_path::<i32>("science/value", &[dim])
+        .unwrap();
+    builder.write_variable(variable, &[1_i32, 2]).unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_nc4_classic_group_attributes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "science",
+            "title",
+            NcAttrValue::Chars("enhanced model".to_string()),
+        )
         .unwrap();
 
     let err = builder

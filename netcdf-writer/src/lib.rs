@@ -199,6 +199,12 @@ struct DimensionDef {
 }
 
 #[derive(Debug, Clone)]
+struct GroupAttributeDef {
+    group_path: String,
+    attribute: NcAttribute,
+}
+
+#[derive(Debug, Clone)]
 struct VariableDef {
     name: String,
     dim_ids: Vec<DimensionId>,
@@ -248,6 +254,7 @@ impl VariableStorageDef {
 pub struct NcFileBuilder {
     dimensions: Vec<DimensionDef>,
     attributes: Vec<NcAttribute>,
+    group_attributes: Vec<GroupAttributeDef>,
     variables: Vec<VariableDef>,
 }
 
@@ -259,32 +266,27 @@ impl NcFileBuilder {
     pub fn add_dimension(&mut self, name: impl Into<String>, size: u64) -> Result<DimensionId> {
         let name = name.into();
         validate_name(&name, "dimension")?;
-        if size == 0 {
-            return Err(Error::InvalidDefinition(
-                "fixed dimensions must have non-zero size; use add_unlimited_dimension".into(),
-            ));
-        }
-        self.ensure_unique_dimension(&name)?;
-        let id = DimensionId(self.dimensions.len());
-        self.dimensions.push(DimensionDef {
-            name,
-            size,
-            is_unlimited: false,
-        });
-        Ok(id)
+        self.add_dimension_def(name, size, false)
+    }
+
+    pub fn add_dimension_path(
+        &mut self,
+        path: impl Into<String>,
+        size: u64,
+    ) -> Result<DimensionId> {
+        let path = validate_path_name(path.into(), "dimension")?;
+        self.add_dimension_def(path, size, false)
     }
 
     pub fn add_unlimited_dimension(&mut self, name: impl Into<String>) -> Result<DimensionId> {
         let name = name.into();
         validate_name(&name, "dimension")?;
-        self.ensure_unique_dimension(&name)?;
-        let id = DimensionId(self.dimensions.len());
-        self.dimensions.push(DimensionDef {
-            name,
-            size: 0,
-            is_unlimited: true,
-        });
-        Ok(id)
+        self.add_dimension_def(name, 0, true)
+    }
+
+    pub fn add_unlimited_dimension_path(&mut self, path: impl Into<String>) -> Result<DimensionId> {
+        let path = validate_path_name(path.into(), "dimension")?;
+        self.add_dimension_def(path, 0, true)
     }
 
     pub fn add_attribute(&mut self, name: impl Into<String>, value: NcAttrValue) -> Result<()> {
@@ -292,6 +294,31 @@ impl NcFileBuilder {
         validate_name(&name, "attribute")?;
         ensure_unique_attr(&self.attributes, &name)?;
         self.attributes.push(NcAttribute { name, value });
+        Ok(())
+    }
+
+    pub fn add_group_attribute(
+        &mut self,
+        group_path: impl Into<String>,
+        name: impl Into<String>,
+        value: NcAttrValue,
+    ) -> Result<()> {
+        let group_path = validate_path_name(group_path.into(), "group")?;
+        let name = name.into();
+        validate_name(&name, "attribute")?;
+        if self
+            .group_attributes
+            .iter()
+            .any(|attr| attr.group_path == group_path && attr.attribute.name == name)
+        {
+            return Err(Error::InvalidDefinition(format!(
+                "duplicate attribute '{name}' on group '{group_path}'"
+            )));
+        }
+        self.group_attributes.push(GroupAttributeDef {
+            group_path,
+            attribute: NcAttribute { name, value },
+        });
         Ok(())
     }
 
@@ -303,12 +330,28 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, T::nc_type())
     }
 
+    pub fn add_variable_path<T: NcWriteType>(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, T::nc_type())
+    }
+
     pub fn add_char_variable(
         &mut self,
         name: impl Into<String>,
         dimensions: &[DimensionId],
     ) -> Result<VariableId> {
         self.add_variable_with_type(name, dimensions, NcType::Char)
+    }
+
+    pub fn add_char_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, NcType::Char)
     }
 
     pub fn add_string_variable(
@@ -319,6 +362,14 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, NcType::String)
     }
 
+    pub fn add_string_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, NcType::String)
+    }
+
     pub fn add_user_defined_variable(
         &mut self,
         name: impl Into<String>,
@@ -327,6 +378,16 @@ impl NcFileBuilder {
     ) -> Result<VariableId> {
         validate_supported_user_defined_type(&dtype)?;
         self.add_variable_with_type(name, dimensions, dtype)
+    }
+
+    pub fn add_user_defined_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
+        validate_supported_user_defined_type(&dtype)?;
+        self.add_variable_path_with_type(path, dimensions, dtype)
     }
 
     pub fn add_variable_attribute(
@@ -952,6 +1013,12 @@ impl NcFileBuilder {
         for attr in &self.attributes {
             builder = builder.attribute(nc_attr_to_hdf5(attr)?);
         }
+        for group_attr in &self.group_attributes {
+            builder = builder.group_attribute(
+                group_attr.group_path.as_str(),
+                nc_attr_to_hdf5(&group_attr.attribute)?,
+            );
+        }
 
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
             if self
@@ -969,7 +1036,7 @@ impl NcFileBuilder {
                     "NAME",
                     format!(
                         "This is a netCDF dimension but not a netCDF variable. {}",
-                        dimension.name
+                        path_leaf_name(&dimension.name)
                     ),
                 ))
                 .attribute(
@@ -1058,7 +1125,7 @@ impl NcFileBuilder {
                     .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
                     .attribute(H5AttributeBuilder::fixed_string(
                         "NAME",
-                        self.dimensions[dim_id.0].name.as_str(),
+                        path_leaf_name(&self.dimensions[dim_id.0].name),
                     ))
                     .attribute(
                         H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id.0 as i32)
@@ -1136,6 +1203,27 @@ impl NcFileBuilder {
         ))
     }
 
+    fn add_dimension_def(
+        &mut self,
+        name: String,
+        size: u64,
+        is_unlimited: bool,
+    ) -> Result<DimensionId> {
+        if !is_unlimited && size == 0 {
+            return Err(Error::InvalidDefinition(
+                "fixed dimensions must have non-zero size; use add_unlimited_dimension".into(),
+            ));
+        }
+        self.ensure_unique_dimension(&name)?;
+        let id = DimensionId(self.dimensions.len());
+        self.dimensions.push(DimensionDef {
+            name,
+            size,
+            is_unlimited,
+        });
+        Ok(id)
+    }
+
     fn add_variable_with_type(
         &mut self,
         name: impl Into<String>,
@@ -1144,6 +1232,25 @@ impl NcFileBuilder {
     ) -> Result<VariableId> {
         let name = name.into();
         validate_name(&name, "variable")?;
+        self.add_variable_def(name, dimensions, dtype)
+    }
+
+    fn add_variable_path_with_type(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
+        let path = validate_path_name(path.into(), "variable")?;
+        self.add_variable_def(path, dimensions, dtype)
+    }
+
+    fn add_variable_def(
+        &mut self,
+        name: String,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
         if self.variables.iter().any(|v| v.name == name) {
             return Err(Error::InvalidDefinition(format!(
                 "duplicate variable '{name}'"
@@ -1342,6 +1449,10 @@ impl NcFileBuilder {
             })
             || self.attributes.iter().any(|a| attr_requires_cdf5(&a.value))
             || self
+                .group_attributes
+                .iter()
+                .any(|a| attr_requires_cdf5(&a.attribute.value))
+            || self
                 .variables
                 .iter()
                 .flat_map(|v| &v.attributes)
@@ -1369,6 +1480,7 @@ impl NcFileBuilder {
                     .into(),
             ));
         }
+        validate_root_only_names(self)?;
         for variable in &self.variables {
             if variable.storage.has_nc4_options() {
                 return Err(Error::UnsupportedFeature(format!(
@@ -2978,6 +3090,7 @@ fn validate_nc4_classic_attr_value(value: &NcAttrValue) -> Result<()> {
 
 #[cfg(feature = "netcdf4")]
 fn validate_nc4_classic_model(builder: &NcFileBuilder) -> Result<()> {
+    validate_root_only_names(builder)?;
     let unlimited_count = builder
         .dimensions
         .iter()
@@ -3044,6 +3157,50 @@ fn validate_name(name: &str, kind: &str) -> Result<()> {
     if name.contains('/') || name.bytes().any(|b| b == 0) {
         return Err(Error::InvalidDefinition(format!(
             "{kind} name '{name}' contains invalid characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path_name(path: String, kind: &str) -> Result<String> {
+    let trimmed = path.trim_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "{kind} path must not be empty"
+        )));
+    }
+    for component in trimmed.split('/') {
+        validate_name(component, kind)?;
+    }
+    Ok(trimmed)
+}
+
+#[cfg(feature = "netcdf4")]
+fn path_leaf_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn validate_root_only_names(builder: &NcFileBuilder) -> Result<()> {
+    for dimension in &builder.dimensions {
+        if dimension.name.contains('/') {
+            return Err(Error::UnsupportedFeature(format!(
+                "dimension '{}' requires NetCDF-4",
+                dimension.name
+            )));
+        }
+    }
+    for variable in &builder.variables {
+        if variable.name.contains('/') {
+            return Err(Error::UnsupportedFeature(format!(
+                "variable '{}' requires NetCDF-4",
+                variable.name
+            )));
+        }
+    }
+    if let Some(group_attr) = builder.group_attributes.first() {
+        return Err(Error::UnsupportedFeature(format!(
+            "group '{}' requires NetCDF-4",
+            group_attr.group_path
         )));
     }
     Ok(())
