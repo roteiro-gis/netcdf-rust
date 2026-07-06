@@ -2,8 +2,9 @@ use std::io::Cursor;
 
 use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
 use hdf5_writer::{
-    AttributeBuilder, ByteOrder, DatasetBuilder, FilterDescription, Hdf5Builder, Hdf5Writer,
-    WriteOptions, FILTER_DEFLATE, FILTER_SHUFFLE, UNLIMITED,
+    AttributeBuilder, ByteOrder, CompoundField, DatasetBuilder, Datatype, EnumMember,
+    FilterDescription, Hdf5Builder, Hdf5Writer, StringEncoding, StringPadding, VarLenKind,
+    WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, UNLIMITED,
 };
 
 #[test]
@@ -207,6 +208,231 @@ fn writes_fixed_string_arrays() {
         file.dataset("/labels").unwrap().read_strings().unwrap(),
         vec!["red".to_string(), "green".to_string(), "blue".to_string()]
     );
+}
+
+#[test]
+fn writes_enhanced_datatype_messages() {
+    let bitfield_type = Datatype::Bitfield {
+        size: 2,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let opaque_type = Datatype::Opaque {
+        size: 3,
+        tag: "rgb".to_string(),
+    };
+    let array_type = Datatype::Array {
+        base: Box::new(Datatype::FixedPoint {
+            size: 2,
+            signed: true,
+            byte_order: ByteOrder::LittleEndian,
+        }),
+        dims: vec![2],
+    };
+    let enum_type = Datatype::Enum {
+        base: Box::new(Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        }),
+        members: vec![
+            EnumMember {
+                name: "OFF".to_string(),
+                value: vec![0],
+            },
+            EnumMember {
+                name: "ON".to_string(),
+                value: vec![1],
+            },
+        ],
+    };
+    let compound_type = Datatype::Compound {
+        size: 12,
+        fields: vec![
+            CompoundField {
+                name: "id".to_string(),
+                byte_offset: 0,
+                datatype: Datatype::FixedPoint {
+                    size: 4,
+                    signed: true,
+                    byte_order: ByteOrder::LittleEndian,
+                },
+            },
+            CompoundField {
+                name: "value".to_string(),
+                byte_offset: 4,
+                datatype: Datatype::FloatingPoint {
+                    size: 8,
+                    byte_order: ByteOrder::LittleEndian,
+                },
+            },
+        ],
+    };
+    let compound_data = {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7_i32.to_le_bytes());
+        bytes.extend_from_slice(&3.5_f64.to_le_bytes());
+        bytes
+    };
+
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::new("flags", bitfield_type.clone(), vec![2])
+                .raw_data([0x34, 0x12, 0xcd, 0xab]),
+        )
+        .dataset(
+            DatasetBuilder::new("pixels", opaque_type.clone(), vec![2])
+                .raw_data([0xff, 0x00, 0x00, 0x00, 0xff, 0x00]),
+        )
+        .dataset(
+            DatasetBuilder::new("pairs", array_type.clone(), vec![2])
+                .raw_data([1, 0, 2, 0, 3, 0, 4, 0]),
+        )
+        .dataset(DatasetBuilder::new("states", enum_type.clone(), vec![3]).raw_data([0, 1, 1]))
+        .dataset(
+            DatasetBuilder::new("records", compound_type.clone(), vec![1])
+                .raw_data(compound_data.clone()),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dataset("/flags").unwrap().dtype(), &bitfield_type);
+    assert_eq!(
+        file.dataset("/flags").unwrap().read_raw_bytes().unwrap(),
+        vec![0x34, 0x12, 0xcd, 0xab]
+    );
+    assert_eq!(file.dataset("/pixels").unwrap().dtype(), &opaque_type);
+    assert_eq!(
+        file.dataset("/pixels").unwrap().read_raw_bytes().unwrap(),
+        vec![0xff, 0x00, 0x00, 0x00, 0xff, 0x00]
+    );
+    assert_eq!(file.dataset("/pairs").unwrap().dtype(), &array_type);
+    assert_eq!(
+        file.dataset("/pairs").unwrap().read_raw_bytes().unwrap(),
+        vec![1, 0, 2, 0, 3, 0, 4, 0]
+    );
+    assert_eq!(file.dataset("/states").unwrap().dtype(), &enum_type);
+    assert_eq!(
+        file.dataset("/states").unwrap().read_raw_bytes().unwrap(),
+        vec![0, 1, 1]
+    );
+    assert_eq!(file.dataset("/records").unwrap().dtype(), &compound_type);
+    assert_eq!(
+        file.dataset("/records").unwrap().read_raw_bytes().unwrap(),
+        compound_data
+    );
+}
+
+#[test]
+fn writes_vlen_string_dataset_backed_by_global_heap() {
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data("names", vec![3], &["alpha", "beta", "gamma"])
+                .unwrap(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.dataset("/names").unwrap().read_strings().unwrap(),
+        vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+    );
+}
+
+#[test]
+fn writes_chunked_vlen_string_dataset_backed_by_global_heap() {
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data(
+                "names",
+                vec![2, 2],
+                &["alpha", "beta", "gamma", "delta"],
+            )
+            .unwrap()
+            .chunked(vec![1, 2]),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/names").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 2]);
+    assert_eq!(
+        dataset.read_strings().unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string()
+        ]
+    );
+}
+
+#[test]
+fn writes_vlen_sequence_dataset_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: true,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let values = vec![
+        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_i16.to_le_bytes(),
+            11_i16.to_le_bytes(),
+            12_i16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_sequence_data("ragged", base.clone(), vec![3], values.clone())
+                .unwrap(),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/ragged").unwrap();
+    assert_eq!(
+        dataset.dtype(),
+        &Datatype::VarLen {
+            base: Box::new(base),
+            kind: VarLenKind::Sequence,
+            encoding: StringEncoding::Ascii,
+            padding: StringPadding::NullTerminate,
+        }
+    );
+
+    let raw = dataset.read_raw_bytes().unwrap();
+    let ref_size = dataset.vlen_reference_size();
+    let decoded = raw
+        .chunks_exact(ref_size)
+        .map(|reference| dataset.resolve_vlen_reference_bytes(reference, 2).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, values);
 }
 
 #[test]
@@ -481,6 +707,99 @@ fn writes_shuffle_deflate_dataset() {
 }
 
 #[test]
+fn writes_fletcher32_dataset() {
+    let values = (0_i16..35).map(|value| value * 11).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("checked", vec![5, 7], &values)
+                .unwrap()
+                .chunked(vec![2, 3])
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: Vec::new(),
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/checked").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i16>().unwrap();
+    assert_eq!(array.shape(), &[5, 7]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn writes_shuffle_deflate_fletcher32_pipeline() {
+    let values = (0_i32..42).map(|value| value * 4099).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("filtered", vec![6, 7], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_SHUFFLE,
+                    name: None,
+                    client_data: Vec::new(),
+                })
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![4],
+                })
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: Vec::new(),
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/filtered").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![3, 4]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.shape(), &[6, 7]);
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn rejects_fletcher32_client_data() {
+    let values = (0_i16..12).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("bad_checksum", vec![3, 4], &values)
+                .unwrap()
+                .chunked(vec![3, 4])
+                .filter(FilterDescription {
+                    id: FILTER_FLETCHER32,
+                    name: None,
+                    client_data: vec![1],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let err = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap_err();
+    assert!(err.to_string().contains("Fletcher32 filter"));
+}
+
+#[test]
 fn rejects_shuffle_with_wrong_element_size() {
     let values = (0_i32..12).collect::<Vec<_>>();
     let plan = Hdf5Builder::new()
@@ -526,6 +845,75 @@ fn writes_vlen_string_attribute_backed_by_global_heap() {
             .unwrap(),
         vec!["created".to_string(), "updated".to_string()]
     );
+}
+
+#[test]
+fn writes_vlen_sequence_attribute_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: false,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let sequences = vec![
+        [1_u16.to_le_bytes(), 2_u16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_u16.to_le_bytes(),
+            11_u16.to_le_bytes(),
+            12_u16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .attribute(
+            AttributeBuilder::vlen_sequences("ragged", base.clone(), sequences.clone()).unwrap(),
+        )
+        .dataset(DatasetBuilder::typed_data("data", vec![1], &[1_i32]).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let attr = file.root_group().unwrap().attribute("ragged").unwrap();
+    assert_eq!(
+        &attr.datatype,
+        &Datatype::VarLen {
+            base: Box::new(base),
+            kind: VarLenKind::Sequence,
+            encoding: StringEncoding::Ascii,
+            padding: StringPadding::NullTerminate,
+        }
+    );
+    assert_eq!(attr.shape, vec![3]);
+    assert_eq!(attr.raw_data.len(), 48);
+
+    let decoded = attr
+        .raw_data
+        .chunks_exact(16)
+        .map(|reference| {
+            let seq_len = u32::from_le_bytes(reference[0..4].try_into().unwrap()) as usize;
+            let heap_addr = u64::from_le_bytes(reference[4..12].try_into().unwrap());
+            let heap_index = u32::from_le_bytes(reference[12..16].try_into().unwrap()) as u16;
+            if heap_index == 0 {
+                assert_eq!(seq_len, 0);
+                return Vec::new();
+            }
+            let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+                file.storage(),
+                heap_addr,
+                file.superblock().offset_size,
+                file.superblock().length_size,
+            )
+            .unwrap();
+            let object = heap.get_object(heap_index).unwrap();
+            object.data[..seq_len * 2].to_vec()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, sequences);
 }
 
 #[test]

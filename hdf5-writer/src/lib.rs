@@ -9,10 +9,11 @@ use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
 
 pub use hdf5_core::{
-    jenkins_lookup3, ByteOrder, ChunkIndexing, DataLayout, DataspaceMessage, DataspaceType,
-    Datatype, FillTime, FillValueMessage, FilterDescription, FilterPipelineMessage, ReferenceType,
-    StringEncoding, StringPadding, StringSize, VarLenKind, FILTER_DEFLATE, FILTER_FLETCHER32,
-    FILTER_LZ4, FILTER_NBIT, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP, UNLIMITED,
+    fletcher32, jenkins_lookup3, ByteOrder, ChunkIndexing, CompoundField, DataLayout,
+    DataspaceMessage, DataspaceType, Datatype, EnumMember, FillTime, FillValueMessage,
+    FilterDescription, FilterPipelineMessage, ReferenceType, StringEncoding, StringPadding,
+    StringSize, VarLenKind, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZ4, FILTER_NBIT,
+    FILTER_SCALEOFFSET, FILTER_SHUFFLE, FILTER_SZIP, UNLIMITED,
 };
 
 const HDF5_MAGIC: [u8; 8] = [0x89, b'H', b'D', b'F', 0x0d, 0x0a, 0x1a, 0x0a];
@@ -211,6 +212,8 @@ pub struct DatasetBuilder {
     filters: Vec<FilterDescription>,
     fill_value: Option<Vec<u8>>,
     raw_data: Option<Vec<u8>>,
+    vlen_string_values: Option<Vec<String>>,
+    vlen_sequence_values: Option<Vec<Vec<u8>>>,
     attributes: Vec<AttributeBuilder>,
 }
 
@@ -232,6 +235,8 @@ impl DatasetBuilder {
             filters: Vec::new(),
             fill_value: None,
             raw_data: None,
+            vlen_string_values: None,
+            vlen_sequence_values: None,
             attributes: Vec::new(),
         }
     }
@@ -275,6 +280,104 @@ impl DatasetBuilder {
         Ok(Self::new(name, datatype, shape).raw_data(raw_data))
     }
 
+    pub fn vlen_string_data<S: AsRef<str>>(
+        name: impl Into<String>,
+        shape: impl Into<Vec<u64>>,
+        values: &[S],
+    ) -> Result<Self> {
+        let name = name.into();
+        let shape = shape.into();
+        let expected = expected_element_count(&shape)?;
+        if values.len() != expected {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' expects {expected} string elements, got {}",
+                name,
+                values.len()
+            )));
+        }
+
+        let mut strings = Vec::with_capacity(values.len());
+        let mut encoding = StringEncoding::Ascii;
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "variable-length string values cannot contain NUL bytes".into(),
+                ));
+            }
+            if !value.is_ascii() {
+                encoding = StringEncoding::Utf8;
+            }
+            strings.push(value.to_string());
+        }
+
+        Ok(Self {
+            name,
+            datatype: Datatype::String {
+                size: StringSize::Variable,
+                encoding,
+                padding: StringPadding::NullTerminate,
+            },
+            shape,
+            max_shape: None,
+            layout: PlannedLayout::Contiguous,
+            filters: Vec::new(),
+            fill_value: None,
+            raw_data: None,
+            vlen_string_values: Some(strings),
+            vlen_sequence_values: None,
+            attributes: Vec::new(),
+        })
+    }
+
+    pub fn vlen_sequence_data(
+        name: impl Into<String>,
+        base: Datatype,
+        shape: impl Into<Vec<u64>>,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        let shape = shape.into();
+        let expected = expected_element_count(&shape)?;
+        if values.len() != expected {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' expects {expected} vlen sequence elements, got {}",
+                name,
+                values.len()
+            )));
+        }
+        validate_vlen_sequence_base(&base)?;
+        let base_size = datatype_element_size(&base)?;
+        for value in &values {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    name,
+                    value.len()
+                )));
+            }
+        }
+
+        Ok(Self {
+            name,
+            datatype: Datatype::VarLen {
+                base: Box::new(base),
+                kind: VarLenKind::Sequence,
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullTerminate,
+            },
+            shape,
+            max_shape: None,
+            layout: PlannedLayout::Contiguous,
+            filters: Vec::new(),
+            fill_value: None,
+            raw_data: None,
+            vlen_string_values: None,
+            vlen_sequence_values: Some(values),
+            attributes: Vec::new(),
+        })
+    }
+
     pub fn max_shape(mut self, max_shape: impl Into<Vec<u64>>) -> Self {
         self.max_shape = Some(max_shape.into());
         self
@@ -304,6 +407,8 @@ impl DatasetBuilder {
 
     pub fn raw_data(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.raw_data = Some(bytes.into());
+        self.vlen_string_values = None;
+        self.vlen_sequence_values = None;
         self
     }
 
@@ -324,6 +429,8 @@ impl DatasetBuilder {
             value.write_one(byte_order, &mut bytes);
         }
         self.raw_data = Some(bytes);
+        self.vlen_string_values = None;
+        self.vlen_sequence_values = None;
         Ok(self)
     }
 
@@ -397,6 +504,37 @@ impl DatasetBuilder {
                 )));
             }
         }
+        if let Some(values) = &self.vlen_sequence_values {
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &self.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence values require a sequence datatype",
+                    self.name
+                )));
+            };
+            let expected = expected_element_count(&self.shape)?;
+            if values.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence shape must match value count",
+                    self.name
+                )));
+            }
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            for value in values {
+                if value.len() % base_size != 0 {
+                    return Err(Error::InvalidDefinition(format!(
+                        "dataset '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                        self.name,
+                        value.len()
+                    )));
+                }
+            }
+        }
         validate_attributes(&self.attributes)?;
         Ok(())
     }
@@ -411,6 +549,7 @@ pub struct AttributeBuilder {
     raw_data: Vec<u8>,
     vlen_object_reference_targets: Option<Vec<Vec<String>>>,
     vlen_string_values: Option<Vec<String>>,
+    vlen_sequence_values: Option<Vec<Vec<u8>>>,
 }
 
 impl AttributeBuilder {
@@ -427,6 +566,7 @@ impl AttributeBuilder {
             raw_data: raw_data.into(),
             vlen_object_reference_targets: None,
             vlen_string_values: None,
+            vlen_sequence_values: None,
         }
     }
 
@@ -505,6 +645,7 @@ impl AttributeBuilder {
             raw_data: Vec::new(),
             vlen_object_reference_targets: Some(target_sequences),
             vlen_string_values: None,
+            vlen_sequence_values: None,
         }
     }
 
@@ -543,6 +684,46 @@ impl AttributeBuilder {
             raw_data: Vec::new(),
             vlen_object_reference_targets: None,
             vlen_string_values: Some(strings),
+            vlen_sequence_values: None,
+        })
+    }
+
+    pub fn vlen_sequences(
+        name: impl Into<String>,
+        base: Datatype,
+        values: Vec<Vec<u8>>,
+    ) -> Result<Self> {
+        let name = name.into();
+        validate_vlen_sequence_base(&base)?;
+        let base_size = datatype_element_size(&base)?;
+        for value in &values {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    name,
+                    value.len()
+                )));
+            }
+        }
+        let element_count = u64::try_from(values.len()).map_err(|_| {
+            Error::InvalidDefinition(
+                "vlen sequence attribute element count exceeds u64 capacity".into(),
+            )
+        })?;
+
+        Ok(Self {
+            name,
+            datatype: Datatype::VarLen {
+                base: Box::new(base),
+                kind: VarLenKind::Sequence,
+                encoding: StringEncoding::Ascii,
+                padding: StringPadding::NullTerminate,
+            },
+            shape: vec![element_count],
+            raw_data: Vec::new(),
+            vlen_object_reference_targets: None,
+            vlen_string_values: None,
+            vlen_sequence_values: Some(values),
         })
     }
 
@@ -576,6 +757,37 @@ impl AttributeBuilder {
                     return Err(Error::InvalidDefinition(format!(
                         "attribute '{}' vlen string values cannot contain NUL bytes",
                         self.name
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        if let Some(values) = &self.vlen_sequence_values {
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &self.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence values require a sequence datatype",
+                    self.name
+                )));
+            };
+            if self.shape != [values.len() as u64] {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' vlen sequence shape must match value count",
+                    self.name
+                )));
+            }
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            for value in values {
+                if value.len() % base_size != 0 {
+                    return Err(Error::InvalidDefinition(format!(
+                        "attribute '{}' vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                        self.name,
+                        value.len()
                     )));
                 }
             }
@@ -760,7 +972,7 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
 #[derive(Debug)]
 struct DatasetEmission<'a> {
     dataset: &'a DatasetBuilder,
-    raw_data: &'a [u8],
+    raw_data: Vec<u8>,
     header_address: u64,
     data_address: u64,
     header: Vec<u8>,
@@ -818,6 +1030,7 @@ struct GlobalHeapObjectPlan {
 struct PlannedAttributes {
     root: Vec<PlannedAttribute>,
     datasets: Vec<Vec<PlannedAttribute>>,
+    dataset_vlen_refs: Vec<Option<Vec<VLenHeapReference>>>,
     heap_objects: Vec<GlobalHeapObjectPlan>,
 }
 
@@ -845,17 +1058,20 @@ impl PlannedAttribute {
         match &self.raw_data {
             PlannedAttributeRaw::Inline(raw_data) => raw_data.clone(),
             PlannedAttributeRaw::GlobalHeapVLenReferences(refs) => {
-                let mut raw_data =
-                    Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
-                for reference in refs {
-                    raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
-                    raw_data.extend_from_slice(&heap_address.to_le_bytes());
-                    raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
-                }
-                raw_data
+                encode_vlen_heap_references(refs, heap_address)
             }
         }
     }
+}
+
+fn encode_vlen_heap_references(refs: &[VLenHeapReference], heap_address: u64) -> Vec<u8> {
+    let mut raw_data = Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
+    for reference in refs {
+        raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
+        raw_data.extend_from_slice(&heap_address.to_le_bytes());
+        raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
+    }
+    raw_data
 }
 
 fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u8>> {
@@ -1025,13 +1241,16 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
-    for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
-        prepared
-            .iter()
-            .zip(&planned_attributes.datasets)
-            .zip(header_addresses.iter().copied())
-            .zip(data_addresses.iter().copied())
-            .zip(chunk_index_addresses.iter().copied())
+    for (
+        dataset_index,
+        ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address),
+    ) in prepared
+        .iter()
+        .zip(&planned_attributes.datasets)
+        .zip(header_addresses.iter().copied())
+        .zip(data_addresses.iter().copied())
+        .zip(chunk_index_addresses.iter().copied())
+        .enumerate()
     {
         let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
@@ -1052,9 +1271,14 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         } else {
             None
         };
+        let raw_data = if let Some(refs) = &planned_attributes.dataset_vlen_refs[dataset_index] {
+            dataset_vlen_storage_data(prepared_dataset.dataset, refs, heap_address)?
+        } else {
+            prepared_dataset.raw_data.clone()
+        };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
-            raw_data: &prepared_dataset.raw_data,
+            raw_data,
             header_address,
             data_address,
             header,
@@ -1090,7 +1314,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     for emission in &emissions {
         if !matches!(emission.dataset.layout, PlannedLayout::Compact) {
             pad_to_address(&mut file, emission.data_address)?;
-            file.extend_from_slice(emission.raw_data);
+            file.extend_from_slice(&emission.raw_data);
         }
     }
 
@@ -1148,7 +1372,92 @@ fn prepare_datasets(
             }
         }
         let expected = expected_data_len(&dataset.shape, element_size)?;
-        let (storage_data, chunk_index) = if let Some(raw_data) = dataset.raw_data.as_deref() {
+        let (storage_data, chunk_index) = if let Some(values) = &dataset.vlen_string_values {
+            if dataset.fill_value.is_some() {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' cannot combine variable-length strings with a fill value",
+                    dataset.name
+                )));
+            }
+            if matches!(dataset.layout, PlannedLayout::Compact) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compact variable-length string HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            if !filters.is_empty() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "filtered variable-length string HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            let refs = placeholder_vlen_string_references(&dataset.name, values)?;
+            let raw_data = encode_vlen_heap_references(&refs, 0);
+            if raw_data.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' expects {expected} vlen reference bytes, got {}",
+                    dataset.name,
+                    raw_data.len()
+                )));
+            }
+            match &dataset.layout {
+                PlannedLayout::Contiguous => (raw_data, None),
+                PlannedLayout::Chunked { chunk_shape } => (
+                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
+                    None,
+                ),
+                PlannedLayout::Compact => unreachable!("compact vlen string datasets rejected"),
+            }
+        } else if let Some(values) = &dataset.vlen_sequence_values {
+            if dataset.fill_value.is_some() {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' cannot combine variable-length sequences with a fill value",
+                    dataset.name
+                )));
+            }
+            if matches!(dataset.layout, PlannedLayout::Compact) {
+                return Err(Error::UnsupportedFeature(format!(
+                    "compact variable-length sequence HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            if !filters.is_empty() {
+                return Err(Error::UnsupportedFeature(format!(
+                    "filtered variable-length sequence HDF5 datasets are not emitted yet: '{}'",
+                    dataset.name
+                )));
+            }
+            let Datatype::VarLen {
+                base,
+                kind: VarLenKind::Sequence,
+                ..
+            } = &dataset.datatype
+            else {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' vlen sequence values require a sequence datatype",
+                    dataset.name
+                )));
+            };
+            validate_vlen_sequence_base(base)?;
+            let base_size = datatype_element_size(base)?;
+            let refs = placeholder_vlen_sequence_references(&dataset.name, values, base_size)?;
+            let raw_data = encode_vlen_heap_references(&refs, 0);
+            if raw_data.len() != expected {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' expects {expected} vlen reference bytes, got {}",
+                    dataset.name,
+                    raw_data.len()
+                )));
+            }
+            match &dataset.layout {
+                PlannedLayout::Contiguous => (raw_data, None),
+                PlannedLayout::Chunked { chunk_shape } => (
+                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
+                    None,
+                ),
+                PlannedLayout::Compact => unreachable!("compact vlen sequence datasets rejected"),
+            }
+        } else if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
                     "dataset '{}' expects {expected} data bytes, got {}",
@@ -1439,9 +1748,15 @@ fn plan_attributes(
             plan_attribute_list(&dataset.attributes, target_addresses, &mut heap_objects)
         })
         .collect::<Result<Vec<_>>>()?;
+    let dataset_vlen_refs = plan
+        .datasets
+        .iter()
+        .map(|dataset| plan_dataset_vlen_values(dataset, &mut heap_objects))
+        .collect::<Result<Vec<_>>>()?;
     Ok(PlannedAttributes {
         root,
         datasets,
+        dataset_vlen_refs,
         heap_objects,
     })
 }
@@ -1464,28 +1779,29 @@ fn plan_attribute(
 ) -> Result<PlannedAttribute> {
     attribute.validate()?;
     if let Some(values) = &attribute.vlen_string_values {
-        let mut refs = Vec::with_capacity(values.len());
-        for value in values {
-            let index = checked_heap_index(heap_objects.len() + 1)?;
-            let mut data = Vec::with_capacity(value.len() + 1);
-            data.extend_from_slice(value.as_bytes());
-            data.push(0);
-            let sequence_len = u32::try_from(data.len()).map_err(|_| {
-                Error::UnsupportedFeature(format!(
-                    "attribute '{}' vlen string exceeds u32 capacity",
-                    attribute.name
-                ))
-            })?;
-            heap_objects.push(GlobalHeapObjectPlan {
-                index,
-                reference_count: 1,
-                data,
-            });
-            refs.push(VLenHeapReference {
-                sequence_len,
-                heap_index: index,
-            });
-        }
+        let refs = plan_vlen_string_heap_references(&attribute.name, values, heap_objects)?;
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::GlobalHeapVLenReferences(refs),
+        })
+    } else if let Some(values) = &attribute.vlen_sequence_values {
+        let Datatype::VarLen {
+            base,
+            kind: VarLenKind::Sequence,
+            ..
+        } = &attribute.datatype
+        else {
+            return Err(Error::InvalidDefinition(format!(
+                "attribute '{}' vlen sequence values require a sequence datatype",
+                attribute.name
+            )));
+        };
+        validate_vlen_sequence_base(base)?;
+        let base_size = datatype_element_size(base)?;
+        let refs =
+            plan_vlen_sequence_heap_references(&attribute.name, values, base_size, heap_objects)?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -1535,6 +1851,172 @@ fn plan_attribute(
             shape: attribute.shape.clone(),
             raw_data: PlannedAttributeRaw::Inline(attribute.raw_data.clone()),
         })
+    }
+}
+
+fn plan_dataset_vlen_values(
+    dataset: &DatasetBuilder,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Option<Vec<VLenHeapReference>>> {
+    if let Some(values) = dataset.vlen_string_values.as_ref() {
+        return plan_vlen_string_heap_references(&dataset.name, values, heap_objects).map(Some);
+    }
+    if let Some(values) = dataset.vlen_sequence_values.as_ref() {
+        let Datatype::VarLen {
+            base,
+            kind: VarLenKind::Sequence,
+            ..
+        } = &dataset.datatype
+        else {
+            return Err(Error::InvalidDefinition(format!(
+                "dataset '{}' vlen sequence values require a sequence datatype",
+                dataset.name
+            )));
+        };
+        validate_vlen_sequence_base(base)?;
+        let base_size = datatype_element_size(base)?;
+        return plan_vlen_sequence_heap_references(&dataset.name, values, base_size, heap_objects)
+            .map(Some);
+    }
+    Ok(None)
+}
+
+fn plan_vlen_string_heap_references(
+    context: &str,
+    values: &[String],
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Vec<VLenHeapReference>> {
+    let mut refs = Vec::with_capacity(values.len());
+    for value in values {
+        let index = checked_heap_index(heap_objects.len() + 1)?;
+        let mut data = Vec::with_capacity(value.len() + 1);
+        data.extend_from_slice(value.as_bytes());
+        data.push(0);
+        let sequence_len = u32::try_from(data.len()).map_err(|_| {
+            Error::UnsupportedFeature(format!(
+                "'{context}' variable-length string exceeds u32 capacity"
+            ))
+        })?;
+        heap_objects.push(GlobalHeapObjectPlan {
+            index,
+            reference_count: 1,
+            data,
+        });
+        refs.push(VLenHeapReference {
+            sequence_len,
+            heap_index: index,
+        });
+    }
+    Ok(refs)
+}
+
+fn placeholder_vlen_string_references(
+    context: &str,
+    values: &[String],
+) -> Result<Vec<VLenHeapReference>> {
+    values
+        .iter()
+        .map(|value| {
+            let sequence_len = value
+                .len()
+                .checked_add(1)
+                .and_then(|len| u32::try_from(len).ok())
+                .ok_or_else(|| {
+                    Error::UnsupportedFeature(format!(
+                        "'{context}' variable-length string exceeds u32 capacity"
+                    ))
+                })?;
+            Ok(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            })
+        })
+        .collect()
+}
+
+fn plan_vlen_sequence_heap_references(
+    context: &str,
+    values: &[Vec<u8>],
+    base_size: usize,
+    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+) -> Result<Vec<VLenHeapReference>> {
+    let mut refs = Vec::with_capacity(values.len());
+    for value in values {
+        if value.len() % base_size != 0 {
+            return Err(Error::InvalidDefinition(format!(
+                "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
+                value.len()
+            )));
+        }
+        let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
+            Error::UnsupportedFeature(format!(
+                "'{context}' variable-length sequence exceeds u32 element capacity"
+            ))
+        })?;
+        if sequence_len == 0 {
+            refs.push(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            });
+            continue;
+        }
+        let index = checked_heap_index(heap_objects.len() + 1)?;
+        heap_objects.push(GlobalHeapObjectPlan {
+            index,
+            reference_count: 1,
+            data: value.clone(),
+        });
+        refs.push(VLenHeapReference {
+            sequence_len,
+            heap_index: index,
+        });
+    }
+    Ok(refs)
+}
+
+fn placeholder_vlen_sequence_references(
+    context: &str,
+    values: &[Vec<u8>],
+    base_size: usize,
+) -> Result<Vec<VLenHeapReference>> {
+    values
+        .iter()
+        .map(|value| {
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
+                    value.len()
+                )));
+            }
+            let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
+                Error::UnsupportedFeature(format!(
+                    "'{context}' variable-length sequence exceeds u32 element capacity"
+                ))
+            })?;
+            Ok(VLenHeapReference {
+                sequence_len,
+                heap_index: 0,
+            })
+        })
+        .collect()
+}
+
+fn dataset_vlen_storage_data(
+    dataset: &DatasetBuilder,
+    refs: &[VLenHeapReference],
+    heap_address: u64,
+) -> Result<Vec<u8>> {
+    let element_size = datatype_element_size(&dataset.datatype)?;
+    let raw_data = encode_vlen_heap_references(refs, heap_address);
+    match &dataset.layout {
+        PlannedLayout::Contiguous => Ok(raw_data),
+        PlannedLayout::Chunked { chunk_shape } => {
+            chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)
+        }
+        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
+            "compact variable-length HDF5 datasets are not emitted yet: '{}'",
+            dataset.name
+        ))),
     }
 }
 
@@ -1870,10 +2352,191 @@ fn encode_datatype_message(datatype: &Datatype) -> Result<Vec<u8>> {
             bytes.extend_from_slice(&encode_datatype_message(base)?);
             Ok(bytes)
         }
-        other => Err(Error::UnsupportedFeature(format!(
-            "datatype emission is not implemented for {other:?}"
-        ))),
+        Datatype::Bitfield { size, byte_order } => {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(4, 1, byte_order_flag(*byte_order)).to_le_bytes());
+            bytes.extend_from_slice(&u32::from(*size).to_le_bytes());
+            bytes.extend_from_slice(&0u16.to_le_bytes());
+            bytes.extend_from_slice(&(u16::from(*size) * 8).to_le_bytes());
+            Ok(bytes)
+        }
+        Datatype::Opaque { size, tag } => {
+            let tag_len = if tag.is_empty() {
+                0
+            } else {
+                checked_add_usize(tag.len(), 1, "opaque datatype tag length")?
+            };
+            if tag.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "opaque datatype tag cannot contain NUL bytes".into(),
+                ));
+            }
+            let flags = u32::try_from(tag_len).map_err(|_| {
+                Error::UnsupportedFeature("opaque datatype tag exceeds u32 capacity".into())
+            })?;
+            if flags > 0xff {
+                return Err(Error::UnsupportedFeature(
+                    "opaque datatype tag exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(5, 1, flags).to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            if tag_len > 0 {
+                bytes.extend_from_slice(tag.as_bytes());
+                bytes.push(0);
+                align_vec(&mut bytes, 8);
+            }
+            Ok(bytes)
+        }
+        Datatype::Compound { size, fields } => {
+            let n_fields = u32::try_from(fields.len()).map_err(|_| {
+                Error::UnsupportedFeature(
+                    "compound datatype member count exceeds u32 capacity".into(),
+                )
+            })?;
+            if n_fields > 0xffff {
+                return Err(Error::UnsupportedFeature(
+                    "compound datatype member count exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            let offset_size = compound_member_offset_size(*size);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(6, 3, n_fields).to_le_bytes());
+            bytes.extend_from_slice(&size.to_le_bytes());
+            let mut names = std::collections::BTreeSet::new();
+            for field in fields {
+                encode_datatype_name(&field.name, "compound field")?;
+                if !names.insert(field.name.as_str()) {
+                    return Err(Error::InvalidDefinition(format!(
+                        "duplicate compound field '{}'",
+                        field.name
+                    )));
+                }
+                let field_size =
+                    u32::try_from(datatype_element_size(&field.datatype)?).map_err(|_| {
+                        Error::UnsupportedFeature(format!(
+                            "compound field '{}' size exceeds u32 capacity",
+                            field.name
+                        ))
+                    })?;
+                let field_end = field.byte_offset.checked_add(field_size).ok_or_else(|| {
+                    Error::InvalidDefinition(format!(
+                        "compound field '{}' offset overflows datatype size",
+                        field.name
+                    ))
+                })?;
+                if field_end > *size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "compound field '{}' byte range {}..{} is outside datatype size {size}",
+                        field.name, field.byte_offset, field_end
+                    )));
+                }
+                bytes.extend_from_slice(field.name.as_bytes());
+                bytes.push(0);
+                write_uvar(u64::from(field.byte_offset), offset_size, &mut bytes);
+                bytes.extend_from_slice(&encode_datatype_message(&field.datatype)?);
+            }
+            Ok(bytes)
+        }
+        Datatype::Enum { base, members } => {
+            let n_members = u32::try_from(members.len()).map_err(|_| {
+                Error::UnsupportedFeature("enum datatype member count exceeds u32 capacity".into())
+            })?;
+            if n_members > 0xffff {
+                return Err(Error::UnsupportedFeature(
+                    "enum datatype member count exceeds HDF5 class flag capacity".into(),
+                ));
+            }
+            if !matches!(base.as_ref(), Datatype::FixedPoint { .. }) {
+                return Err(Error::InvalidDefinition(
+                    "enum datatype base must be fixed-point integer".into(),
+                ));
+            }
+            let value_size = datatype_element_size(base)?;
+            let value_size_u32 = u32::try_from(value_size).map_err(|_| {
+                Error::UnsupportedFeature("enum datatype value size exceeds u32 capacity".into())
+            })?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(8, 3, n_members).to_le_bytes());
+            bytes.extend_from_slice(&value_size_u32.to_le_bytes());
+            bytes.extend_from_slice(&encode_datatype_message(base)?);
+            let mut names = std::collections::BTreeSet::new();
+            for member in members {
+                encode_datatype_name(&member.name, "enum member")?;
+                if !names.insert(member.name.as_str()) {
+                    return Err(Error::InvalidDefinition(format!(
+                        "duplicate enum member '{}'",
+                        member.name
+                    )));
+                }
+                bytes.extend_from_slice(member.name.as_bytes());
+                bytes.push(0);
+            }
+            for member in members {
+                if member.value.len() != value_size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "enum member '{}' value byte length must be {value_size}, got {}",
+                        member.name,
+                        member.value.len()
+                    )));
+                }
+                bytes.extend_from_slice(&member.value);
+            }
+            Ok(bytes)
+        }
+        Datatype::Array { base, dims } => {
+            let rank = u8::try_from(dims.len()).map_err(|_| {
+                Error::UnsupportedFeature("array datatype rank exceeds HDF5 capacity".into())
+            })?;
+            let element_size = datatype_element_size(datatype)?;
+            let element_size_u32 = u32::try_from(element_size).map_err(|_| {
+                Error::UnsupportedFeature("array datatype element size exceeds u32 capacity".into())
+            })?;
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&class_word(10, 3, 0).to_le_bytes());
+            bytes.extend_from_slice(&element_size_u32.to_le_bytes());
+            bytes.push(rank);
+            for &dim in dims {
+                let dim = u32::try_from(dim).map_err(|_| {
+                    Error::UnsupportedFeature(
+                        "array datatype dimension exceeds HDF5 u32 capacity".into(),
+                    )
+                })?;
+                bytes.extend_from_slice(&dim.to_le_bytes());
+            }
+            bytes.extend_from_slice(&encode_datatype_message(base)?);
+            Ok(bytes)
+        }
     }
+}
+
+fn encode_datatype_name(name: &str, context: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "{context} name must not be empty"
+        )));
+    }
+    if name.as_bytes().contains(&0) {
+        return Err(Error::InvalidDefinition(format!(
+            "{context} name cannot contain NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn compound_member_offset_size(size: u32) -> usize {
+    match size {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
+        0x1_0000..=0xff_ffff => 3,
+        _ => 4,
+    }
+}
+
+fn align_vec(bytes: &mut Vec<u8>, align: usize) {
+    let padding = (align - (bytes.len() % align)) % align;
+    bytes.resize(bytes.len() + padding, 0);
 }
 
 fn encode_contiguous_layout_message(address: u64, size: u64) -> Vec<u8> {
@@ -2126,6 +2789,41 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
     }
 }
 
+fn validate_vlen_sequence_base(datatype: &Datatype) -> Result<()> {
+    if datatype_element_size(datatype)? == 0 {
+        return Err(Error::InvalidDefinition(
+            "variable-length sequence base datatype must have non-zero byte size".into(),
+        ));
+    }
+    match datatype {
+        Datatype::String {
+            size: StringSize::Variable,
+            ..
+        }
+        | Datatype::VarLen { .. } => Err(Error::UnsupportedFeature(
+            "nested heap-backed variable-length sequence bases are not emitted yet".into(),
+        )),
+        Datatype::Compound { fields, .. } => {
+            for field in fields {
+                validate_vlen_sequence_base(&field.datatype)?;
+            }
+            Ok(())
+        }
+        Datatype::Array { base, .. } | Datatype::Enum { base, .. } => {
+            validate_vlen_sequence_base(base)
+        }
+        Datatype::FixedPoint { .. }
+        | Datatype::FloatingPoint { .. }
+        | Datatype::Bitfield { .. }
+        | Datatype::Reference { .. }
+        | Datatype::String {
+            size: StringSize::Fixed(_),
+            ..
+        }
+        | Datatype::Opaque { .. } => Ok(()),
+    }
+}
+
 fn validate_writer_filters(
     dataset: &DatasetBuilder,
     element_size: usize,
@@ -2139,9 +2837,6 @@ fn validate_writer_filters(
         ));
     };
     let _ = chunk_count(&dataset.shape, chunk_shape)?;
-    let element_size_client_data = u32::try_from(element_size).map_err(|_| {
-        Error::UnsupportedFeature("shuffle filter element size exceeds u32 capacity".into())
-    })?;
     let mut filters = Vec::with_capacity(dataset.filters.len());
     for filter in &dataset.filters {
         match filter.id {
@@ -2164,6 +2859,11 @@ fn validate_writer_filters(
                         "well-known HDF5 shuffle filter must not carry a name".into(),
                     ));
                 }
+                let element_size_client_data = u32::try_from(element_size).map_err(|_| {
+                    Error::UnsupportedFeature(
+                        "shuffle filter element size exceeds u32 capacity".into(),
+                    )
+                })?;
                 match filter.client_data.as_slice() {
                     [] => filters.push(FilterDescription {
                         id: FILTER_SHUFFLE,
@@ -2182,6 +2882,19 @@ fn validate_writer_filters(
                         ));
                     }
                 }
+            }
+            FILTER_FLETCHER32 => {
+                if filter.name.is_some() {
+                    return Err(Error::InvalidDefinition(
+                        "well-known HDF5 Fletcher32 filter must not carry a name".into(),
+                    ));
+                }
+                if !filter.client_data.is_empty() {
+                    return Err(Error::InvalidDefinition(
+                        "Fletcher32 filter must not carry client data".into(),
+                    ));
+                }
+                filters.push(filter.clone());
             }
             other => {
                 return Err(Error::UnsupportedFeature(format!(
@@ -2203,6 +2916,7 @@ fn apply_write_filters(
         current = match filter.id {
             FILTER_SHUFFLE => shuffle_filter(&current, element_size),
             FILTER_DEFLATE => deflate_filter(&current, filter)?,
+            FILTER_FLETCHER32 => fletcher32_filter(&current),
             other => {
                 return Err(Error::UnsupportedFeature(format!(
                     "HDF5 filter id {other} is not implemented for writing"
@@ -2235,6 +2949,13 @@ fn shuffle_filter(data: &[u8], element_size: usize) -> Vec<u8> {
     if complete < data.len() {
         output[complete..].copy_from_slice(&data[complete..]);
     }
+    output
+}
+
+fn fletcher32_filter(data: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(data.len() + 4);
+    output.extend_from_slice(data);
+    output.extend_from_slice(&fletcher32(data).to_le_bytes());
     output
 }
 
@@ -2645,13 +3366,8 @@ fn size_width_for(value: u64) -> Result<(u8, usize)> {
 }
 
 fn write_uvar(value: u64, width: usize, dst: &mut Vec<u8>) {
-    match width {
-        1 => dst.push(value as u8),
-        2 => dst.extend_from_slice(&(value as u16).to_le_bytes()),
-        4 => dst.extend_from_slice(&(value as u32).to_le_bytes()),
-        8 => dst.extend_from_slice(&value.to_le_bytes()),
-        _ => unreachable!("validated HDF5 variable integer width"),
-    }
+    let bytes = value.to_le_bytes();
+    dst.extend_from_slice(&bytes[..width]);
 }
 
 fn pad_to_address(bytes: &mut Vec<u8>, address: u64) -> Result<()> {
