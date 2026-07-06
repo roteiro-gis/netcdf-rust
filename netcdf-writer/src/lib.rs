@@ -544,6 +544,20 @@ impl NcFileBuilder {
         Ok(())
     }
 
+    pub fn write_user_defined_variable_slice_bytes(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let elem_size = {
+            let variable = self.variable(variable)?;
+            validate_fixed_width_user_defined_type(&variable.dtype)?;
+            variable.dtype.size()?
+        };
+        self.write_native_variable_slice_bytes(variable, selection, bytes, elem_size)
+    }
+
     pub fn write_enum_variable(
         &mut self,
         variable: VariableId,
@@ -565,6 +579,34 @@ impl NcFileBuilder {
         variable.string_values = None;
         variable.vlen_values = None;
         Ok(())
+    }
+
+    pub fn write_enum_variable_slice(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[NcIntegerValue],
+    ) -> Result<()> {
+        let base = {
+            let variable = self.variable(variable)?;
+            let NcType::Enum { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Enum".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            base.clone()
+        };
+        let elem_size = base.size()?;
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            elem_size,
+            "enum slice byte size",
+        )?);
+        for &value in values {
+            data.extend_from_slice(&nc_enum_value_to_le_bytes(&base, value)?);
+        }
+        self.write_native_variable_slice_bytes(variable, selection, &data, elem_size)
     }
 
     pub fn write_opaque_variable<S: AsRef<[u8]>>(
@@ -600,6 +642,42 @@ impl NcFileBuilder {
         Ok(())
     }
 
+    pub fn write_opaque_variable_slice<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let size = {
+            let variable = self.variable(variable)?;
+            let NcType::Opaque { size, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Opaque".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            usize::try_from(*size).map_err(|_| {
+                Error::InvalidDefinition("opaque element size exceeds platform usize".into())
+            })?
+        };
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            size,
+            "opaque slice byte size",
+        )?);
+        for value in values {
+            let value = value.as_ref();
+            if value.len() != size {
+                return Err(Error::DataLengthMismatch {
+                    expected: size,
+                    actual: value.len(),
+                });
+            }
+            data.extend_from_slice(value);
+        }
+        self.write_native_variable_slice_bytes(variable, selection, &data, size)
+    }
+
     pub fn write_array_variable<T: NcWriteType>(
         &mut self,
         variable: VariableId,
@@ -628,6 +706,40 @@ impl NcFileBuilder {
         variable.string_values = None;
         variable.vlen_values = None;
         Ok(())
+    }
+
+    pub fn write_array_variable_slice<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[T],
+    ) -> Result<()> {
+        let elem_size = {
+            let variable = self.variable(variable)?;
+            let NcType::Array { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Array".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
+            }
+            variable.dtype.size()?
+        };
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            T::nc_type().size()?,
+            "array slice byte size",
+        )?);
+        for &value in values {
+            value.write_one_le(&mut data);
+        }
+        self.write_native_variable_slice_bytes(variable, selection, &data, elem_size)
     }
 
     pub fn write_vlen_variable_bytes<S: AsRef<[u8]>>(
@@ -1135,6 +1247,46 @@ impl NcFileBuilder {
                 })
             })
             .collect()
+    }
+
+    fn write_native_variable_slice_bytes(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+        elem_size: usize,
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, elem_size)?;
+        let expected = checked_mul_usize(
+            resolved.elements,
+            elem_size,
+            "native variable slice byte size",
+        )?;
+        if bytes.len() != expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer native slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer native variable element count")?;
+        let variable_def = self.variable_mut(variable)?;
+        ensure_variable_native_slice_buffer(
+            variable_def,
+            total_elements,
+            elem_size,
+            resolved.can_grow,
+        )?;
+        scatter_slice_bytes(
+            &mut variable_def.data,
+            elem_size,
+            &resolved.dims,
+            &strides,
+            bytes,
+        )
     }
 
     fn ensure_unique_dimension(&self, name: &str) -> Result<()> {
@@ -2090,6 +2242,41 @@ fn ensure_variable_slice_buffer(
     }
 
     variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
+    variable.string_values = None;
+    variable.vlen_values = None;
+    Ok(())
+}
+
+fn ensure_variable_native_slice_buffer(
+    variable: &mut VariableDef,
+    total_elements: u64,
+    elem_size: usize,
+    can_grow: bool,
+) -> Result<()> {
+    if variable.data_encoding != VariableDataEncoding::Hdf5Native && !variable.data.is_empty() {
+        return Err(Error::UnsupportedFeature(format!(
+            "native slice writes cannot update classic-endian payload for variable '{}'",
+            variable.name
+        )));
+    }
+
+    let expected = checked_mul_usize(
+        require_usize(total_elements, "native variable element count")?,
+        elem_size,
+        "native variable byte size",
+    )?;
+    if variable.data.is_empty() {
+        variable.data = vec![0; expected];
+    } else if variable.data.len() < expected && can_grow {
+        variable.data.resize(expected, 0);
+    } else if variable.data.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: variable.data.len(),
+        });
+    }
+
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
     variable.string_values = None;
     variable.vlen_values = None;
     Ok(())

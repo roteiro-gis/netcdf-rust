@@ -517,6 +517,195 @@ fn writes_nc4_user_defined_variables() {
 }
 
 #[test]
+fn writes_nc4_user_defined_variable_slices() {
+    let mut builder = NcFileBuilder::new();
+    let n = builder.add_dimension("n", 3).unwrap();
+    let quality_type = NcType::Enum {
+        base: Box::new(NcType::UByte),
+        members: vec![
+            NcEnumMember {
+                name: "bad".to_string(),
+                value: NcIntegerValue::U8(1),
+            },
+            NcEnumMember {
+                name: "good".to_string(),
+                value: NcIntegerValue::U8(2),
+            },
+        ],
+    };
+    let samples_type = NcType::Array {
+        base: Box::new(NcType::Short),
+        dims: vec![3],
+    };
+    let obs_type = NcType::Compound {
+        size: 12,
+        fields: vec![
+            NcCompoundField {
+                name: "temp".to_string(),
+                offset: 0,
+                dtype: NcType::Float,
+            },
+            NcCompoundField {
+                name: "quality".to_string(),
+                offset: 4,
+                dtype: NcType::UByte,
+            },
+            NcCompoundField {
+                name: "samples".to_string(),
+                offset: 6,
+                dtype: NcType::Array {
+                    base: Box::new(NcType::Short),
+                    dims: vec![3],
+                },
+            },
+        ],
+    };
+    let quality = builder
+        .add_user_defined_variable("quality", &[n], quality_type)
+        .unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[n],
+            NcType::Opaque {
+                size: 4,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+    let samples = builder
+        .add_user_defined_variable("samples", &[n], samples_type)
+        .unwrap();
+    let obs = builder
+        .add_user_defined_variable("obs", &[n], obs_type)
+        .unwrap();
+
+    builder
+        .write_enum_variable_slice(
+            quality,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Slice {
+                    start: 1,
+                    end: 3,
+                    step: 1,
+                }],
+            },
+            &[NcIntegerValue::U8(2), NcIntegerValue::U8(1)],
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(2)],
+            },
+            &[&[5_u8, 6, 7, 8][..]],
+        )
+        .unwrap();
+    builder
+        .write_array_variable_slice(
+            samples,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[10_i16, 11, 12],
+        )
+        .unwrap();
+    let mut obs_bytes = Vec::new();
+    obs_bytes.extend_from_slice(&12.5_f32.to_le_bytes());
+    obs_bytes.push(2);
+    obs_bytes.push(0);
+    obs_bytes.extend_from_slice(&10_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&11_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&12_i16.to_le_bytes());
+    builder
+        .write_user_defined_variable_slice_bytes(
+            obs,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(2)],
+            },
+            &obs_bytes,
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_raw_bytes("quality").unwrap(),
+        vec![0, 2, 1]
+    );
+    assert_eq!(
+        file.read_variable_raw_bytes("blob").unwrap(),
+        vec![0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8]
+    );
+    let mut expected_samples = vec![0_u8; 18];
+    expected_samples[6..8].copy_from_slice(&10_i16.to_le_bytes());
+    expected_samples[8..10].copy_from_slice(&11_i16.to_le_bytes());
+    expected_samples[10..12].copy_from_slice(&12_i16.to_le_bytes());
+    assert_eq!(
+        file.read_variable_raw_bytes("samples").unwrap(),
+        expected_samples
+    );
+    let mut expected_obs = vec![0_u8; 36];
+    expected_obs[24..36].copy_from_slice(&obs_bytes);
+    assert_eq!(file.read_variable_raw_bytes("obs").unwrap(), expected_obs);
+}
+
+#[test]
+fn writes_nc4_user_defined_unlimited_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_unlimited_dimension("obs").unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[obs],
+            NcType::Opaque {
+                size: 4,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[&[1_u8, 2, 3, 4][..]],
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(3)],
+            },
+            &[&[9_u8, 8, 7, 6][..]],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let obs_dim = file.dimension("obs").unwrap();
+    assert_eq!(obs_dim.size, 4);
+    assert!(obs_dim.is_unlimited);
+    assert_eq!(
+        file.read_variable_raw_bytes("blob").unwrap(),
+        vec![0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 9, 8, 7, 6]
+    );
+}
+
+#[test]
 fn writes_nc4_vlen_sequence_variable() {
     let mut builder = NcFileBuilder::new();
     let obs = builder.add_unlimited_dimension("obs").unwrap();
