@@ -500,6 +500,35 @@ impl NcFileBuilder {
         Ok(())
     }
 
+    pub fn write_char_variable_slice(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        if variable_def.dtype != NcType::Char {
+            return Err(Error::TypeMismatch {
+                expected: "Char".into(),
+                actual: format!("{:?}", variable_def.dtype),
+            });
+        }
+        let shape = self.fixed_variable_shape(variable_def)?;
+        let resolved = resolve_write_selection(&variable_def.name, &shape, selection)?;
+        if bytes.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: bytes.len(),
+            });
+        }
+
+        let strides = row_major_strides(&shape, "writer char slice stride")?;
+        let total_elements = checked_shape_elements(&shape, "writer char variable element count")?;
+        let variable_def = self.variable_mut(variable)?;
+        ensure_variable_slice_buffer(variable_def, total_elements, 1)?;
+        scatter_slice_bytes(&mut variable_def.data, 1, &resolved.dims, &strides, bytes)
+    }
+
     pub fn write_user_defined_variable_bytes(
         &mut self,
         variable: VariableId,

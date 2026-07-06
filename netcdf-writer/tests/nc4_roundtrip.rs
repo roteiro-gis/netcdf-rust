@@ -199,6 +199,64 @@ fn writes_nc4_char_variable() {
 }
 
 #[test]
+fn writes_nc4_char_variable_slice() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let variable = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            variable,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 5,
+                        step: 1,
+                    },
+                ],
+            },
+            b"alpha",
+        )
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            variable,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(1),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 4,
+                        step: 1,
+                    },
+                ],
+            },
+            b"beta",
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_raw_bytes("station_name").unwrap(),
+        b"alphabeta\0"
+    );
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
 fn writes_nc4_string_vector_attributes() {
     let mut builder = NcFileBuilder::new();
     builder
