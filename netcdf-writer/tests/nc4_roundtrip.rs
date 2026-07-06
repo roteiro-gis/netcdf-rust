@@ -3,7 +3,7 @@
 use netcdf_reader::{NcFile, NcFormat};
 use netcdf_writer::{
     NcAttrValue, NcCompoundField, NcEnumMember, NcFileBuilder, NcIntegerValue, NcSliceInfo,
-    NcSliceInfoElem, NcType, NcWriteFormat, NcWriteOptions,
+    NcSliceInfoElem, NcType, NcWriteFormat, NcWriteOptions, NC_FILL_INT,
 };
 
 #[test]
@@ -149,7 +149,20 @@ fn writes_nc4_strided_variable_slice() {
     assert_eq!(values.shape(), &[3, 4]);
     assert_eq!(
         values.as_slice_memory_order().unwrap(),
-        &[1, 0, 2, 0, 0, 0, 0, 0, 3, 0, 4, 0]
+        &[
+            1,
+            NC_FILL_INT,
+            2,
+            NC_FILL_INT,
+            NC_FILL_INT,
+            NC_FILL_INT,
+            NC_FILL_INT,
+            NC_FILL_INT,
+            3,
+            NC_FILL_INT,
+            4,
+            NC_FILL_INT
+        ]
     );
 }
 

@@ -23,7 +23,9 @@ use hdf5_writer::{
 
 pub use netcdf_core::{
     NcAttrValue, NcAttribute, NcCompoundField, NcDimension, NcEnumMember, NcFormat, NcGroup,
-    NcIntegerValue, NcSliceInfo, NcSliceInfoElem, NcType, NcVariable,
+    NcIntegerValue, NcSliceInfo, NcSliceInfoElem, NcType, NcVariable, NC_FILL_BYTE, NC_FILL_CHAR,
+    NC_FILL_DOUBLE, NC_FILL_FLOAT, NC_FILL_INT, NC_FILL_INT64, NC_FILL_SHORT, NC_FILL_UBYTE,
+    NC_FILL_UINT, NC_FILL_UINT64, NC_FILL_USHORT,
 };
 
 const ABSENT: u32 = 0x0000_0000;
@@ -1896,11 +1898,11 @@ fn ensure_variable_slice_buffer(
         "variable byte size",
     )?;
     if variable.data.is_empty() {
-        let fill_pattern = variable
-            .fill_value
-            .as_ref()
-            .map(|fill_value| fill_value.classic_bytes.as_slice());
-        variable.data = filled_data_buffer(expected, elem_size, fill_pattern)?;
+        let fill_pattern = match &variable.fill_value {
+            Some(fill_value) => fill_value.classic_bytes.clone(),
+            None => default_classic_fill_bytes(&variable.dtype)?,
+        };
+        variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
     } else if variable.data.len() != expected {
         return Err(Error::DataLengthMismatch {
             expected,
@@ -1914,11 +1916,7 @@ fn ensure_variable_slice_buffer(
     Ok(())
 }
 
-fn filled_data_buffer(
-    len: usize,
-    elem_size: usize,
-    fill_pattern: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+fn filled_data_buffer(len: usize, elem_size: usize, fill_pattern: &[u8]) -> Result<Vec<u8>> {
     if elem_size == 0 {
         return if len == 0 {
             Ok(Vec::new())
@@ -1933,9 +1931,6 @@ fn filled_data_buffer(
             "variable byte length {len} is not a multiple of element size {elem_size}"
         )));
     }
-    let Some(fill_pattern) = fill_pattern else {
-        return Ok(vec![0; len]);
-    };
     if fill_pattern.len() != elem_size {
         return Err(Error::InvalidDefinition(format!(
             "fill value byte length must match datatype element size: expected {elem_size}, got {}",
@@ -1947,6 +1942,25 @@ fn filled_data_buffer(
         data.extend_from_slice(fill_pattern);
     }
     Ok(data)
+}
+
+fn default_classic_fill_bytes(dtype: &NcType) -> Result<Vec<u8>> {
+    match dtype {
+        NcType::Byte => Ok(vec![NC_FILL_BYTE as u8]),
+        NcType::Char => Ok(vec![NC_FILL_CHAR]),
+        NcType::Short => Ok(NC_FILL_SHORT.to_be_bytes().to_vec()),
+        NcType::Int => Ok(NC_FILL_INT.to_be_bytes().to_vec()),
+        NcType::Float => Ok(NC_FILL_FLOAT.to_be_bytes().to_vec()),
+        NcType::Double => Ok(NC_FILL_DOUBLE.to_be_bytes().to_vec()),
+        NcType::UByte => Ok(vec![NC_FILL_UBYTE]),
+        NcType::UShort => Ok(NC_FILL_USHORT.to_be_bytes().to_vec()),
+        NcType::UInt => Ok(NC_FILL_UINT.to_be_bytes().to_vec()),
+        NcType::Int64 => Ok(NC_FILL_INT64.to_be_bytes().to_vec()),
+        NcType::UInt64 => Ok(NC_FILL_UINT64.to_be_bytes().to_vec()),
+        other => Err(Error::UnsupportedFeature(format!(
+            "{other:?} does not have a primitive NetCDF default fill value"
+        ))),
+    }
 }
 
 fn scatter_slice_bytes(
