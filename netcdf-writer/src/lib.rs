@@ -453,8 +453,8 @@ impl NcFileBuilder {
                 actual: format!("{expected:?}"),
             });
         }
-        let shape = self.fixed_variable_shape(variable_def)?;
-        let resolved = resolve_write_selection(&variable_def.name, &shape, selection)?;
+        let resolved =
+            self.resolve_variable_write_selection(variable_def, selection, expected.size()?)?;
         if values.len() != resolved.elements {
             return Err(Error::DataLengthMismatch {
                 expected: resolved.elements,
@@ -472,10 +472,11 @@ impl NcFileBuilder {
             value.write_one_be(&mut encoded);
         }
 
-        let strides = row_major_strides(&shape, "writer slice stride")?;
-        let total_elements = checked_shape_elements(&shape, "writer variable element count")?;
+        let strides = row_major_strides(&resolved.shape, "writer slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer variable element count")?;
         let variable_def = self.variable_mut(variable)?;
-        ensure_variable_slice_buffer(variable_def, total_elements, elem_size)?;
+        ensure_variable_slice_buffer(variable_def, total_elements, elem_size, resolved.can_grow)?;
         scatter_slice_bytes(
             &mut variable_def.data,
             elem_size,
@@ -513,8 +514,7 @@ impl NcFileBuilder {
                 actual: format!("{:?}", variable_def.dtype),
             });
         }
-        let shape = self.fixed_variable_shape(variable_def)?;
-        let resolved = resolve_write_selection(&variable_def.name, &shape, selection)?;
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, 1)?;
         if bytes.len() != resolved.elements {
             return Err(Error::DataLengthMismatch {
                 expected: resolved.elements,
@@ -522,10 +522,11 @@ impl NcFileBuilder {
             });
         }
 
-        let strides = row_major_strides(&shape, "writer char slice stride")?;
-        let total_elements = checked_shape_elements(&shape, "writer char variable element count")?;
+        let strides = row_major_strides(&resolved.shape, "writer char slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer char variable element count")?;
         let variable_def = self.variable_mut(variable)?;
-        ensure_variable_slice_buffer(variable_def, total_elements, 1)?;
+        ensure_variable_slice_buffer(variable_def, total_elements, 1, resolved.can_grow)?;
         scatter_slice_bytes(&mut variable_def.data, 1, &resolved.dims, &strides, bytes)
     }
 
@@ -1073,19 +1074,65 @@ impl NcFileBuilder {
             .ok_or_else(|| Error::InvalidDefinition("invalid variable handle".into()))
     }
 
-    fn fixed_variable_shape(&self, variable: &VariableDef) -> Result<Vec<u64>> {
+    fn resolve_variable_write_selection(
+        &self,
+        variable: &VariableDef,
+        selection: &NcSliceInfo,
+        elem_size: usize,
+    ) -> Result<ResolvedWriteSelection> {
+        let extents = self.variable_write_extents(variable, elem_size)?;
+        resolve_write_selection(&variable.name, &extents, selection)
+    }
+
+    fn variable_write_extents(
+        &self,
+        variable: &VariableDef,
+        elem_size: usize,
+    ) -> Result<Vec<WriteDimensionExtent>> {
+        let unlimited_positions = variable
+            .dim_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(position, id)| self.dimensions[id.0].is_unlimited.then_some(position))
+            .collect::<Vec<_>>();
+        if unlimited_positions.len() > 1 {
+            return Err(Error::UnsupportedFeature(format!(
+                "slice writes to multiple unlimited dimensions are not supported yet: '{}'",
+                variable.name
+            )));
+        }
+        if unlimited_positions
+            .first()
+            .is_some_and(|position| *position != 0)
+        {
+            let dim_id = variable.dim_ids[unlimited_positions[0]];
+            return Err(Error::UnsupportedFeature(format!(
+                "slice writes to unlimited dimension '{}' are only supported when it is the first variable dimension",
+                self.dimensions[dim_id.0].name
+            )));
+        }
+
+        let current_unlimited_extent = if unlimited_positions.is_empty() {
+            None
+        } else {
+            Some(current_leading_unlimited_extent(self, variable, elem_size)?)
+        };
+
         variable
             .dim_ids
             .iter()
-            .map(|id| {
+            .enumerate()
+            .map(|(position, id)| {
                 let dimension = &self.dimensions[id.0];
-                if dimension.is_unlimited {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "slice writes to unlimited dimension '{}' are not supported yet",
-                        dimension.name
-                    )));
-                }
-                Ok(dimension.size)
+                Ok(WriteDimensionExtent {
+                    current: if dimension.is_unlimited {
+                        current_unlimited_extent.unwrap_or(0)
+                    } else {
+                        dimension.size
+                    },
+                    is_unlimited: dimension.is_unlimited,
+                    position,
+                })
             })
             .collect()
     }
@@ -1833,10 +1880,59 @@ fn expected_variable_bytes(
         .map_err(|_| Error::InvalidDefinition("variable byte size exceeds platform usize".into()))
 }
 
+fn current_leading_unlimited_extent(
+    builder: &NcFileBuilder,
+    variable: &VariableDef,
+    elem_size: usize,
+) -> Result<u64> {
+    if variable.data.is_empty() {
+        return Ok(0);
+    }
+    if elem_size == 0 {
+        return Err(Error::InvalidDefinition(
+            "unlimited slice writes require a non-zero element size".into(),
+        ));
+    }
+    if variable.data.len() % elem_size != 0 {
+        return Err(Error::DataLengthMismatch {
+            expected: variable.data.len() + (elem_size - variable.data.len() % elem_size),
+            actual: variable.data.len(),
+        });
+    }
+
+    let fixed_product = variable.dim_ids.iter().skip(1).try_fold(1u64, |acc, id| {
+        checked_mul_u64(
+            acc,
+            builder.dimensions[id.0].size,
+            "fixed dimensions for unlimited slice writes",
+        )
+    })?;
+    if fixed_product == 0 {
+        return Err(Error::InvalidDefinition(
+            "unlimited slice writes require non-zero fixed trailing dimensions".into(),
+        ));
+    }
+
+    let elements = u64::try_from(variable.data.len() / elem_size).map_err(|_| {
+        Error::InvalidDefinition("variable data element count exceeds u64 capacity".into())
+    })?;
+    if elements % fixed_product != 0 {
+        return Err(Error::DataLengthMismatch {
+            expected: usize::try_from((elements / fixed_product + 1) * fixed_product)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(elem_size),
+            actual: variable.data.len(),
+        });
+    }
+    Ok(elements / fixed_product)
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedWriteSelection {
     dims: Vec<ResolvedWriteSelectionDim>,
     elements: usize,
+    shape: Vec<u64>,
+    can_grow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1845,28 +1941,42 @@ enum ResolvedWriteSelectionDim {
     Slice { start: u64, step: u64, count: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WriteDimensionExtent {
+    current: u64,
+    is_unlimited: bool,
+    position: usize,
+}
+
 fn resolve_write_selection(
     variable_name: &str,
-    shape: &[u64],
+    extents: &[WriteDimensionExtent],
     selection: &NcSliceInfo,
 ) -> Result<ResolvedWriteSelection> {
-    if selection.selections.len() != shape.len() {
+    if selection.selections.len() != extents.len() {
         return Err(Error::InvalidDefinition(format!(
             "selection has {} dimensions but variable '{}' has {}",
             selection.selections.len(),
             variable_name,
-            shape.len()
+            extents.len()
         )));
     }
 
-    let mut dims = Vec::with_capacity(shape.len());
+    let mut dims = Vec::with_capacity(extents.len());
+    let mut shape = Vec::with_capacity(extents.len());
     let mut elements = 1usize;
-    for (dim, (selection, &dim_size)) in selection.selections.iter().zip(shape).enumerate() {
+    let mut can_grow = false;
+    for (selection, extent) in selection.selections.iter().zip(extents) {
+        let dim_size = extent.current;
+        let mut target_dim_size = dim_size;
         match selection {
             NcSliceInfoElem::Index(index) => {
-                if *index >= dim_size {
+                if extent.is_unlimited {
+                    target_dim_size = checked_add(*index, 1, "unlimited slice extent")?;
+                } else if *index >= dim_size {
                     return Err(Error::InvalidDefinition(format!(
-                        "index {index} out of bounds for dimension {dim} (size {dim_size})"
+                        "index {index} out of bounds for dimension {} (size {dim_size})",
+                        extent.position
                     )));
                 }
                 dims.push(ResolvedWriteSelectionDim::Index(*index));
@@ -1875,22 +1985,43 @@ fn resolve_write_selection(
                 if *step == 0 {
                     return Err(Error::InvalidDefinition("slice step cannot be 0".into()));
                 }
-                if *start > dim_size {
+                if !extent.is_unlimited && *start > dim_size {
                     return Err(Error::InvalidDefinition(format!(
-                        "slice start {start} out of bounds for dimension {dim} (size {dim_size})"
+                        "slice start {start} out of bounds for dimension {} (size {dim_size})",
+                        extent.position
                     )));
                 }
-                let actual_end = if *end == u64::MAX {
+                let actual_end = if extent.is_unlimited {
+                    if *end == u64::MAX {
+                        dim_size
+                    } else {
+                        *end
+                    }
+                } else if *end == u64::MAX {
                     dim_size
                 } else {
                     (*end).min(dim_size)
                 };
+                if extent.is_unlimited && *start > actual_end {
+                    return Err(Error::InvalidDefinition(format!(
+                        "slice start {start} exceeds end {actual_end} for unlimited dimension {}",
+                        extent.position
+                    )));
+                }
                 let count_u64 = if *start >= actual_end {
                     0
                 } else {
                     (actual_end - *start).div_ceil(*step)
                 };
                 let count = require_usize(count_u64, "slice result dimension")?;
+                if extent.is_unlimited && count > 0 {
+                    let last_index = checked_add(
+                        *start,
+                        checked_mul_u64((count - 1) as u64, *step, "slice coordinate step")?,
+                        "slice coordinate",
+                    )?;
+                    target_dim_size = checked_add(last_index, 1, "unlimited slice extent")?;
+                }
                 elements = elements.checked_mul(count).ok_or_else(|| {
                     Error::InvalidDefinition(
                         "slice result element count exceeds platform usize".into(),
@@ -1903,15 +2034,25 @@ fn resolve_write_selection(
                 });
             }
         }
+        if extent.is_unlimited && target_dim_size > dim_size {
+            can_grow = true;
+        }
+        shape.push(target_dim_size.max(dim_size));
     }
 
-    Ok(ResolvedWriteSelection { dims, elements })
+    Ok(ResolvedWriteSelection {
+        dims,
+        elements,
+        shape,
+        can_grow,
+    })
 }
 
 fn ensure_variable_slice_buffer(
     variable: &mut VariableDef,
     total_elements: u64,
     elem_size: usize,
+    can_grow: bool,
 ) -> Result<()> {
     if variable.data_encoding != VariableDataEncoding::ClassicBigEndian && !variable.data.is_empty()
     {
@@ -1932,6 +2073,15 @@ fn ensure_variable_slice_buffer(
             None => default_classic_fill_bytes(&variable.dtype)?,
         };
         variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
+    } else if variable.data.len() < expected && can_grow {
+        let fill_pattern = match &variable.fill_value {
+            Some(fill_value) => fill_value.classic_bytes.clone(),
+            None => default_classic_fill_bytes(&variable.dtype)?,
+        };
+        let additional = expected - variable.data.len();
+        variable
+            .data
+            .extend(filled_data_buffer(additional, elem_size, &fill_pattern)?);
     } else if variable.data.len() != expected {
         return Err(Error::DataLengthMismatch {
             expected,

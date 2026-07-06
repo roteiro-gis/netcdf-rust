@@ -200,6 +200,62 @@ fn writes_classic_char_variable_slice() {
 }
 
 #[test]
+fn writes_classic_unlimited_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let temp = builder
+        .add_variable::<i32>("temp", &[time, station])
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[10_i32, 11],
+        )
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(2),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[30_i32, 31],
+        )
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert!(time_dim.is_unlimited);
+    let values = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(values.shape(), &[3, 2]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[10, 11, NC_FILL_INT, NC_FILL_INT, 30, 31]
+    );
+}
+
+#[test]
 fn auto_promotes_unsigned_and_u64_to_cdf5() {
     let mut builder = NcFileBuilder::new();
     let n = builder.add_dimension("n", 3).unwrap();
