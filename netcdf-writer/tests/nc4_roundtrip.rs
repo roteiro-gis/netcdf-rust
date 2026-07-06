@@ -2,8 +2,8 @@
 
 use netcdf_reader::{NcFile, NcFormat};
 use netcdf_writer::{
-    NcAttrValue, NcCompoundField, NcEnumMember, NcFileBuilder, NcIntegerValue, NcType,
-    NcWriteFormat, NcWriteOptions,
+    NcAttrValue, NcCompoundField, NcEnumMember, NcFileBuilder, NcIntegerValue, NcSliceInfo,
+    NcSliceInfoElem, NcType, NcWriteFormat, NcWriteOptions,
 };
 
 #[test]
@@ -108,6 +108,48 @@ fn writes_nc4_fill_value_for_unwritten_variable() {
     assert_eq!(
         values.as_slice_memory_order().unwrap(),
         &[-999_i16, -999, -999, -999, -999, -999]
+    );
+}
+
+#[test]
+fn writes_nc4_strided_variable_slice() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 3).unwrap();
+    let x = builder.add_dimension("x", 4).unwrap();
+    let temp = builder.add_variable::<i32>("temp", &[y, x]).unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 3,
+                        step: 2,
+                    },
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 4,
+                        step: 2,
+                    },
+                ],
+            },
+            &[1_i32, 2, 3, 4],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let values = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(values.shape(), &[3, 4]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[1, 0, 2, 0, 0, 0, 0, 0, 3, 0, 4, 0]
     );
 }
 

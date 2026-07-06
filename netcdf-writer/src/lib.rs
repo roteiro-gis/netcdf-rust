@@ -218,6 +218,7 @@ enum VariableDataEncoding {
 
 #[derive(Debug, Clone)]
 struct VariableFillValue {
+    classic_bytes: Vec<u8>,
     #[cfg(feature = "netcdf4")]
     hdf5_bytes: Vec<u8>,
 }
@@ -354,9 +355,16 @@ impl NcFileBuilder {
             });
         }
 
+        let mut classic_bytes = Vec::with_capacity(expected.size()?);
+        value.write_one_be(&mut classic_bytes);
         let mut hdf5_bytes = Vec::with_capacity(expected.size()?);
         value.write_one_le(&mut hdf5_bytes);
-        set_variable_fill_value_metadata(variable, value.fill_attr_value(), hdf5_bytes)
+        set_variable_fill_value_metadata(
+            variable,
+            value.fill_attr_value(),
+            classic_bytes,
+            hdf5_bytes,
+        )
     }
 
     pub fn set_variable_chunking(
@@ -427,6 +435,52 @@ impl NcFileBuilder {
         variable.string_values = None;
         variable.vlen_values = None;
         Ok(())
+    }
+
+    pub fn write_variable_slice<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[T],
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        let expected = T::nc_type();
+        if variable_def.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", variable_def.dtype),
+                actual: format!("{expected:?}"),
+            });
+        }
+        let shape = self.fixed_variable_shape(variable_def)?;
+        let resolved = resolve_write_selection(&variable_def.name, &shape, selection)?;
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let elem_size = expected.size()?;
+        let mut encoded = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            elem_size,
+            "variable slice byte size",
+        )?);
+        for &value in values {
+            value.write_one_be(&mut encoded);
+        }
+
+        let strides = row_major_strides(&shape, "writer slice stride")?;
+        let total_elements = checked_shape_elements(&shape, "writer variable element count")?;
+        let variable_def = self.variable_mut(variable)?;
+        ensure_variable_slice_buffer(variable_def, total_elements, elem_size)?;
+        scatter_slice_bytes(
+            &mut variable_def.data,
+            elem_size,
+            &resolved.dims,
+            &strides,
+            &encoded,
+        )
     }
 
     pub fn write_char_variable(&mut self, variable: VariableId, bytes: &[u8]) -> Result<()> {
@@ -976,10 +1030,33 @@ impl NcFileBuilder {
             .ok_or_else(|| Error::InvalidDefinition("invalid dimension handle".into()))
     }
 
+    fn variable(&self, id: VariableId) -> Result<&VariableDef> {
+        self.variables
+            .get(id.0)
+            .ok_or_else(|| Error::InvalidDefinition("invalid variable handle".into()))
+    }
+
     fn variable_mut(&mut self, id: VariableId) -> Result<&mut VariableDef> {
         self.variables
             .get_mut(id.0)
             .ok_or_else(|| Error::InvalidDefinition("invalid variable handle".into()))
+    }
+
+    fn fixed_variable_shape(&self, variable: &VariableDef) -> Result<Vec<u64>> {
+        variable
+            .dim_ids
+            .iter()
+            .map(|id| {
+                let dimension = &self.dimensions[id.0];
+                if dimension.is_unlimited {
+                    return Err(Error::UnsupportedFeature(format!(
+                        "slice writes to unlimited dimension '{}' are not supported yet",
+                        dimension.name
+                    )));
+                }
+                Ok(dimension.size)
+            })
+            .collect()
     }
 
     fn ensure_unique_dimension(&self, name: &str) -> Result<()> {
@@ -1725,6 +1802,268 @@ fn expected_variable_bytes(
         .map_err(|_| Error::InvalidDefinition("variable byte size exceeds platform usize".into()))
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedWriteSelection {
+    dims: Vec<ResolvedWriteSelectionDim>,
+    elements: usize,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedWriteSelectionDim {
+    Index(u64),
+    Slice { start: u64, step: u64, count: usize },
+}
+
+fn resolve_write_selection(
+    variable_name: &str,
+    shape: &[u64],
+    selection: &NcSliceInfo,
+) -> Result<ResolvedWriteSelection> {
+    if selection.selections.len() != shape.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "selection has {} dimensions but variable '{}' has {}",
+            selection.selections.len(),
+            variable_name,
+            shape.len()
+        )));
+    }
+
+    let mut dims = Vec::with_capacity(shape.len());
+    let mut elements = 1usize;
+    for (dim, (selection, &dim_size)) in selection.selections.iter().zip(shape).enumerate() {
+        match selection {
+            NcSliceInfoElem::Index(index) => {
+                if *index >= dim_size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "index {index} out of bounds for dimension {dim} (size {dim_size})"
+                    )));
+                }
+                dims.push(ResolvedWriteSelectionDim::Index(*index));
+            }
+            NcSliceInfoElem::Slice { start, end, step } => {
+                if *step == 0 {
+                    return Err(Error::InvalidDefinition("slice step cannot be 0".into()));
+                }
+                if *start > dim_size {
+                    return Err(Error::InvalidDefinition(format!(
+                        "slice start {start} out of bounds for dimension {dim} (size {dim_size})"
+                    )));
+                }
+                let actual_end = if *end == u64::MAX {
+                    dim_size
+                } else {
+                    (*end).min(dim_size)
+                };
+                let count_u64 = if *start >= actual_end {
+                    0
+                } else {
+                    (actual_end - *start).div_ceil(*step)
+                };
+                let count = require_usize(count_u64, "slice result dimension")?;
+                elements = elements.checked_mul(count).ok_or_else(|| {
+                    Error::InvalidDefinition(
+                        "slice result element count exceeds platform usize".into(),
+                    )
+                })?;
+                dims.push(ResolvedWriteSelectionDim::Slice {
+                    start: *start,
+                    step: *step,
+                    count,
+                });
+            }
+        }
+    }
+
+    Ok(ResolvedWriteSelection { dims, elements })
+}
+
+fn ensure_variable_slice_buffer(
+    variable: &mut VariableDef,
+    total_elements: u64,
+    elem_size: usize,
+) -> Result<()> {
+    if variable.data_encoding != VariableDataEncoding::ClassicBigEndian && !variable.data.is_empty()
+    {
+        return Err(Error::UnsupportedFeature(format!(
+            "typed slice writes cannot update native-endian payload for variable '{}'",
+            variable.name
+        )));
+    }
+
+    let expected = checked_mul_usize(
+        require_usize(total_elements, "variable element count")?,
+        elem_size,
+        "variable byte size",
+    )?;
+    if variable.data.is_empty() {
+        let fill_pattern = variable
+            .fill_value
+            .as_ref()
+            .map(|fill_value| fill_value.classic_bytes.as_slice());
+        variable.data = filled_data_buffer(expected, elem_size, fill_pattern)?;
+    } else if variable.data.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: variable.data.len(),
+        });
+    }
+
+    variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
+    variable.string_values = None;
+    variable.vlen_values = None;
+    Ok(())
+}
+
+fn filled_data_buffer(
+    len: usize,
+    elem_size: usize,
+    fill_pattern: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    if elem_size == 0 {
+        return if len == 0 {
+            Ok(Vec::new())
+        } else {
+            Err(Error::InvalidDefinition(
+                "non-empty variable data requires a non-zero element size".into(),
+            ))
+        };
+    }
+    if len % elem_size != 0 {
+        return Err(Error::InvalidDefinition(format!(
+            "variable byte length {len} is not a multiple of element size {elem_size}"
+        )));
+    }
+    let Some(fill_pattern) = fill_pattern else {
+        return Ok(vec![0; len]);
+    };
+    if fill_pattern.len() != elem_size {
+        return Err(Error::InvalidDefinition(format!(
+            "fill value byte length must match datatype element size: expected {elem_size}, got {}",
+            fill_pattern.len()
+        )));
+    }
+    let mut data = Vec::with_capacity(len);
+    for _ in 0..len / elem_size {
+        data.extend_from_slice(fill_pattern);
+    }
+    Ok(data)
+}
+
+fn scatter_slice_bytes(
+    data: &mut [u8],
+    elem_size: usize,
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    encoded: &[u8],
+) -> Result<()> {
+    let mut src_elem = 0usize;
+    scatter_slice_bytes_recursive(data, elem_size, dims, strides, encoded, 0, 0, &mut src_elem)?;
+    let expected = encoded.len() / elem_size.max(1);
+    if src_elem != expected {
+        return Err(Error::InvalidDefinition(format!(
+            "slice scatter wrote {src_elem} elements but expected {expected}"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_slice_bytes_recursive(
+    data: &mut [u8],
+    elem_size: usize,
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    encoded: &[u8],
+    dim: usize,
+    dst_elem: u64,
+    src_elem: &mut usize,
+) -> Result<()> {
+    if dim == dims.len() {
+        let dst_start = checked_mul_usize(
+            require_usize(dst_elem, "slice destination element")?,
+            elem_size,
+            "slice destination byte offset",
+        )?;
+        let dst_end = dst_start.checked_add(elem_size).ok_or_else(|| {
+            Error::InvalidDefinition("slice destination byte range exceeds usize".into())
+        })?;
+        let src_start = checked_mul_usize(*src_elem, elem_size, "slice source byte offset")?;
+        let src_end = src_start.checked_add(elem_size).ok_or_else(|| {
+            Error::InvalidDefinition("slice source byte range exceeds usize".into())
+        })?;
+        if dst_end > data.len() || src_end > encoded.len() {
+            return Err(Error::InvalidDefinition(
+                "slice write exceeded planned data bounds".into(),
+            ));
+        }
+        data[dst_start..dst_end].copy_from_slice(&encoded[src_start..src_end]);
+        *src_elem += 1;
+        return Ok(());
+    }
+
+    match dims[dim] {
+        ResolvedWriteSelectionDim::Index(index) => {
+            let offset = checked_add(
+                dst_elem,
+                checked_mul_u64(index, strides[dim], "slice index stride")?,
+                "slice destination element",
+            )?;
+            scatter_slice_bytes_recursive(
+                data,
+                elem_size,
+                dims,
+                strides,
+                encoded,
+                dim + 1,
+                offset,
+                src_elem,
+            )
+        }
+        ResolvedWriteSelectionDim::Slice { start, step, count } => {
+            for i in 0..count {
+                let coord = checked_add(
+                    start,
+                    checked_mul_u64(i as u64, step, "slice coordinate step")?,
+                    "slice coordinate",
+                )?;
+                let offset = checked_add(
+                    dst_elem,
+                    checked_mul_u64(coord, strides[dim], "slice coordinate stride")?,
+                    "slice destination element",
+                )?;
+                scatter_slice_bytes_recursive(
+                    data,
+                    elem_size,
+                    dims,
+                    strides,
+                    encoded,
+                    dim + 1,
+                    offset,
+                    src_elem,
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn row_major_strides(shape: &[u64], context: &str) -> Result<Vec<u64>> {
+    if shape.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut strides = vec![1u64; shape.len()];
+    for dim in (0..shape.len() - 1).rev() {
+        strides[dim] = checked_mul_u64(strides[dim + 1], shape[dim + 1], context)?;
+    }
+    Ok(strides)
+}
+
+fn checked_shape_elements(shape: &[u64], context: &str) -> Result<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |acc, &dim| checked_mul_u64(acc, dim, context))
+}
+
 #[cfg(feature = "netcdf4")]
 fn validate_nc4_variable_data(variable: &VariableDef, dimension_sizes: &[u64]) -> Result<()> {
     let elements = nc4_variable_elements(variable, dimension_sizes)?;
@@ -2342,6 +2681,7 @@ fn ensure_unique_attr(attrs: &[NcAttribute], name: &str) -> Result<()> {
 fn set_variable_fill_value_metadata(
     variable: &mut VariableDef,
     value: NcAttrValue,
+    classic_bytes: Vec<u8>,
     #[cfg_attr(not(feature = "netcdf4"), allow(unused_variables))] hdf5_bytes: Vec<u8>,
 ) -> Result<()> {
     if let Some(attribute) = variable
@@ -2364,6 +2704,7 @@ fn set_variable_fill_value_metadata(
     }
 
     variable.fill_value = Some(VariableFillValue {
+        classic_bytes,
         #[cfg(feature = "netcdf4")]
         hdf5_bytes,
     });
@@ -2423,8 +2764,12 @@ fn checked_add(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
         .ok_or_else(|| Error::InvalidDefinition(format!("{context} overflow")))
 }
 
-#[cfg(feature = "netcdf4")]
 fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
+    lhs.checked_mul(rhs)
+        .ok_or_else(|| Error::InvalidDefinition(format!("{context} overflow")))
+}
+
+fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
     lhs.checked_mul(rhs)
         .ok_or_else(|| Error::InvalidDefinition(format!("{context} overflow")))
 }
@@ -2432,4 +2777,9 @@ fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64> {
 fn require_u32(value: u64, context: &str) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| Error::InvalidDefinition(format!("{context} exceeds u32 capacity")))
+}
+
+fn require_usize(value: u64, context: &str) -> Result<usize> {
+    usize::try_from(value)
+        .map_err(|_| Error::InvalidDefinition(format!("{context} exceeds platform usize capacity")))
 }

@@ -1,5 +1,5 @@
 use netcdf_reader::NcFile;
-use netcdf_writer::{NcAttrValue, NcFileBuilder, NcWriteOptions};
+use netcdf_writer::{NcAttrValue, NcFileBuilder, NcSliceInfo, NcSliceInfoElem, NcWriteOptions};
 
 #[test]
 fn writes_cdf1_fixed_variables() {
@@ -73,6 +73,42 @@ fn writes_classic_fill_value_attribute() {
     assert_eq!(
         data.as_slice_memory_order().unwrap(),
         &[1, 2, -999, 4, 5, 6]
+    );
+}
+
+#[test]
+fn writes_classic_variable_slice_with_fill_initialization() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 3).unwrap();
+    let x = builder.add_dimension("x", 4).unwrap();
+    let temp = builder.add_variable::<i16>("temp", &[y, x]).unwrap();
+    builder.set_variable_fill_value(temp, -999_i16).unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(1),
+                    NcSliceInfoElem::Slice {
+                        start: 1,
+                        end: 4,
+                        step: 1,
+                    },
+                ],
+            },
+            &[10_i16, 11, 12],
+        )
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let data = file.read_variable::<i16>("temp").unwrap();
+    assert_eq!(data.shape(), &[3, 4]);
+    assert_eq!(
+        data.as_slice_memory_order().unwrap(),
+        &[-999, -999, -999, -999, -999, 10, 11, 12, -999, -999, -999, -999]
     );
 }
 
