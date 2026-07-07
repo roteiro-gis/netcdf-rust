@@ -616,6 +616,76 @@ impl NcFileBuilder {
         self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
+    pub fn write_char_variable_strings<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        values: &[S],
+    ) -> Result<()> {
+        let (name, width, inferred_unlimited) = {
+            let variable_def = self.variable(variable)?;
+            if variable_def.dtype != NcType::Char {
+                return Err(Error::TypeMismatch {
+                    expected: "Char".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            }
+            let inferred_unlimited =
+                self.validate_char_string_value_count(variable_def, values.len())?;
+            (
+                variable_def.name.clone(),
+                self.char_string_axis_width(variable_def)?,
+                inferred_unlimited,
+            )
+        };
+        let encoded = encode_char_string_values(&name, width, values)?;
+        self.write_char_variable(variable, &encoded)?;
+        if let Some((dimension, size)) = inferred_unlimited {
+            if size > self.dimensions[dimension.0].current_size {
+                self.dimensions[dimension.0].current_size = size;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_char_variable_strings_slice<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let (name, width, resolved) = {
+            let variable_def = self.variable(variable)?;
+            if variable_def.dtype != NcType::Char {
+                return Err(Error::TypeMismatch {
+                    expected: "Char".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            }
+            (
+                variable_def.name.clone(),
+                self.char_string_axis_width(variable_def)?,
+                self.resolve_char_string_write_selection(variable_def, selection)?,
+            )
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let encoded = encode_char_string_values(&name, width, values)?;
+        let mut selections = selection.selections.clone();
+        selections.push(NcSliceInfoElem::Slice {
+            start: 0,
+            end: u64::try_from(width).map_err(|_| {
+                Error::InvalidDefinition("char string width exceeds u64 capacity".into())
+            })?,
+            step: 1,
+        });
+        self.write_char_variable_slice(variable, &NcSliceInfo { selections }, &encoded)
+    }
+
     pub fn write_user_defined_variable_bytes(
         &mut self,
         variable: VariableId,
@@ -1539,6 +1609,21 @@ impl NcFileBuilder {
         resolve_write_selection(&variable.name, &extents, selection)
     }
 
+    fn resolve_char_string_write_selection(
+        &self,
+        variable: &VariableDef,
+        selection: &NcSliceInfo,
+    ) -> Result<ResolvedWriteSelection> {
+        if variable.dim_ids.is_empty() {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            )));
+        }
+        let extents = self.variable_write_extents(variable, 1)?;
+        resolve_write_selection(&variable.name, &extents[..extents.len() - 1], selection)
+    }
+
     fn variable_write_extents(
         &self,
         variable: &VariableDef,
@@ -1561,6 +1646,99 @@ impl NcFileBuilder {
                 })
             })
             .collect()
+    }
+
+    fn char_string_axis_width(&self, variable: &VariableDef) -> Result<usize> {
+        let width_dim_id = variable.dim_ids.last().ok_or_else(|| {
+            Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            ))
+        })?;
+        let dimension = &self.dimensions[width_dim_id.0];
+        let width = if dimension.is_unlimited {
+            dimension.current_size
+        } else {
+            dimension.size
+        };
+        if dimension.is_unlimited && width == 0 {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' string-width dimension cannot be inferred from string values",
+                variable.name
+            )));
+        }
+        require_usize(width, "char string width")
+    }
+
+    fn validate_char_string_value_count(
+        &self,
+        variable: &VariableDef,
+        value_count: usize,
+    ) -> Result<Option<(DimensionId, u64)>> {
+        if variable.dim_ids.is_empty() {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            )));
+        }
+
+        let value_count = u64::try_from(value_count).map_err(|_| {
+            Error::InvalidDefinition("char string value count exceeds u64 capacity".into())
+        })?;
+        let mut known_product = 1u64;
+        let mut unknown = Vec::new();
+        for dim_id in &variable.dim_ids[..variable.dim_ids.len() - 1] {
+            let dimension = &self.dimensions[dim_id.0];
+            let size = if dimension.is_unlimited {
+                dimension.current_size
+            } else {
+                dimension.size
+            };
+            if dimension.is_unlimited && size == 0 {
+                if !unknown.contains(dim_id) {
+                    unknown.push(*dim_id);
+                }
+                continue;
+            }
+            known_product = checked_mul_u64(known_product, size, "char string value count shape")?;
+        }
+
+        let mut inferred_unlimited = None;
+        if unknown.is_empty() {
+            if value_count != known_product {
+                return Err(Error::DataLengthMismatch {
+                    expected: require_usize(known_product, "char string value count")?,
+                    actual: require_usize(value_count, "char string value count")?,
+                });
+            }
+        } else if unknown.len() == 1 {
+            if known_product == 0 {
+                if value_count != 0 {
+                    return Err(Error::DataLengthMismatch {
+                        expected: 0,
+                        actual: require_usize(value_count, "char string value count")?,
+                    });
+                }
+            } else if value_count % known_product != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "char string value count {value_count} is not divisible by known leading dimension product {known_product}"
+                )));
+            } else {
+                inferred_unlimited = Some((unknown[0], value_count / known_product));
+            }
+        } else {
+            let names = unknown
+                .iter()
+                .map(|id| self.dimensions[id.0].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidDefinition(format!(
+                "cannot infer multiple unlimited char string dimensions {names} for variable '{}'",
+                variable.name
+            )));
+        }
+
+        Ok(inferred_unlimited)
     }
 
     fn update_unlimited_extents_from_element_count(
@@ -2635,6 +2813,36 @@ fn ensure_variable_native_slice_buffer(
     variable.string_values = None;
     variable.vlen_values = None;
     Ok(())
+}
+
+fn encode_char_string_values<S: AsRef<str>>(
+    variable_name: &str,
+    width: usize,
+    values: &[S],
+) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(checked_mul_usize(
+        values.len(),
+        width,
+        "char string byte count",
+    )?);
+    for value in values {
+        let value = value.as_ref();
+        let bytes = value.as_bytes();
+        if bytes.contains(&0) {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{variable_name}' string values cannot contain NUL bytes"
+            )));
+        }
+        if bytes.len() > width {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{variable_name}' string value is {} bytes, exceeding fixed width {width}",
+                bytes.len()
+            )));
+        }
+        encoded.extend_from_slice(bytes);
+        encoded.resize(encoded.len() + (width - bytes.len()), 0);
+    }
+    Ok(encoded)
 }
 
 fn ensure_variable_string_slice_buffer(

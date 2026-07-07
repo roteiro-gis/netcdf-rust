@@ -342,6 +342,87 @@ fn writes_nc4_char_variable_slice() {
 }
 
 #[test]
+fn writes_nc4_char_variable_strings() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let variable = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_strings(variable, &["alpha", "beta"])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_raw_bytes("station_name").unwrap(),
+        b"alphabeta\0"
+    );
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
+fn writes_nc4_multiple_unlimited_char_variable_string_slices() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let variable = builder
+        .add_char_variable("station_name", &[time, member, strlen])
+        .unwrap();
+
+    for (time_index, member_index, value) in [
+        (0, 0, "t0m0"),
+        (1, 0, "t1m0"),
+        (0, 1, "t0m1"),
+        (2, 1, "t2m1"),
+    ] {
+        builder
+            .write_char_variable_strings_slice(
+                variable,
+                &NcSliceInfo {
+                    selections: vec![
+                        NcSliceInfoElem::Index(time_index),
+                        NcSliceInfoElem::Index(member_index),
+                    ],
+                },
+                &[value],
+            )
+            .unwrap();
+    }
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dimension("time").unwrap().size, 3);
+    assert_eq!(file.dimension("member").unwrap().size, 2);
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec![
+            "t0m0".to_string(),
+            "t0m1".to_string(),
+            "t1m0".to_string(),
+            "".to_string(),
+            "".to_string(),
+            "t2m1".to_string()
+        ]
+    );
+}
+
+#[test]
 fn writes_nc4_string_vector_attributes() {
     let mut builder = NcFileBuilder::new();
     builder

@@ -200,6 +200,65 @@ fn writes_classic_char_variable_slice() {
 }
 
 #[test]
+fn writes_classic_char_variable_strings() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let names = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_strings(names, &["alpha", "beta"])
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
+fn writes_classic_char_variable_string_slices() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let names = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_strings_slice(
+            names,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &["beta"],
+        )
+        .unwrap();
+    builder
+        .write_char_variable_strings_slice(
+            names,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(0)],
+            },
+            &["alpha"],
+        )
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
 fn writes_classic_unlimited_variable_slice_append() {
     let mut builder = NcFileBuilder::new();
     let time = builder.add_unlimited_dimension("time").unwrap();
