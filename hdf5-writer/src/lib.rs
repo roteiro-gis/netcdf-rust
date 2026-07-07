@@ -801,12 +801,6 @@ impl AttributeBuilder {
                 )));
             }
             for sequence in target_sequences {
-                if sequence.is_empty() {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "attribute '{}' contains an empty vlen object-reference sequence",
-                        self.name
-                    )));
-                }
                 for target in sequence {
                     validate_name(target)?;
                 }
@@ -1985,6 +1979,13 @@ fn plan_attribute(
     } else if let Some(target_sequences) = &attribute.vlen_object_reference_targets {
         let mut refs = Vec::with_capacity(target_sequences.len());
         for sequence in target_sequences {
+            if sequence.is_empty() {
+                refs.push(VLenHeapReference {
+                    sequence_len: 0,
+                    heap_index: 0,
+                });
+                continue;
+            }
             let index = checked_heap_index(heap_objects.len() + 1)?;
             let mut data = Vec::with_capacity(sequence.len() * usize::from(OFFSET_SIZE));
             for target in sequence {

@@ -1105,6 +1105,61 @@ fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
 }
 
 #[test]
+fn writes_empty_vlen_object_reference_attribute_sequence() {
+    let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
+        .unwrap()
+        .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"));
+    let data = DatasetBuilder::typed_data("temp", vec![2, 3], &[1_i16, 2, 3, 4, 5, 6])
+        .unwrap()
+        .attribute(AttributeBuilder::vlen_object_references(
+            "DIMENSION_LIST",
+            vec![Vec::new(), vec!["x".to_string()]],
+        ));
+    let plan = Hdf5Builder::new()
+        .dataset(scale)
+        .dataset(data)
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let scale = file.dataset("/x").unwrap();
+    let data = file.dataset("/temp").unwrap();
+    let attr = data.attribute("DIMENSION_LIST").unwrap();
+    assert_eq!(attr.shape, vec![2]);
+    assert_eq!(attr.raw_data.len(), 32);
+
+    let first_seq_len = u32::from_le_bytes(attr.raw_data[0..4].try_into().unwrap());
+    let first_heap_index = u32::from_le_bytes(attr.raw_data[12..16].try_into().unwrap());
+    assert_eq!(first_seq_len, 0);
+    assert_eq!(first_heap_index, 0);
+
+    let second_seq_len = u32::from_le_bytes(attr.raw_data[16..20].try_into().unwrap());
+    let second_heap_addr = u64::from_le_bytes(attr.raw_data[20..28].try_into().unwrap());
+    let second_heap_index = u32::from_le_bytes(attr.raw_data[28..32].try_into().unwrap()) as u16;
+    assert_eq!(second_seq_len, 1);
+
+    let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+        file.storage(),
+        second_heap_addr,
+        file.superblock().offset_size,
+        file.superblock().length_size,
+    )
+    .unwrap();
+    let heap_object = heap.get_object(second_heap_index).unwrap();
+    let refs = hdf5_reader::reference::read_object_references(
+        &heap_object.data,
+        file.superblock().offset_size,
+    )
+    .unwrap();
+    assert_eq!(refs, vec![scale.address()]);
+}
+
+#[test]
 fn binary_emission_requires_data() {
     let plan = Hdf5Builder::new()
         .dataset(DatasetBuilder::typed::<f32>("data", vec![2, 3]))
