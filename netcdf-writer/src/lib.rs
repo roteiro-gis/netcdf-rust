@@ -956,6 +956,61 @@ impl NcFileBuilder {
         self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
+    pub fn write_string_variable_slice<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        if variable_def.dtype != NcType::String {
+            return Err(Error::TypeMismatch {
+                expected: "String".into(),
+                actual: format!("{:?}", variable_def.dtype),
+            });
+        }
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, 1)?;
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut strings = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "NC_STRING variable values cannot contain NUL bytes".into(),
+                ));
+            }
+            strings.push(value.to_string());
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer string slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer string variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_string_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let string_values = variable_def.string_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "NC_STRING variable '{}' has no initialized string data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(string_values, &resolved.dims, &strides, &strings)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
+    }
+
     pub fn write<W: Write>(&self, mut writer: W, options: NcWriteOptions) -> Result<NcFormat> {
         if options.format == NcWriteFormat::AutoClassic {
             return self.write_auto_classic(&mut writer);
@@ -2458,6 +2513,38 @@ fn ensure_variable_native_slice_buffer(
     Ok(())
 }
 
+fn ensure_variable_string_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    can_grow: bool,
+) -> Result<()> {
+    if variable.dtype != NcType::String {
+        return Err(Error::TypeMismatch {
+            expected: "String".into(),
+            actual: format!("{:?}", variable.dtype),
+        });
+    }
+    let expected = require_usize(total_elements, "string variable element count")?;
+    let values = variable.string_values.get_or_insert_with(Vec::new);
+    if values.is_empty() {
+        values.resize(expected, String::new());
+    } else if values.len() < expected && can_grow {
+        resize_variable_values(values, old_shape, new_shape, String::new())?;
+    } else if values.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: values.len(),
+        });
+    }
+
+    variable.data.clear();
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.vlen_values = None;
+    Ok(())
+}
+
 fn resize_variable_data(
     data: &mut Vec<u8>,
     old_shape: &[u64],
@@ -2503,6 +2590,46 @@ fn resize_variable_data(
     let mut resized = filled_data_buffer(new_len, elem_size, fill_pattern)?;
     copy_reshaped_variable_data(&old, &mut resized, old_shape, new_shape, elem_size)?;
     *data = resized;
+    Ok(())
+}
+
+fn resize_variable_values<T: Clone>(
+    values: &mut Vec<T>,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    fill_value: T,
+) -> Result<()> {
+    if old_shape.len() != new_shape.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "cannot resize variable values from rank {} to rank {}",
+            old_shape.len(),
+            new_shape.len()
+        )));
+    }
+    let old_elements = require_usize(
+        checked_shape_elements(old_shape, "old variable value shape element count")?,
+        "old variable value element count",
+    )?;
+    if values.len() != old_elements {
+        return Err(Error::DataLengthMismatch {
+            expected: old_elements,
+            actual: values.len(),
+        });
+    }
+
+    let new_len = require_usize(
+        checked_shape_elements(new_shape, "new variable value shape element count")?,
+        "new variable value element count",
+    )?;
+    if old_shape.get(1..) == new_shape.get(1..) {
+        values.resize(new_len, fill_value);
+        return Ok(());
+    }
+
+    let old = std::mem::take(values);
+    let mut resized = vec![fill_value; new_len];
+    copy_reshaped_values(&old, &mut resized, old_shape, new_shape)?;
+    *values = resized;
     Ok(())
 }
 
@@ -2578,6 +2705,63 @@ fn copy_reshaped_variable_data(
     Ok(())
 }
 
+fn copy_reshaped_values<T: Clone>(
+    old: &[T],
+    new: &mut [T],
+    old_shape: &[u64],
+    new_shape: &[u64],
+) -> Result<()> {
+    let old_elements = checked_shape_elements(old_shape, "old variable value copy element count")?;
+    if old_elements == 0 {
+        return Ok(());
+    }
+    if old_shape.is_empty() {
+        if old.len() != 1 || new.len() != 1 {
+            return Err(Error::DataLengthMismatch {
+                expected: 1,
+                actual: old.len().max(new.len()),
+            });
+        }
+        new[0] = old[0].clone();
+        return Ok(());
+    }
+
+    let old_strides = row_major_strides(old_shape, "old variable value copy stride")?;
+    let new_strides = row_major_strides(new_shape, "new variable value copy stride")?;
+    let rank = old_shape.len();
+    let mut coords = vec![0u64; rank];
+    for old_index in 0..old_elements {
+        let mut remainder = old_index;
+        for dim in 0..rank {
+            let stride = old_strides[dim];
+            coords[dim] = remainder / stride;
+            remainder %= stride;
+        }
+        if coords
+            .iter()
+            .zip(new_shape)
+            .any(|(&coord, &extent)| coord >= extent)
+        {
+            continue;
+        }
+        let new_index =
+            coords
+                .iter()
+                .zip(&new_strides)
+                .try_fold(0u64, |acc, (&coord, &stride)| {
+                    checked_add(
+                        acc,
+                        checked_mul_u64(coord, stride, "new variable value copy coordinate")?,
+                        "new variable value copy element index",
+                    )
+                })?;
+        let old_index = require_usize(old_index, "old variable value copy element")?;
+        let new_index = require_usize(new_index, "new variable value copy element")?;
+        new[new_index] = old[old_index].clone();
+    }
+    Ok(())
+}
+
 fn filled_data_buffer(len: usize, elem_size: usize, fill_pattern: &[u8]) -> Result<Vec<u8>> {
     if elem_size == 0 {
         return if len == 0 {
@@ -2641,6 +2825,80 @@ fn scatter_slice_bytes(
         )));
     }
     Ok(())
+}
+
+fn scatter_slice_values<T: Clone>(
+    data: &mut [T],
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    values: &[T],
+) -> Result<()> {
+    let mut src_elem = 0usize;
+    scatter_slice_values_recursive(data, dims, strides, values, 0, 0, &mut src_elem)?;
+    if src_elem != values.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "slice scatter wrote {src_elem} elements but expected {}",
+            values.len()
+        )));
+    }
+    Ok(())
+}
+
+fn scatter_slice_values_recursive<T: Clone>(
+    data: &mut [T],
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    values: &[T],
+    dim: usize,
+    dst_elem: u64,
+    src_elem: &mut usize,
+) -> Result<()> {
+    if dim == dims.len() {
+        let dst = require_usize(dst_elem, "slice destination element")?;
+        if dst >= data.len() || *src_elem >= values.len() {
+            return Err(Error::InvalidDefinition(
+                "slice write exceeded planned value bounds".into(),
+            ));
+        }
+        data[dst] = values[*src_elem].clone();
+        *src_elem += 1;
+        return Ok(());
+    }
+
+    match dims[dim] {
+        ResolvedWriteSelectionDim::Index(index) => {
+            let next = checked_add(
+                dst_elem,
+                checked_mul_u64(index, strides[dim], "slice index stride")?,
+                "slice destination element",
+            )?;
+            scatter_slice_values_recursive(data, dims, strides, values, dim + 1, next, src_elem)
+        }
+        ResolvedWriteSelectionDim::Slice { start, step, count } => {
+            for offset in 0..count {
+                let coord = checked_add(
+                    start,
+                    checked_mul_u64(offset as u64, step, "slice coordinate step")?,
+                    "slice coordinate",
+                )?;
+                let next = checked_add(
+                    dst_elem,
+                    checked_mul_u64(coord, strides[dim], "slice coordinate stride")?,
+                    "slice destination element",
+                )?;
+                scatter_slice_values_recursive(
+                    data,
+                    dims,
+                    strides,
+                    values,
+                    dim + 1,
+                    next,
+                    src_elem,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
