@@ -40,6 +40,29 @@ pub const NC_UINT: u32 = 9;
 pub const NC_INT64: u32 = 10;
 pub const NC_UINT64: u32 = 11;
 
+/// Default fill value for NC_BYTE variables when prefilled data is needed.
+pub const NC_FILL_BYTE: i8 = -127;
+/// Default fill value for NC_CHAR variables when prefilled data is needed.
+pub const NC_FILL_CHAR: u8 = 0;
+/// Default fill value for NC_SHORT variables when prefilled data is needed.
+pub const NC_FILL_SHORT: i16 = -32767;
+/// Default fill value for NC_INT variables when prefilled data is needed.
+pub const NC_FILL_INT: i32 = -2147483647;
+/// Default fill value for NC_FLOAT variables when prefilled data is needed.
+pub const NC_FILL_FLOAT: f32 = 9.969_21e36_f32;
+/// Default fill value for NC_DOUBLE variables when prefilled data is needed.
+pub const NC_FILL_DOUBLE: f64 = 9.969_209_968_386_869e36_f64;
+/// Default fill value for NC_UBYTE variables when prefilled data is needed.
+pub const NC_FILL_UBYTE: u8 = 255;
+/// Default fill value for NC_USHORT variables when prefilled data is needed.
+pub const NC_FILL_USHORT: u16 = 65535;
+/// Default fill value for NC_UINT variables when prefilled data is needed.
+pub const NC_FILL_UINT: u32 = 4294967295;
+/// Default fill value for NC_INT64 variables when prefilled data is needed.
+pub const NC_FILL_INT64: i64 = -9223372036854775806;
+/// Default fill value for NC_UINT64 variables when prefilled data is needed.
+pub const NC_FILL_UINT64: u64 = 18446744073709551614;
+
 /// A NetCDF dimension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NcDimension {
