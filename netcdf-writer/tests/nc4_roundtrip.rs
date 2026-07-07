@@ -1033,6 +1033,194 @@ fn writes_nc4_vlen_sequence_variable() {
 }
 
 #[test]
+fn writes_nc4_vlen_sequence_variable_slices() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_dimension("obs", 3).unwrap();
+    let dtype = NcType::VLen {
+        base: Box::new(NcType::Short),
+    };
+    let ragged = builder
+        .add_user_defined_variable("ragged", &[obs], dtype.clone())
+        .unwrap();
+    builder
+        .write_vlen_variable_slice(
+            ragged,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[vec![3_i16, 4]],
+        )
+        .unwrap();
+    builder
+        .write_vlen_variable_slice(
+            ragged,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Slice {
+                    start: 0,
+                    end: 3,
+                    step: 2,
+                }],
+            },
+            &[vec![1_i16], vec![10_i16, 11, 12]],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let variable = file.variable("ragged").unwrap();
+    assert_eq!(variable.dtype(), &dtype);
+    assert_eq!(variable.shape(), vec![3]);
+
+    let decoded = file.read_variable_user_defined("ragged").unwrap();
+    let values = decoded.as_slice().unwrap();
+    assert_eq!(
+        values[0],
+        netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(1)])
+    );
+    assert_eq!(
+        values[1],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Short(3),
+            netcdf_reader::NcValue::Short(4)
+        ])
+    );
+    assert_eq!(
+        values[2],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Short(10),
+            netcdf_reader::NcValue::Short(11),
+            netcdf_reader::NcValue::Short(12)
+        ])
+    );
+}
+
+#[test]
+fn writes_nc4_unlimited_vlen_sequence_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_unlimited_dimension("obs").unwrap();
+    let dtype = NcType::VLen {
+        base: Box::new(NcType::Short),
+    };
+    let ragged = builder
+        .add_user_defined_variable("ragged", &[obs], dtype.clone())
+        .unwrap();
+    builder
+        .write_vlen_variable_slice_bytes(
+            ragged,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[2_i16.to_le_bytes().to_vec()],
+        )
+        .unwrap();
+    let mut sequence = Vec::new();
+    sequence.extend_from_slice(&4_i16.to_le_bytes());
+    sequence.extend_from_slice(&5_i16.to_le_bytes());
+    builder
+        .write_vlen_variable_slice_bytes(
+            ragged,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(3)],
+            },
+            &[sequence],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let obs_dim = file.dimension("obs").unwrap();
+    assert_eq!(obs_dim.size, 4);
+    assert!(obs_dim.is_unlimited);
+    assert_eq!(file.variable("ragged").unwrap().dtype(), &dtype);
+
+    let decoded = file.read_variable_user_defined("ragged").unwrap();
+    let values = decoded.as_slice().unwrap();
+    assert_eq!(values[0], netcdf_reader::NcValue::VLen(Vec::new()));
+    assert_eq!(
+        values[1],
+        netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(2)])
+    );
+    assert_eq!(values[2], netcdf_reader::NcValue::VLen(Vec::new()));
+    assert_eq!(
+        values[3],
+        netcdf_reader::NcValue::VLen(vec![
+            netcdf_reader::NcValue::Short(4),
+            netcdf_reader::NcValue::Short(5)
+        ])
+    );
+}
+
+#[test]
+fn writes_nc4_multiple_unlimited_vlen_sequence_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let dtype = NcType::VLen {
+        base: Box::new(NcType::Short),
+    };
+    let ragged = builder
+        .add_user_defined_variable("ragged", &[time, member], dtype)
+        .unwrap();
+
+    for (time_index, member_index, value) in [
+        (0, 0, vec![1_i16]),
+        (1, 0, vec![2_i16]),
+        (0, 1, vec![3_i16]),
+        (2, 1, vec![4_i16, 5]),
+    ] {
+        builder
+            .write_vlen_variable_slice(
+                ragged,
+                &NcSliceInfo {
+                    selections: vec![
+                        NcSliceInfoElem::Index(time_index),
+                        NcSliceInfoElem::Index(member_index),
+                    ],
+                },
+                &[value],
+            )
+            .unwrap();
+    }
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dimension("time").unwrap().size, 3);
+    assert_eq!(file.dimension("member").unwrap().size, 2);
+
+    let decoded = file.read_variable_user_defined("ragged").unwrap();
+    let values = decoded.as_slice().unwrap();
+    assert_eq!(
+        values,
+        &[
+            netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(1)]),
+            netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(3)]),
+            netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(2)]),
+            netcdf_reader::NcValue::VLen(Vec::new()),
+            netcdf_reader::NcValue::VLen(Vec::new()),
+            netcdf_reader::NcValue::VLen(vec![
+                netcdf_reader::NcValue::Short(4),
+                netcdf_reader::NcValue::Short(5)
+            ])
+        ]
+    );
+}
+
+#[test]
 fn writes_nc4_classic_marker() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<f64>("value", &[]).unwrap();

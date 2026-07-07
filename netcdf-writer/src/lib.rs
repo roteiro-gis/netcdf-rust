@@ -924,6 +924,130 @@ impl NcFileBuilder {
         self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
+    pub fn write_vlen_variable_slice_bytes<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let (resolved, base_size) = {
+            let variable_def = self.variable(variable)?;
+            let NcType::VLen { base } = &variable_def.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            };
+            validate_vlen_base_nc4_type(base)?;
+            (
+                self.resolve_variable_write_selection(variable_def, selection, 1)?,
+                base.size()?,
+            )
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut sequences = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    value.len()
+                )));
+            }
+            sequences.push(value.to_vec());
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer vlen slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer vlen variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_vlen_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let vlen_values = variable_def.vlen_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "vlen variable '{}' has no initialized sequence data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(vlen_values, &resolved.dims, &strides, &sequences)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
+    }
+
+    pub fn write_vlen_variable_slice<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[Vec<T>],
+    ) -> Result<()> {
+        let resolved = {
+            let variable_def = self.variable(variable)?;
+            let NcType::VLen { base } = &variable_def.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
+            }
+            self.resolve_variable_write_selection(variable_def, selection, 1)?
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut sequences = Vec::with_capacity(values.len());
+        for sequence in values {
+            let mut bytes = Vec::with_capacity(std::mem::size_of_val(sequence.as_slice()));
+            for &value in sequence {
+                value.write_one_le(&mut bytes);
+            }
+            sequences.push(bytes);
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer vlen slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer vlen variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_vlen_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let vlen_values = variable_def.vlen_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "vlen variable '{}' has no initialized sequence data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(vlen_values, &resolved.dims, &strides, &sequences)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
+    }
+
     pub fn write_string_variable<S: AsRef<str>>(
         &mut self,
         variable: VariableId,
@@ -2542,6 +2666,38 @@ fn ensure_variable_string_slice_buffer(
     variable.data.clear();
     variable.data_encoding = VariableDataEncoding::Hdf5Native;
     variable.vlen_values = None;
+    Ok(())
+}
+
+fn ensure_variable_vlen_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    can_grow: bool,
+) -> Result<()> {
+    if !matches!(&variable.dtype, NcType::VLen { .. }) {
+        return Err(Error::TypeMismatch {
+            expected: "VLen".into(),
+            actual: format!("{:?}", variable.dtype),
+        });
+    }
+    let expected = require_usize(total_elements, "vlen variable element count")?;
+    let values = variable.vlen_values.get_or_insert_with(Vec::new);
+    if values.is_empty() {
+        values.resize(expected, Vec::new());
+    } else if values.len() < expected && can_grow {
+        resize_variable_values(values, old_shape, new_shape, Vec::new())?;
+    } else if values.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: values.len(),
+        });
+    }
+
+    variable.data.clear();
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.string_values = None;
     Ok(())
 }
 
