@@ -196,6 +196,13 @@ struct DimensionDef {
     name: String,
     size: u64,
     is_unlimited: bool,
+    current_size: u64,
+}
+
+#[derive(Debug, Clone)]
+struct GroupAttributeDef {
+    group_path: String,
+    attribute: NcAttribute,
 }
 
 #[derive(Debug, Clone)]
@@ -248,6 +255,7 @@ impl VariableStorageDef {
 pub struct NcFileBuilder {
     dimensions: Vec<DimensionDef>,
     attributes: Vec<NcAttribute>,
+    group_attributes: Vec<GroupAttributeDef>,
     variables: Vec<VariableDef>,
 }
 
@@ -259,32 +267,27 @@ impl NcFileBuilder {
     pub fn add_dimension(&mut self, name: impl Into<String>, size: u64) -> Result<DimensionId> {
         let name = name.into();
         validate_name(&name, "dimension")?;
-        if size == 0 {
-            return Err(Error::InvalidDefinition(
-                "fixed dimensions must have non-zero size; use add_unlimited_dimension".into(),
-            ));
-        }
-        self.ensure_unique_dimension(&name)?;
-        let id = DimensionId(self.dimensions.len());
-        self.dimensions.push(DimensionDef {
-            name,
-            size,
-            is_unlimited: false,
-        });
-        Ok(id)
+        self.add_dimension_def(name, size, false)
+    }
+
+    pub fn add_dimension_path(
+        &mut self,
+        path: impl Into<String>,
+        size: u64,
+    ) -> Result<DimensionId> {
+        let path = validate_path_name(path.into(), "dimension")?;
+        self.add_dimension_def(path, size, false)
     }
 
     pub fn add_unlimited_dimension(&mut self, name: impl Into<String>) -> Result<DimensionId> {
         let name = name.into();
         validate_name(&name, "dimension")?;
-        self.ensure_unique_dimension(&name)?;
-        let id = DimensionId(self.dimensions.len());
-        self.dimensions.push(DimensionDef {
-            name,
-            size: 0,
-            is_unlimited: true,
-        });
-        Ok(id)
+        self.add_dimension_def(name, 0, true)
+    }
+
+    pub fn add_unlimited_dimension_path(&mut self, path: impl Into<String>) -> Result<DimensionId> {
+        let path = validate_path_name(path.into(), "dimension")?;
+        self.add_dimension_def(path, 0, true)
     }
 
     pub fn add_attribute(&mut self, name: impl Into<String>, value: NcAttrValue) -> Result<()> {
@@ -292,6 +295,31 @@ impl NcFileBuilder {
         validate_name(&name, "attribute")?;
         ensure_unique_attr(&self.attributes, &name)?;
         self.attributes.push(NcAttribute { name, value });
+        Ok(())
+    }
+
+    pub fn add_group_attribute(
+        &mut self,
+        group_path: impl Into<String>,
+        name: impl Into<String>,
+        value: NcAttrValue,
+    ) -> Result<()> {
+        let group_path = validate_path_name(group_path.into(), "group")?;
+        let name = name.into();
+        validate_name(&name, "attribute")?;
+        if self
+            .group_attributes
+            .iter()
+            .any(|attr| attr.group_path == group_path && attr.attribute.name == name)
+        {
+            return Err(Error::InvalidDefinition(format!(
+                "duplicate attribute '{name}' on group '{group_path}'"
+            )));
+        }
+        self.group_attributes.push(GroupAttributeDef {
+            group_path,
+            attribute: NcAttribute { name, value },
+        });
         Ok(())
     }
 
@@ -303,12 +331,28 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, T::nc_type())
     }
 
+    pub fn add_variable_path<T: NcWriteType>(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, T::nc_type())
+    }
+
     pub fn add_char_variable(
         &mut self,
         name: impl Into<String>,
         dimensions: &[DimensionId],
     ) -> Result<VariableId> {
         self.add_variable_with_type(name, dimensions, NcType::Char)
+    }
+
+    pub fn add_char_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, NcType::Char)
     }
 
     pub fn add_string_variable(
@@ -319,6 +363,14 @@ impl NcFileBuilder {
         self.add_variable_with_type(name, dimensions, NcType::String)
     }
 
+    pub fn add_string_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+    ) -> Result<VariableId> {
+        self.add_variable_path_with_type(path, dimensions, NcType::String)
+    }
+
     pub fn add_user_defined_variable(
         &mut self,
         name: impl Into<String>,
@@ -327,6 +379,16 @@ impl NcFileBuilder {
     ) -> Result<VariableId> {
         validate_supported_user_defined_type(&dtype)?;
         self.add_variable_with_type(name, dimensions, dtype)
+    }
+
+    pub fn add_user_defined_variable_path(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
+        validate_supported_user_defined_type(&dtype)?;
+        self.add_variable_path_with_type(path, dimensions, dtype)
     }
 
     pub fn add_variable_attribute(
@@ -420,23 +482,25 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[T],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        let expected = T::nc_type();
-        if variable.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", variable.dtype),
-                actual: format!("{:?}", expected),
-            });
+        {
+            let variable = self.variable_mut(variable)?;
+            let expected = T::nc_type();
+            if variable.dtype != expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", variable.dtype),
+                    actual: format!("{:?}", expected),
+                });
+            }
+            let mut data = Vec::with_capacity(std::mem::size_of_val(values));
+            for &value in values {
+                value.write_one_be(&mut data);
+            }
+            variable.data = data;
+            variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
+            variable.string_values = None;
+            variable.vlen_values = None;
         }
-        let mut data = Vec::with_capacity(std::mem::size_of_val(values));
-        for &value in values {
-            value.write_one_be(&mut data);
-        }
-        variable.data = data;
-        variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
     pub fn write_variable_slice<T: NcWriteType>(
@@ -453,8 +517,8 @@ impl NcFileBuilder {
                 actual: format!("{expected:?}"),
             });
         }
-        let shape = self.fixed_variable_shape(variable_def)?;
-        let resolved = resolve_write_selection(&variable_def.name, &shape, selection)?;
+        let resolved =
+            self.resolve_variable_write_selection(variable_def, selection, expected.size()?)?;
         if values.len() != resolved.elements {
             return Err(Error::DataLengthMismatch {
                 expected: resolved.elements,
@@ -472,32 +536,84 @@ impl NcFileBuilder {
             value.write_one_be(&mut encoded);
         }
 
-        let strides = row_major_strides(&shape, "writer slice stride")?;
-        let total_elements = checked_shape_elements(&shape, "writer variable element count")?;
-        let variable_def = self.variable_mut(variable)?;
-        ensure_variable_slice_buffer(variable_def, total_elements, elem_size)?;
-        scatter_slice_bytes(
-            &mut variable_def.data,
-            elem_size,
-            &resolved.dims,
-            &strides,
-            &encoded,
-        )
+        let strides = row_major_strides(&resolved.shape, "writer slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                elem_size,
+                resolved.can_grow,
+            )?;
+            scatter_slice_bytes(
+                &mut variable_def.data,
+                elem_size,
+                &resolved.dims,
+                &strides,
+                &encoded,
+            )?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
     pub fn write_char_variable(&mut self, variable: VariableId, bytes: &[u8]) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        if variable.dtype != NcType::Char {
+        {
+            let variable = self.variable_mut(variable)?;
+            if variable.dtype != NcType::Char {
+                return Err(Error::TypeMismatch {
+                    expected: "Char".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            }
+            variable.data = bytes.to_vec();
+            variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
+            variable.string_values = None;
+            variable.vlen_values = None;
+        }
+        self.update_unlimited_extents_from_element_count(variable, bytes.len() as u64)
+    }
+
+    pub fn write_char_variable_slice(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        if variable_def.dtype != NcType::Char {
             return Err(Error::TypeMismatch {
                 expected: "Char".into(),
-                actual: format!("{:?}", variable.dtype),
+                actual: format!("{:?}", variable_def.dtype),
             });
         }
-        variable.data = bytes.to_vec();
-        variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, 1)?;
+        if bytes.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: bytes.len(),
+            });
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer char slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer char variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                1,
+                resolved.can_grow,
+            )?;
+            scatter_slice_bytes(&mut variable_def.data, 1, &resolved.dims, &strides, bytes)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
     pub fn write_user_defined_variable_bytes(
@@ -505,13 +621,37 @@ impl NcFileBuilder {
         variable: VariableId,
         bytes: &[u8],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        validate_fixed_width_user_defined_type(&variable.dtype)?;
-        variable.data = bytes.to_vec();
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        let elem_size = {
+            let variable = self.variable_mut(variable)?;
+            validate_fixed_width_user_defined_type(&variable.dtype)?;
+            let elem_size = variable.dtype.size()?;
+            variable.data = bytes.to_vec();
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = None;
+            variable.vlen_values = None;
+            elem_size
+        };
+        if bytes.len() % elem_size != 0 {
+            return Err(Error::DataLengthMismatch {
+                expected: bytes.len() + (elem_size - bytes.len() % elem_size),
+                actual: bytes.len(),
+            });
+        }
+        self.update_unlimited_extents_from_element_count(variable, (bytes.len() / elem_size) as u64)
+    }
+
+    pub fn write_user_defined_variable_slice_bytes(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let elem_size = {
+            let variable = self.variable(variable)?;
+            validate_fixed_width_user_defined_type(&variable.dtype)?;
+            variable.dtype.size()?
+        };
+        self.write_native_variable_slice_bytes(variable, selection, bytes, elem_size)
     }
 
     pub fn write_enum_variable(
@@ -519,22 +659,52 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[NcIntegerValue],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        let NcType::Enum { base, .. } = &variable.dtype else {
-            return Err(Error::TypeMismatch {
-                expected: "Enum".into(),
-                actual: format!("{:?}", variable.dtype),
-            });
-        };
-        let mut data = Vec::with_capacity(values.len() * base.size()?);
-        for &value in values {
-            data.extend_from_slice(&nc_enum_value_to_le_bytes(base, value)?);
+        {
+            let variable = self.variable_mut(variable)?;
+            let NcType::Enum { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Enum".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            let mut data = Vec::with_capacity(values.len() * base.size()?);
+            for &value in values {
+                data.extend_from_slice(&nc_enum_value_to_le_bytes(base, value)?);
+            }
+            variable.data = data;
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = None;
+            variable.vlen_values = None;
         }
-        variable.data = data;
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
+    }
+
+    pub fn write_enum_variable_slice(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[NcIntegerValue],
+    ) -> Result<()> {
+        let base = {
+            let variable = self.variable(variable)?;
+            let NcType::Enum { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Enum".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            base.clone()
+        };
+        let elem_size = base.size()?;
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            elem_size,
+            "enum slice byte size",
+        )?);
+        for &value in values {
+            data.extend_from_slice(&nc_enum_value_to_le_bytes(&base, value)?);
+        }
+        self.write_native_variable_slice_bytes(variable, selection, &data, elem_size)
     }
 
     pub fn write_opaque_variable<S: AsRef<[u8]>>(
@@ -542,17 +712,59 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[S],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        let NcType::Opaque { size, .. } = &variable.dtype else {
-            return Err(Error::TypeMismatch {
-                expected: "Opaque".into(),
-                actual: format!("{:?}", variable.dtype),
-            });
+        {
+            let variable = self.variable_mut(variable)?;
+            let NcType::Opaque { size, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Opaque".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            let size = usize::try_from(*size).map_err(|_| {
+                Error::InvalidDefinition("opaque element size exceeds platform usize".into())
+            })?;
+            let mut data = Vec::with_capacity(values.len() * size);
+            for value in values {
+                let value = value.as_ref();
+                if value.len() != size {
+                    return Err(Error::DataLengthMismatch {
+                        expected: size,
+                        actual: value.len(),
+                    });
+                }
+                data.extend_from_slice(value);
+            }
+            variable.data = data;
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = None;
+            variable.vlen_values = None;
+        }
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
+    }
+
+    pub fn write_opaque_variable_slice<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let size = {
+            let variable = self.variable(variable)?;
+            let NcType::Opaque { size, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Opaque".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            usize::try_from(*size).map_err(|_| {
+                Error::InvalidDefinition("opaque element size exceeds platform usize".into())
+            })?
         };
-        let size = usize::try_from(*size).map_err(|_| {
-            Error::InvalidDefinition("opaque element size exceeds platform usize".into())
-        })?;
-        let mut data = Vec::with_capacity(values.len() * size);
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            size,
+            "opaque slice byte size",
+        )?);
         for value in values {
             let value = value.as_ref();
             if value.len() != size {
@@ -563,11 +775,7 @@ impl NcFileBuilder {
             }
             data.extend_from_slice(value);
         }
-        variable.data = data;
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        self.write_native_variable_slice_bytes(variable, selection, &data, size)
     }
 
     pub fn write_array_variable<T: NcWriteType>(
@@ -575,29 +783,74 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[T],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        let NcType::Array { base, .. } = &variable.dtype else {
-            return Err(Error::TypeMismatch {
-                expected: "Array".into(),
-                actual: format!("{:?}", variable.dtype),
-            });
+        let variable_elements = {
+            let variable = self.variable_mut(variable)?;
+            let NcType::Array { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Array".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
+            }
+            let mut data = Vec::with_capacity(std::mem::size_of_val(values));
+            for &value in values {
+                value.write_one_le(&mut data);
+            }
+            let elem_size = variable.dtype.size()?;
+            if data.len() % elem_size != 0 {
+                return Err(Error::DataLengthMismatch {
+                    expected: data.len() + (elem_size - data.len() % elem_size),
+                    actual: data.len(),
+                });
+            }
+            let variable_elements = (data.len() / elem_size) as u64;
+            variable.data = data;
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = None;
+            variable.vlen_values = None;
+            variable_elements
         };
-        let expected = T::nc_type();
-        if base.as_ref() != &expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", base),
-                actual: format!("{expected:?}"),
-            });
-        }
-        let mut data = Vec::with_capacity(std::mem::size_of_val(values));
+        self.update_unlimited_extents_from_element_count(variable, variable_elements)
+    }
+
+    pub fn write_array_variable_slice<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[T],
+    ) -> Result<()> {
+        let elem_size = {
+            let variable = self.variable(variable)?;
+            let NcType::Array { base, .. } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "Array".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
+            }
+            variable.dtype.size()?
+        };
+        let mut data = Vec::with_capacity(checked_mul_usize(
+            values.len(),
+            T::nc_type().size()?,
+            "array slice byte size",
+        )?);
         for &value in values {
             value.write_one_le(&mut data);
         }
-        variable.data = data;
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = None;
-        variable.vlen_values = None;
-        Ok(())
+        self.write_native_variable_slice_bytes(variable, selection, &data, elem_size)
     }
 
     pub fn write_vlen_variable_bytes<S: AsRef<[u8]>>(
@@ -605,31 +858,33 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[S],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        let NcType::VLen { base } = &variable.dtype else {
-            return Err(Error::TypeMismatch {
-                expected: "VLen".into(),
-                actual: format!("{:?}", variable.dtype),
-            });
-        };
-        validate_vlen_base_nc4_type(base)?;
-        let base_size = base.size()?;
-        let mut sequences = Vec::with_capacity(values.len());
-        for value in values {
-            let value = value.as_ref();
-            if value.len() % base_size != 0 {
-                return Err(Error::InvalidDefinition(format!(
-                    "vlen sequence byte length {} is not a multiple of base element size {base_size}",
-                    value.len()
-                )));
+        {
+            let variable = self.variable_mut(variable)?;
+            let NcType::VLen { base } = &variable.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
+            };
+            validate_vlen_base_nc4_type(base)?;
+            let base_size = base.size()?;
+            let mut sequences = Vec::with_capacity(values.len());
+            for value in values {
+                let value = value.as_ref();
+                if value.len() % base_size != 0 {
+                    return Err(Error::InvalidDefinition(format!(
+                        "vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                        value.len()
+                    )));
+                }
+                sequences.push(value.to_vec());
             }
-            sequences.push(value.to_vec());
+            variable.data.clear();
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = None;
+            variable.vlen_values = Some(sequences);
         }
-        variable.data.clear();
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = None;
-        variable.vlen_values = Some(sequences);
-        Ok(())
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
     pub fn write_vlen_variable<T: NcWriteType>(
@@ -637,34 +892,36 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[Vec<T>],
     ) -> Result<()> {
-        let variable_def = self.variable_mut(variable)?;
-        let NcType::VLen { base } = &variable_def.dtype else {
-            return Err(Error::TypeMismatch {
-                expected: "VLen".into(),
-                actual: format!("{:?}", variable_def.dtype),
-            });
-        };
-        let expected = T::nc_type();
-        if base.as_ref() != &expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", base),
-                actual: format!("{expected:?}"),
-            });
-        }
-
-        let mut sequences = Vec::with_capacity(values.len());
-        for sequence in values {
-            let mut bytes = Vec::with_capacity(std::mem::size_of_val(sequence.as_slice()));
-            for &value in sequence {
-                value.write_one_le(&mut bytes);
+        {
+            let variable_def = self.variable_mut(variable)?;
+            let NcType::VLen { base } = &variable_def.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
             }
-            sequences.push(bytes);
+
+            let mut sequences = Vec::with_capacity(values.len());
+            for sequence in values {
+                let mut bytes = Vec::with_capacity(std::mem::size_of_val(sequence.as_slice()));
+                for &value in sequence {
+                    value.write_one_le(&mut bytes);
+                }
+                sequences.push(bytes);
+            }
+            variable_def.data.clear();
+            variable_def.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable_def.string_values = None;
+            variable_def.vlen_values = Some(sequences);
         }
-        variable_def.data.clear();
-        variable_def.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable_def.string_values = None;
-        variable_def.vlen_values = Some(sequences);
-        Ok(())
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
     pub fn write_string_variable<S: AsRef<str>>(
@@ -672,29 +929,31 @@ impl NcFileBuilder {
         variable: VariableId,
         values: &[S],
     ) -> Result<()> {
-        let variable = self.variable_mut(variable)?;
-        if variable.dtype != NcType::String {
-            return Err(Error::TypeMismatch {
-                expected: "String".into(),
-                actual: format!("{:?}", variable.dtype),
-            });
-        }
-
-        let mut strings = Vec::with_capacity(values.len());
-        for value in values {
-            let value = value.as_ref();
-            if value.as_bytes().contains(&0) {
-                return Err(Error::InvalidDefinition(
-                    "NC_STRING variable values cannot contain NUL bytes".into(),
-                ));
+        {
+            let variable = self.variable_mut(variable)?;
+            if variable.dtype != NcType::String {
+                return Err(Error::TypeMismatch {
+                    expected: "String".into(),
+                    actual: format!("{:?}", variable.dtype),
+                });
             }
-            strings.push(value.to_string());
+
+            let mut strings = Vec::with_capacity(values.len());
+            for value in values {
+                let value = value.as_ref();
+                if value.as_bytes().contains(&0) {
+                    return Err(Error::InvalidDefinition(
+                        "NC_STRING variable values cannot contain NUL bytes".into(),
+                    ));
+                }
+                strings.push(value.to_string());
+            }
+            variable.data.clear();
+            variable.data_encoding = VariableDataEncoding::Hdf5Native;
+            variable.string_values = Some(strings);
+            variable.vlen_values = None;
         }
-        variable.data.clear();
-        variable.data_encoding = VariableDataEncoding::Hdf5Native;
-        variable.string_values = Some(strings);
-        variable.vlen_values = None;
-        Ok(())
+        self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
     pub fn write<W: Write>(&self, mut writer: W, options: NcWriteOptions) -> Result<NcFormat> {
@@ -810,6 +1069,12 @@ impl NcFileBuilder {
         for attr in &self.attributes {
             builder = builder.attribute(nc_attr_to_hdf5(attr)?);
         }
+        for group_attr in &self.group_attributes {
+            builder = builder.group_attribute(
+                group_attr.group_path.as_str(),
+                nc_attr_to_hdf5(&group_attr.attribute)?,
+            );
+        }
 
         for (dim_id, dimension) in self.dimensions.iter().enumerate() {
             if self
@@ -827,7 +1092,7 @@ impl NcFileBuilder {
                     "NAME",
                     format!(
                         "This is a netCDF dimension but not a netCDF variable. {}",
-                        dimension.name
+                        path_leaf_name(&dimension.name)
                     ),
                 ))
                 .attribute(
@@ -916,7 +1181,7 @@ impl NcFileBuilder {
                     .attribute(H5AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
                     .attribute(H5AttributeBuilder::fixed_string(
                         "NAME",
-                        self.dimensions[dim_id.0].name.as_str(),
+                        path_leaf_name(&self.dimensions[dim_id.0].name),
                     ))
                     .attribute(
                         H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id.0 as i32)
@@ -994,6 +1259,28 @@ impl NcFileBuilder {
         ))
     }
 
+    fn add_dimension_def(
+        &mut self,
+        name: String,
+        size: u64,
+        is_unlimited: bool,
+    ) -> Result<DimensionId> {
+        if !is_unlimited && size == 0 {
+            return Err(Error::InvalidDefinition(
+                "fixed dimensions must have non-zero size; use add_unlimited_dimension".into(),
+            ));
+        }
+        self.ensure_unique_dimension(&name)?;
+        let id = DimensionId(self.dimensions.len());
+        self.dimensions.push(DimensionDef {
+            name,
+            size,
+            is_unlimited,
+            current_size: if is_unlimited { 0 } else { size },
+        });
+        Ok(id)
+    }
+
     fn add_variable_with_type(
         &mut self,
         name: impl Into<String>,
@@ -1002,6 +1289,25 @@ impl NcFileBuilder {
     ) -> Result<VariableId> {
         let name = name.into();
         validate_name(&name, "variable")?;
+        self.add_variable_def(name, dimensions, dtype)
+    }
+
+    fn add_variable_path_with_type(
+        &mut self,
+        path: impl Into<String>,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
+        let path = validate_path_name(path.into(), "variable")?;
+        self.add_variable_def(path, dimensions, dtype)
+    }
+
+    fn add_variable_def(
+        &mut self,
+        name: String,
+        dimensions: &[DimensionId],
+        dtype: NcType,
+    ) -> Result<VariableId> {
         if self.variables.iter().any(|v| v.name == name) {
             return Err(Error::InvalidDefinition(format!(
                 "duplicate variable '{name}'"
@@ -1044,21 +1350,143 @@ impl NcFileBuilder {
             .ok_or_else(|| Error::InvalidDefinition("invalid variable handle".into()))
     }
 
-    fn fixed_variable_shape(&self, variable: &VariableDef) -> Result<Vec<u64>> {
+    fn resolve_variable_write_selection(
+        &self,
+        variable: &VariableDef,
+        selection: &NcSliceInfo,
+        elem_size: usize,
+    ) -> Result<ResolvedWriteSelection> {
+        let extents = self.variable_write_extents(variable, elem_size)?;
+        resolve_write_selection(&variable.name, &extents, selection)
+    }
+
+    fn variable_write_extents(
+        &self,
+        variable: &VariableDef,
+        _elem_size: usize,
+    ) -> Result<Vec<WriteDimensionExtent>> {
         variable
             .dim_ids
             .iter()
-            .map(|id| {
+            .enumerate()
+            .map(|(position, id)| {
                 let dimension = &self.dimensions[id.0];
-                if dimension.is_unlimited {
-                    return Err(Error::UnsupportedFeature(format!(
-                        "slice writes to unlimited dimension '{}' are not supported yet",
-                        dimension.name
-                    )));
-                }
-                Ok(dimension.size)
+                Ok(WriteDimensionExtent {
+                    current: if dimension.is_unlimited {
+                        dimension.current_size
+                    } else {
+                        dimension.size
+                    },
+                    is_unlimited: dimension.is_unlimited,
+                    position,
+                })
             })
             .collect()
+    }
+
+    fn update_unlimited_extents_from_element_count(
+        &mut self,
+        variable: VariableId,
+        elements: u64,
+    ) -> Result<()> {
+        let variable = self.variable(variable)?;
+        let mut known_product = 1u64;
+        let mut unknown = Vec::new();
+        for dim_id in &variable.dim_ids {
+            let dimension = &self.dimensions[dim_id.0];
+            let size = if dimension.is_unlimited {
+                dimension.current_size
+            } else {
+                dimension.size
+            };
+            if dimension.is_unlimited && size == 0 {
+                if !unknown.contains(dim_id) {
+                    unknown.push(*dim_id);
+                }
+                continue;
+            }
+            known_product = match known_product.checked_mul(size) {
+                Some(product) => product,
+                None => return Ok(()),
+            };
+        }
+
+        if unknown.len() != 1 || known_product == 0 {
+            return Ok(());
+        }
+        if elements % known_product != 0 {
+            return Ok(());
+        }
+        self.dimensions[unknown[0].0].current_size = elements / known_product;
+        Ok(())
+    }
+
+    fn update_unlimited_extents_from_shape(
+        &mut self,
+        variable: VariableId,
+        shape: &[u64],
+    ) -> Result<()> {
+        let dim_ids = self.variable(variable)?.dim_ids.clone();
+        if dim_ids.len() != shape.len() {
+            return Err(Error::InvalidDefinition(format!(
+                "resolved shape rank {} does not match variable '{}' rank {}",
+                shape.len(),
+                self.variable(variable)?.name,
+                dim_ids.len()
+            )));
+        }
+        for (dim_id, &size) in dim_ids.iter().zip(shape) {
+            let dimension = &mut self.dimensions[dim_id.0];
+            if dimension.is_unlimited && size > dimension.current_size {
+                dimension.current_size = size;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_native_variable_slice_bytes(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        bytes: &[u8],
+        elem_size: usize,
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, elem_size)?;
+        let expected = checked_mul_usize(
+            resolved.elements,
+            elem_size,
+            "native variable slice byte size",
+        )?;
+        if bytes.len() != expected {
+            return Err(Error::DataLengthMismatch {
+                expected,
+                actual: bytes.len(),
+            });
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer native slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer native variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_native_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                elem_size,
+                resolved.can_grow,
+            )?;
+            scatter_slice_bytes(
+                &mut variable_def.data,
+                elem_size,
+                &resolved.dims,
+                &strides,
+                bytes,
+            )?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
     fn ensure_unique_dimension(&self, name: &str) -> Result<()> {
@@ -1114,6 +1542,10 @@ impl NcFileBuilder {
             })
             || self.attributes.iter().any(|a| attr_requires_cdf5(&a.value))
             || self
+                .group_attributes
+                .iter()
+                .any(|a| attr_requires_cdf5(&a.attribute.value))
+            || self
                 .variables
                 .iter()
                 .flat_map(|v| &v.attributes)
@@ -1141,6 +1573,7 @@ impl NcFileBuilder {
                     .into(),
             ));
         }
+        validate_root_only_names(self)?;
         for variable in &self.variables {
             if variable.storage.has_nc4_options() {
                 return Err(Error::UnsupportedFeature(format!(
@@ -1808,6 +2241,9 @@ fn expected_variable_bytes(
 struct ResolvedWriteSelection {
     dims: Vec<ResolvedWriteSelectionDim>,
     elements: usize,
+    old_shape: Vec<u64>,
+    shape: Vec<u64>,
+    can_grow: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1816,28 +2252,44 @@ enum ResolvedWriteSelectionDim {
     Slice { start: u64, step: u64, count: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WriteDimensionExtent {
+    current: u64,
+    is_unlimited: bool,
+    position: usize,
+}
+
 fn resolve_write_selection(
     variable_name: &str,
-    shape: &[u64],
+    extents: &[WriteDimensionExtent],
     selection: &NcSliceInfo,
 ) -> Result<ResolvedWriteSelection> {
-    if selection.selections.len() != shape.len() {
+    if selection.selections.len() != extents.len() {
         return Err(Error::InvalidDefinition(format!(
             "selection has {} dimensions but variable '{}' has {}",
             selection.selections.len(),
             variable_name,
-            shape.len()
+            extents.len()
         )));
     }
 
-    let mut dims = Vec::with_capacity(shape.len());
+    let mut dims = Vec::with_capacity(extents.len());
+    let mut old_shape = Vec::with_capacity(extents.len());
+    let mut shape = Vec::with_capacity(extents.len());
     let mut elements = 1usize;
-    for (dim, (selection, &dim_size)) in selection.selections.iter().zip(shape).enumerate() {
+    let mut can_grow = false;
+    for (selection, extent) in selection.selections.iter().zip(extents) {
+        let dim_size = extent.current;
+        old_shape.push(dim_size);
+        let mut target_dim_size = dim_size;
         match selection {
             NcSliceInfoElem::Index(index) => {
-                if *index >= dim_size {
+                if extent.is_unlimited {
+                    target_dim_size = checked_add(*index, 1, "unlimited slice extent")?;
+                } else if *index >= dim_size {
                     return Err(Error::InvalidDefinition(format!(
-                        "index {index} out of bounds for dimension {dim} (size {dim_size})"
+                        "index {index} out of bounds for dimension {} (size {dim_size})",
+                        extent.position
                     )));
                 }
                 dims.push(ResolvedWriteSelectionDim::Index(*index));
@@ -1846,22 +2298,43 @@ fn resolve_write_selection(
                 if *step == 0 {
                     return Err(Error::InvalidDefinition("slice step cannot be 0".into()));
                 }
-                if *start > dim_size {
+                if !extent.is_unlimited && *start > dim_size {
                     return Err(Error::InvalidDefinition(format!(
-                        "slice start {start} out of bounds for dimension {dim} (size {dim_size})"
+                        "slice start {start} out of bounds for dimension {} (size {dim_size})",
+                        extent.position
                     )));
                 }
-                let actual_end = if *end == u64::MAX {
+                let actual_end = if extent.is_unlimited {
+                    if *end == u64::MAX {
+                        dim_size
+                    } else {
+                        *end
+                    }
+                } else if *end == u64::MAX {
                     dim_size
                 } else {
                     (*end).min(dim_size)
                 };
+                if extent.is_unlimited && *start > actual_end {
+                    return Err(Error::InvalidDefinition(format!(
+                        "slice start {start} exceeds end {actual_end} for unlimited dimension {}",
+                        extent.position
+                    )));
+                }
                 let count_u64 = if *start >= actual_end {
                     0
                 } else {
                     (actual_end - *start).div_ceil(*step)
                 };
                 let count = require_usize(count_u64, "slice result dimension")?;
+                if extent.is_unlimited && count > 0 {
+                    let last_index = checked_add(
+                        *start,
+                        checked_mul_u64((count - 1) as u64, *step, "slice coordinate step")?,
+                        "slice coordinate",
+                    )?;
+                    target_dim_size = checked_add(last_index, 1, "unlimited slice extent")?;
+                }
                 elements = elements.checked_mul(count).ok_or_else(|| {
                     Error::InvalidDefinition(
                         "slice result element count exceeds platform usize".into(),
@@ -1874,15 +2347,28 @@ fn resolve_write_selection(
                 });
             }
         }
+        if extent.is_unlimited && target_dim_size > dim_size {
+            can_grow = true;
+        }
+        shape.push(target_dim_size.max(dim_size));
     }
 
-    Ok(ResolvedWriteSelection { dims, elements })
+    Ok(ResolvedWriteSelection {
+        dims,
+        elements,
+        old_shape,
+        shape,
+        can_grow,
+    })
 }
 
 fn ensure_variable_slice_buffer(
     variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
     total_elements: u64,
     elem_size: usize,
+    can_grow: bool,
 ) -> Result<()> {
     if variable.data_encoding != VariableDataEncoding::ClassicBigEndian && !variable.data.is_empty()
     {
@@ -1903,6 +2389,18 @@ fn ensure_variable_slice_buffer(
             None => default_classic_fill_bytes(&variable.dtype)?,
         };
         variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
+    } else if variable.data.len() < expected && can_grow {
+        let fill_pattern = match &variable.fill_value {
+            Some(fill_value) => fill_value.classic_bytes.clone(),
+            None => default_classic_fill_bytes(&variable.dtype)?,
+        };
+        resize_variable_data(
+            &mut variable.data,
+            old_shape,
+            new_shape,
+            elem_size,
+            &fill_pattern,
+        )?;
     } else if variable.data.len() != expected {
         return Err(Error::DataLengthMismatch {
             expected,
@@ -1913,6 +2411,170 @@ fn ensure_variable_slice_buffer(
     variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
     variable.string_values = None;
     variable.vlen_values = None;
+    Ok(())
+}
+
+fn ensure_variable_native_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    elem_size: usize,
+    can_grow: bool,
+) -> Result<()> {
+    if variable.data_encoding != VariableDataEncoding::Hdf5Native && !variable.data.is_empty() {
+        return Err(Error::UnsupportedFeature(format!(
+            "native slice writes cannot update classic-endian payload for variable '{}'",
+            variable.name
+        )));
+    }
+
+    let expected = checked_mul_usize(
+        require_usize(total_elements, "native variable element count")?,
+        elem_size,
+        "native variable byte size",
+    )?;
+    if variable.data.is_empty() {
+        variable.data = vec![0; expected];
+    } else if variable.data.len() < expected && can_grow {
+        let fill_pattern = vec![0; elem_size];
+        resize_variable_data(
+            &mut variable.data,
+            old_shape,
+            new_shape,
+            elem_size,
+            &fill_pattern,
+        )?;
+    } else if variable.data.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: variable.data.len(),
+        });
+    }
+
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.string_values = None;
+    variable.vlen_values = None;
+    Ok(())
+}
+
+fn resize_variable_data(
+    data: &mut Vec<u8>,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    elem_size: usize,
+    fill_pattern: &[u8],
+) -> Result<()> {
+    if old_shape.len() != new_shape.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "cannot resize variable data from rank {} to rank {}",
+            old_shape.len(),
+            new_shape.len()
+        )));
+    }
+    let old_elements = checked_shape_elements(old_shape, "old variable shape element count")?;
+    let old_expected = checked_mul_usize(
+        require_usize(old_elements, "old variable element count")?,
+        elem_size,
+        "old variable byte size",
+    )?;
+    if data.len() != old_expected {
+        return Err(Error::DataLengthMismatch {
+            expected: old_expected,
+            actual: data.len(),
+        });
+    }
+
+    let new_elements = checked_shape_elements(new_shape, "new variable shape element count")?;
+    let new_len = checked_mul_usize(
+        require_usize(new_elements, "new variable element count")?,
+        elem_size,
+        "new variable byte size",
+    )?;
+    if old_shape.get(1..) == new_shape.get(1..) {
+        let additional = new_len.checked_sub(data.len()).ok_or_else(|| {
+            Error::InvalidDefinition("new variable byte size is smaller than old size".into())
+        })?;
+        data.extend(filled_data_buffer(additional, elem_size, fill_pattern)?);
+        return Ok(());
+    }
+
+    let old = std::mem::take(data);
+    let mut resized = filled_data_buffer(new_len, elem_size, fill_pattern)?;
+    copy_reshaped_variable_data(&old, &mut resized, old_shape, new_shape, elem_size)?;
+    *data = resized;
+    Ok(())
+}
+
+fn copy_reshaped_variable_data(
+    old: &[u8],
+    new: &mut [u8],
+    old_shape: &[u64],
+    new_shape: &[u64],
+    elem_size: usize,
+) -> Result<()> {
+    let old_elements = checked_shape_elements(old_shape, "old variable copy element count")?;
+    if old_elements == 0 {
+        return Ok(());
+    }
+    if old_shape.is_empty() {
+        if old.len() != elem_size || new.len() != elem_size {
+            return Err(Error::DataLengthMismatch {
+                expected: elem_size,
+                actual: old.len().max(new.len()),
+            });
+        }
+        new.copy_from_slice(old);
+        return Ok(());
+    }
+
+    let old_strides = row_major_strides(old_shape, "old variable copy stride")?;
+    let new_strides = row_major_strides(new_shape, "new variable copy stride")?;
+    let rank = old_shape.len();
+    let mut coords = vec![0u64; rank];
+    for old_index in 0..old_elements {
+        let mut remainder = old_index;
+        for dim in 0..rank {
+            let stride = old_strides[dim];
+            coords[dim] = remainder / stride;
+            remainder %= stride;
+        }
+        if coords
+            .iter()
+            .zip(new_shape)
+            .any(|(&coord, &extent)| coord >= extent)
+        {
+            continue;
+        }
+        let new_index =
+            coords
+                .iter()
+                .zip(&new_strides)
+                .try_fold(0u64, |acc, (&coord, &stride)| {
+                    checked_add(
+                        acc,
+                        checked_mul_u64(coord, stride, "new variable copy coordinate")?,
+                        "new variable copy element index",
+                    )
+                })?;
+        let old_start = checked_mul_usize(
+            require_usize(old_index, "old variable copy element")?,
+            elem_size,
+            "old variable copy byte offset",
+        )?;
+        let new_start = checked_mul_usize(
+            require_usize(new_index, "new variable copy element")?,
+            elem_size,
+            "new variable copy byte offset",
+        )?;
+        let old_end = old_start.checked_add(elem_size).ok_or_else(|| {
+            Error::InvalidDefinition("old variable copy byte range exceeds usize".into())
+        })?;
+        let new_end = new_start.checked_add(elem_size).ok_or_else(|| {
+            Error::InvalidDefinition("new variable copy byte range exceeds usize".into())
+        })?;
+        new[new_start..new_end].copy_from_slice(&old[old_start..old_end]);
+    }
     Ok(())
 }
 
@@ -2188,7 +2850,7 @@ fn infer_nc4_dimension_sizes(builder: &NcFileBuilder) -> Result<Vec<u64>> {
         .iter()
         .map(|dimension| {
             if dimension.is_unlimited {
-                None
+                (dimension.current_size > 0).then_some(dimension.current_size)
             } else {
                 Some(dimension.size)
             }
@@ -2612,6 +3274,7 @@ fn validate_nc4_classic_attr_value(value: &NcAttrValue) -> Result<()> {
 
 #[cfg(feature = "netcdf4")]
 fn validate_nc4_classic_model(builder: &NcFileBuilder) -> Result<()> {
+    validate_root_only_names(builder)?;
     let unlimited_count = builder
         .dimensions
         .iter()
@@ -2678,6 +3341,50 @@ fn validate_name(name: &str, kind: &str) -> Result<()> {
     if name.contains('/') || name.bytes().any(|b| b == 0) {
         return Err(Error::InvalidDefinition(format!(
             "{kind} name '{name}' contains invalid characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path_name(path: String, kind: &str) -> Result<String> {
+    let trimmed = path.trim_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Err(Error::InvalidDefinition(format!(
+            "{kind} path must not be empty"
+        )));
+    }
+    for component in trimmed.split('/') {
+        validate_name(component, kind)?;
+    }
+    Ok(trimmed)
+}
+
+#[cfg(feature = "netcdf4")]
+fn path_leaf_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn validate_root_only_names(builder: &NcFileBuilder) -> Result<()> {
+    for dimension in &builder.dimensions {
+        if dimension.name.contains('/') {
+            return Err(Error::UnsupportedFeature(format!(
+                "dimension '{}' requires NetCDF-4",
+                dimension.name
+            )));
+        }
+    }
+    for variable in &builder.variables {
+        if variable.name.contains('/') {
+            return Err(Error::UnsupportedFeature(format!(
+                "variable '{}' requires NetCDF-4",
+                variable.name
+            )));
+        }
+    }
+    if let Some(group_attr) = builder.group_attributes.first() {
+        return Err(Error::UnsupportedFeature(format!(
+            "group '{}' requires NetCDF-4",
+            group_attr.group_path
         )));
     }
     Ok(())

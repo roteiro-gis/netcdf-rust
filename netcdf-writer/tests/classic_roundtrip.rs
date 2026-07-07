@@ -149,6 +149,113 @@ fn writes_classic_variable_slice_with_default_fill_initialization() {
 }
 
 #[test]
+fn writes_classic_char_variable_slice() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let names = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            names,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 5,
+                        step: 1,
+                    },
+                ],
+            },
+            b"alpha",
+        )
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            names,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(1),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 4,
+                        step: 1,
+                    },
+                ],
+            },
+            b"beta",
+        )
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
+fn writes_classic_unlimited_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let temp = builder
+        .add_variable::<i32>("temp", &[time, station])
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[10_i32, 11],
+        )
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(2),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[30_i32, 31],
+        )
+        .unwrap();
+
+    let (format, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    assert_eq!(format, netcdf_reader::NcFormat::Classic);
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert!(time_dim.is_unlimited);
+    let values = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(values.shape(), &[3, 2]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[10, 11, NC_FILL_INT, NC_FILL_INT, 30, 31]
+    );
+}
+
+#[test]
 fn auto_promotes_unsigned_and_u64_to_cdf5() {
     let mut builder = NcFileBuilder::new();
     let n = builder.add_dimension("n", 3).unwrap();
@@ -213,4 +320,32 @@ fn rejects_multiple_unlimited_dimensions_for_classic_writes() {
 
     let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
     assert!(err.to_string().contains("at most one unlimited"));
+}
+
+#[test]
+fn rejects_group_paths_for_classic_writes() {
+    let mut builder = NcFileBuilder::new();
+    let dim = builder.add_dimension_path("science/x", 2).unwrap();
+    let variable = builder
+        .add_variable_path::<i32>("science/value", &[dim])
+        .unwrap();
+    builder.write_variable(variable, &[1_i32, 2]).unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_group_attributes_for_classic_writes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "science",
+            "title",
+            NcAttrValue::Chars("enhanced model".to_string()),
+        )
+        .unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(err.to_string().contains("requires NetCDF-4"));
 }

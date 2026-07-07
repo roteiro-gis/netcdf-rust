@@ -61,6 +61,91 @@ fn writes_nc4_coordinate_variable() {
 }
 
 #[test]
+fn writes_nc4_group_dimension_and_variable_paths() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "/science/",
+            "title",
+            NcAttrValue::Chars("science profile".to_string()),
+        )
+        .unwrap();
+    builder
+        .add_group_attribute(
+            "metadata",
+            "Conventions",
+            NcAttrValue::Chars("CF-1.11".to_string()),
+        )
+        .unwrap();
+    let z = builder.add_dimension_path("science/z", 3).unwrap();
+    let temp = builder
+        .add_variable_path::<f32>("science/temp", &[z])
+        .unwrap();
+    builder
+        .write_variable(temp, &[280.0_f32, 281.0, 282.0])
+        .unwrap();
+
+    let x = builder.add_dimension_path("/science/x/", 3).unwrap();
+    let coordinate = builder.add_variable_path::<f32>("science/x", &[x]).unwrap();
+    builder
+        .write_variable(coordinate, &[0.0_f32, 1.0, 2.0])
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let group = file.group("science").unwrap();
+    assert_eq!(group.name, "science");
+    assert_eq!(
+        group.attribute("title").unwrap().value.as_string().unwrap(),
+        "science profile"
+    );
+    assert_eq!(
+        file.global_attribute("science/title")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "science profile"
+    );
+    assert_eq!(
+        file.group("metadata")
+            .unwrap()
+            .attribute("Conventions")
+            .unwrap()
+            .value
+            .as_string()
+            .unwrap(),
+        "CF-1.11"
+    );
+    assert_eq!(group.dimension("z").unwrap().size, 3);
+    assert_eq!(group.dimension("x").unwrap().size, 3);
+    assert_eq!(file.dimension("science/z").unwrap().size, 3);
+    assert_eq!(file.dimension("science/x").unwrap().size, 3);
+
+    let temp_variable = file.variable("science/temp").unwrap();
+    assert_eq!(temp_variable.shape(), vec![3]);
+    assert!(!temp_variable.is_coordinate_variable());
+    let temp_values = file.read_variable::<f32>("science/temp").unwrap();
+    assert_eq!(
+        temp_values.as_slice_memory_order().unwrap(),
+        &[280.0, 281.0, 282.0]
+    );
+
+    let coordinate_variable = file.variable("science/x").unwrap();
+    assert!(coordinate_variable.is_coordinate_variable_for("x"));
+    let coordinate_values = file.read_variable::<f32>("science/x").unwrap();
+    assert_eq!(
+        coordinate_values.as_slice_memory_order().unwrap(),
+        &[0.0, 1.0, 2.0]
+    );
+}
+
+#[test]
 fn writes_nc4_scalar_variable() {
     let mut builder = NcFileBuilder::new();
     let variable = builder.add_variable::<i32>("answer", &[]).unwrap();
@@ -188,6 +273,64 @@ fn writes_nc4_char_variable() {
     let variable = file.variable("station_name").unwrap();
     assert_eq!(variable.dtype(), &netcdf_writer::NcType::Char);
     assert_eq!(variable.shape(), vec![2, 5]);
+    assert_eq!(
+        file.read_variable_raw_bytes("station_name").unwrap(),
+        b"alphabeta\0"
+    );
+    assert_eq!(
+        file.read_variable_as_strings("station_name").unwrap(),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+}
+
+#[test]
+fn writes_nc4_char_variable_slice() {
+    let mut builder = NcFileBuilder::new();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let strlen = builder.add_dimension("strlen", 5).unwrap();
+    let variable = builder
+        .add_char_variable("station_name", &[station, strlen])
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            variable,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 5,
+                        step: 1,
+                    },
+                ],
+            },
+            b"alpha",
+        )
+        .unwrap();
+    builder
+        .write_char_variable_slice(
+            variable,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(1),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 4,
+                        step: 1,
+                    },
+                ],
+            },
+            b"beta",
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
     assert_eq!(
         file.read_variable_raw_bytes("station_name").unwrap(),
         b"alphabeta\0"
@@ -459,6 +602,246 @@ fn writes_nc4_user_defined_variables() {
 }
 
 #[test]
+fn writes_nc4_user_defined_variable_slices() {
+    let mut builder = NcFileBuilder::new();
+    let n = builder.add_dimension("n", 3).unwrap();
+    let quality_type = NcType::Enum {
+        base: Box::new(NcType::UByte),
+        members: vec![
+            NcEnumMember {
+                name: "bad".to_string(),
+                value: NcIntegerValue::U8(1),
+            },
+            NcEnumMember {
+                name: "good".to_string(),
+                value: NcIntegerValue::U8(2),
+            },
+        ],
+    };
+    let samples_type = NcType::Array {
+        base: Box::new(NcType::Short),
+        dims: vec![3],
+    };
+    let obs_type = NcType::Compound {
+        size: 12,
+        fields: vec![
+            NcCompoundField {
+                name: "temp".to_string(),
+                offset: 0,
+                dtype: NcType::Float,
+            },
+            NcCompoundField {
+                name: "quality".to_string(),
+                offset: 4,
+                dtype: NcType::UByte,
+            },
+            NcCompoundField {
+                name: "samples".to_string(),
+                offset: 6,
+                dtype: NcType::Array {
+                    base: Box::new(NcType::Short),
+                    dims: vec![3],
+                },
+            },
+        ],
+    };
+    let quality = builder
+        .add_user_defined_variable("quality", &[n], quality_type)
+        .unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[n],
+            NcType::Opaque {
+                size: 4,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+    let samples = builder
+        .add_user_defined_variable("samples", &[n], samples_type)
+        .unwrap();
+    let obs = builder
+        .add_user_defined_variable("obs", &[n], obs_type)
+        .unwrap();
+
+    builder
+        .write_enum_variable_slice(
+            quality,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Slice {
+                    start: 1,
+                    end: 3,
+                    step: 1,
+                }],
+            },
+            &[NcIntegerValue::U8(2), NcIntegerValue::U8(1)],
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(2)],
+            },
+            &[&[5_u8, 6, 7, 8][..]],
+        )
+        .unwrap();
+    builder
+        .write_array_variable_slice(
+            samples,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[10_i16, 11, 12],
+        )
+        .unwrap();
+    let mut obs_bytes = Vec::new();
+    obs_bytes.extend_from_slice(&12.5_f32.to_le_bytes());
+    obs_bytes.push(2);
+    obs_bytes.push(0);
+    obs_bytes.extend_from_slice(&10_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&11_i16.to_le_bytes());
+    obs_bytes.extend_from_slice(&12_i16.to_le_bytes());
+    builder
+        .write_user_defined_variable_slice_bytes(
+            obs,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(2)],
+            },
+            &obs_bytes,
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_raw_bytes("quality").unwrap(),
+        vec![0, 2, 1]
+    );
+    assert_eq!(
+        file.read_variable_raw_bytes("blob").unwrap(),
+        vec![0, 0, 0, 0, 0, 0, 0, 0, 5, 6, 7, 8]
+    );
+    let mut expected_samples = vec![0_u8; 18];
+    expected_samples[6..8].copy_from_slice(&10_i16.to_le_bytes());
+    expected_samples[8..10].copy_from_slice(&11_i16.to_le_bytes());
+    expected_samples[10..12].copy_from_slice(&12_i16.to_le_bytes());
+    assert_eq!(
+        file.read_variable_raw_bytes("samples").unwrap(),
+        expected_samples
+    );
+    let mut expected_obs = vec![0_u8; 36];
+    expected_obs[24..36].copy_from_slice(&obs_bytes);
+    assert_eq!(file.read_variable_raw_bytes("obs").unwrap(), expected_obs);
+}
+
+#[test]
+fn writes_nc4_user_defined_unlimited_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let obs = builder.add_unlimited_dimension("obs").unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[obs],
+            NcType::Opaque {
+                size: 4,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(1)],
+            },
+            &[&[1_u8, 2, 3, 4][..]],
+        )
+        .unwrap();
+    builder
+        .write_opaque_variable_slice(
+            blob,
+            &NcSliceInfo {
+                selections: vec![NcSliceInfoElem::Index(3)],
+            },
+            &[&[9_u8, 8, 7, 6][..]],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let obs_dim = file.dimension("obs").unwrap();
+    assert_eq!(obs_dim.size, 4);
+    assert!(obs_dim.is_unlimited);
+    assert_eq!(
+        file.read_variable_raw_bytes("blob").unwrap(),
+        vec![0, 0, 0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 9, 8, 7, 6]
+    );
+}
+
+#[test]
+fn writes_nc4_user_defined_multiple_unlimited_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let blob = builder
+        .add_user_defined_variable(
+            "blob",
+            &[time, member],
+            NcType::Opaque {
+                size: 2,
+                tag: "blob".to_string(),
+            },
+        )
+        .unwrap();
+
+    for (time_index, member_index, value) in [
+        (0, 0, [1_u8, 0_u8]),
+        (1, 0, [2_u8, 0_u8]),
+        (0, 1, [1_u8, 1_u8]),
+        (2, 1, [3_u8, 1_u8]),
+    ] {
+        builder
+            .write_opaque_variable_slice(
+                blob,
+                &NcSliceInfo {
+                    selections: vec![
+                        NcSliceInfoElem::Index(time_index),
+                        NcSliceInfoElem::Index(member_index),
+                    ],
+                },
+                &[&value[..]],
+            )
+            .unwrap();
+    }
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(file.dimension("time").unwrap().size, 3);
+    assert_eq!(file.dimension("member").unwrap().size, 2);
+    assert_eq!(
+        file.read_variable_raw_bytes("blob").unwrap(),
+        vec![1, 0, 1, 1, 2, 0, 0, 0, 0, 0, 3, 1]
+    );
+}
+
+#[test]
 fn writes_nc4_vlen_sequence_variable() {
     let mut builder = NcFileBuilder::new();
     let obs = builder.add_unlimited_dimension("obs").unwrap();
@@ -549,6 +932,44 @@ fn rejects_nc4_classic_string_variable() {
     let variable = builder.add_string_variable("name", &[]).unwrap();
     builder
         .write_string_variable(variable, &["enhanced"])
+        .unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_nc4_classic_group_paths() {
+    let mut builder = NcFileBuilder::new();
+    let dim = builder.add_dimension_path("science/x", 2).unwrap();
+    let variable = builder
+        .add_variable_path::<i32>("science/value", &[dim])
+        .unwrap();
+    builder.write_variable(variable, &[1_i32, 2]).unwrap();
+
+    let err = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4Classic,
+        })
+        .unwrap_err();
+
+    assert!(err.to_string().contains("requires NetCDF-4"));
+}
+
+#[test]
+fn rejects_nc4_classic_group_attributes() {
+    let mut builder = NcFileBuilder::new();
+    builder
+        .add_group_attribute(
+            "science",
+            "title",
+            NcAttrValue::Chars("enhanced model".to_string()),
+        )
         .unwrap();
 
     let err = builder
@@ -676,6 +1097,111 @@ fn writes_nc4_unlimited_dimension_variables() {
     assert_eq!(
         temp_values.as_slice_memory_order().unwrap(),
         &[10.0, 11.0, 20.0, 21.0, 30.0, 31.0]
+    );
+}
+
+#[test]
+fn writes_nc4_unlimited_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let station = builder.add_dimension("station", 2).unwrap();
+    let temp = builder
+        .add_variable::<i32>("temp", &[time, station])
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(0),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[10_i32, 11],
+        )
+        .unwrap();
+    builder
+        .write_variable_slice(
+            temp,
+            &NcSliceInfo {
+                selections: vec![
+                    NcSliceInfoElem::Index(2),
+                    NcSliceInfoElem::Slice {
+                        start: 0,
+                        end: 2,
+                        step: 1,
+                    },
+                ],
+            },
+            &[30_i32, 31],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert!(time_dim.is_unlimited);
+    let values = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(values.shape(), &[3, 2]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[10, 11, NC_FILL_INT, NC_FILL_INT, 30, 31]
+    );
+}
+
+#[test]
+fn writes_nc4_multiple_unlimited_variable_slice_append() {
+    let mut builder = NcFileBuilder::new();
+    let time = builder.add_unlimited_dimension("time").unwrap();
+    let member = builder.add_unlimited_dimension("member").unwrap();
+    let temp = builder
+        .add_variable::<i32>("temp", &[time, member])
+        .unwrap();
+
+    for (time_index, member_index, value) in [(0, 0, 10), (1, 0, 20), (0, 1, 11), (2, 1, 31)] {
+        builder
+            .write_variable_slice(
+                temp,
+                &NcSliceInfo {
+                    selections: vec![
+                        NcSliceInfoElem::Index(time_index),
+                        NcSliceInfoElem::Index(member_index),
+                    ],
+                },
+                &[value],
+            )
+            .unwrap();
+    }
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let time_dim = file.dimension("time").unwrap();
+    let member_dim = file.dimension("member").unwrap();
+    assert_eq!(time_dim.size, 3);
+    assert_eq!(member_dim.size, 2);
+    assert!(time_dim.is_unlimited);
+    assert!(member_dim.is_unlimited);
+
+    let values = file.read_variable::<i32>("temp").unwrap();
+    assert_eq!(values.shape(), &[3, 2]);
+    assert_eq!(
+        values.as_slice_memory_order().unwrap(),
+        &[10, 11, 20, NC_FILL_INT, NC_FILL_INT, 31]
     );
 }
 

@@ -166,6 +166,58 @@ fn writes_nested_group_paths() {
 }
 
 #[test]
+fn writes_group_attributes() {
+    let quality = [1_i16, 2];
+    let plan = Hdf5Builder::new()
+        .group_attribute(
+            "metadata",
+            AttributeBuilder::fixed_string("Conventions", "CF-1.11"),
+        )
+        .group_attribute(
+            "science/quality",
+            AttributeBuilder::scalar("version", 2_i32).unwrap(),
+        )
+        .dataset(DatasetBuilder::typed_data("science/quality/qc", vec![2], &quality).unwrap())
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let metadata = file.group("/metadata").unwrap();
+    assert_eq!(
+        metadata
+            .attribute("Conventions")
+            .unwrap()
+            .read_string()
+            .unwrap(),
+        "CF-1.11"
+    );
+
+    let quality_group = file.group("/science/quality").unwrap();
+    assert_eq!(
+        quality_group
+            .attribute("version")
+            .unwrap()
+            .read_scalar::<i32>()
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        file.dataset("/science/quality/qc")
+            .unwrap()
+            .read_array::<i16>()
+            .unwrap()
+            .as_slice_memory_order()
+            .unwrap(),
+        quality
+    );
+}
+
+#[test]
 fn rejects_dataset_path_that_is_also_group() {
     let err = Hdf5Builder::new()
         .dataset(DatasetBuilder::typed_data("science", vec![1], &[1_i32]).unwrap())

@@ -751,6 +751,7 @@ impl Group {
 
 fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildObjectKind {
     let mut has_dataset_message = false;
+    let mut has_attribute_message = false;
 
     for msg in &header.messages {
         match msg {
@@ -758,6 +759,9 @@ fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildOb
             | HdfMessage::Link(_)
             | HdfMessage::LinkInfo(_)
             | HdfMessage::GroupInfo(_) => return ChildObjectKind::Group,
+            HdfMessage::Attribute(_) | HdfMessage::AttributeInfo(_) => {
+                has_attribute_message = true;
+            }
             HdfMessage::Dataspace(_)
             | HdfMessage::DataLayout(_)
             | HdfMessage::FillValue(_)
@@ -768,6 +772,8 @@ fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildOb
 
     if has_dataset_message {
         ChildObjectKind::Dataset
+    } else if has_attribute_message {
+        ChildObjectKind::Group
     } else {
         ChildObjectKind::Other
     }

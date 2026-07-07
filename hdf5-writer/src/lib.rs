@@ -825,11 +825,41 @@ impl AttributeBuilder {
     }
 }
 
+/// Attribute attached to an HDF5 group addressed by relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupAttributeBuilder {
+    path: String,
+    attribute: AttributeBuilder,
+}
+
+impl GroupAttributeBuilder {
+    pub fn new(group_path: impl Into<String>, attribute: AttributeBuilder) -> Self {
+        Self {
+            path: group_path.into(),
+            attribute,
+        }
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn attribute(&self) -> &AttributeBuilder {
+        &self.attribute
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        validate_name(&self.path)?;
+        self.attribute.validate()
+    }
+}
+
 /// Root HDF5 file builder.
 #[derive(Debug, Clone, Default)]
 pub struct Hdf5Builder {
     datasets: Vec<DatasetBuilder>,
     attributes: Vec<AttributeBuilder>,
+    group_attributes: Vec<GroupAttributeBuilder>,
 }
 
 impl Hdf5Builder {
@@ -847,9 +877,19 @@ impl Hdf5Builder {
         self
     }
 
+    pub fn group_attribute(
+        mut self,
+        group_path: impl Into<String>,
+        attribute: AttributeBuilder,
+    ) -> Self {
+        self.group_attributes
+            .push(GroupAttributeBuilder::new(group_path, attribute));
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         let mut names = std::collections::BTreeSet::new();
-        let mut implicit_group_paths = std::collections::BTreeSet::new();
+        let mut group_paths = std::collections::BTreeSet::new();
         for dataset in &self.datasets {
             dataset.validate()?;
             if !names.insert(dataset.name.as_str()) {
@@ -860,12 +900,20 @@ impl Hdf5Builder {
             }
             let mut parent = parent_path(&dataset.name);
             while let Some(path) = parent {
-                implicit_group_paths.insert(path);
+                group_paths.insert(path.to_string());
                 parent = parent_path(path);
             }
         }
+        for group_attribute in &self.group_attributes {
+            group_attribute.validate()?;
+            let mut path = Some(group_attribute.path.as_str());
+            while let Some(group_path) = path {
+                group_paths.insert(group_path.to_string());
+                path = parent_path(group_path);
+            }
+        }
         for dataset in &self.datasets {
-            if implicit_group_paths.contains(dataset.name.as_str()) {
+            if group_paths.contains(dataset.name.as_str()) {
                 return Err(Error::InvalidDefinition(format!(
                     "dataset '{}' conflicts with an implicit HDF5 group at the same path",
                     dataset.name
@@ -873,6 +921,7 @@ impl Hdf5Builder {
             }
         }
         validate_attributes(&self.attributes)?;
+        validate_group_attributes(&self.group_attributes)?;
         Ok(())
     }
 
@@ -881,6 +930,7 @@ impl Hdf5Builder {
         Ok(Hdf5WritePlan {
             datasets: self.datasets,
             attributes: self.attributes,
+            group_attributes: self.group_attributes,
         })
     }
 }
@@ -890,6 +940,7 @@ impl Hdf5Builder {
 pub struct Hdf5WritePlan {
     datasets: Vec<DatasetBuilder>,
     attributes: Vec<AttributeBuilder>,
+    group_attributes: Vec<GroupAttributeBuilder>,
 }
 
 impl Hdf5WritePlan {
@@ -901,10 +952,15 @@ impl Hdf5WritePlan {
         &self.attributes
     }
 
+    pub fn group_attributes(&self) -> &[GroupAttributeBuilder] {
+        &self.group_attributes
+    }
+
     pub fn validate(&self) -> Result<()> {
         Hdf5Builder {
             datasets: self.datasets.clone(),
             attributes: self.attributes.clone(),
+            group_attributes: self.group_attributes.clone(),
         }
         .validate()
     }
@@ -963,6 +1019,24 @@ fn validate_attributes(attributes: &[AttributeBuilder]) -> Result<()> {
             return Err(Error::InvalidDefinition(format!(
                 "duplicate attribute '{}'",
                 attribute.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_group_attributes(group_attributes: &[GroupAttributeBuilder]) -> Result<()> {
+    let mut names_by_group =
+        std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for group_attribute in group_attributes {
+        group_attribute.validate()?;
+        let group_names = names_by_group
+            .entry(group_attribute.path.as_str())
+            .or_default();
+        if !group_names.insert(group_attribute.attribute.name.as_str()) {
+            return Err(Error::InvalidDefinition(format!(
+                "duplicate attribute '{}' on HDF5 group '{}'",
+                group_attribute.attribute.name, group_attribute.path
             )));
         }
     }
@@ -1029,6 +1103,7 @@ struct GlobalHeapObjectPlan {
 #[derive(Debug, Clone)]
 struct PlannedAttributes {
     root: Vec<PlannedAttribute>,
+    groups: Vec<Vec<PlannedAttribute>>,
     datasets: Vec<Vec<PlannedAttribute>>,
     dataset_vlen_refs: Vec<Option<Vec<VLenHeapReference>>>,
     heap_objects: Vec<GlobalHeapObjectPlan>,
@@ -1083,12 +1158,12 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let prepared = prepare_datasets(plan, options)?;
-    let groups = plan_group_hierarchy(&prepared)?;
+    let groups = plan_group_hierarchy(&prepared, &plan.group_attributes)?;
     let placeholder_group_addresses = vec![0; groups.paths.len()];
     let placeholder_dataset_addresses = vec![0; prepared.len()];
     let placeholder_targets =
         placeholder_target_addresses(&prepared, &groups, &placeholder_group_addresses);
-    let placeholder_attributes = plan_attributes(plan, &placeholder_targets)?;
+    let placeholder_attributes = plan_attributes(plan, &groups, &placeholder_targets)?;
     let root_header_size = encode_group_header_from_plan(
         &groups.root_links,
         &placeholder_group_addresses,
@@ -1109,13 +1184,17 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     );
 
     let mut group_addresses = Vec::with_capacity(groups.paths.len());
-    for group_links in &groups.group_links {
+    for (group_links, attributes) in groups
+        .group_links
+        .iter()
+        .zip(&placeholder_attributes.groups)
+    {
         group_addresses.push(next_address);
         let placeholder = encode_group_header_from_plan(
             group_links,
             &placeholder_group_addresses,
             &placeholder_dataset_addresses,
-            &[],
+            attributes,
             0,
         )?;
         next_address = align_u64(
@@ -1196,7 +1275,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 
     let target_addresses =
         target_addresses(&prepared, &header_addresses, &groups, &group_addresses);
-    let planned_attributes = plan_attributes(plan, &target_addresses)?;
+    let planned_attributes = plan_attributes(plan, &groups, &target_addresses)?;
 
     let heap_address = if planned_attributes.heap_objects.is_empty() {
         0
@@ -1222,16 +1301,17 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     )?;
 
     let mut group_emissions = Vec::with_capacity(groups.paths.len());
-    for (group_links, header_address) in groups
+    for ((group_links, attributes), header_address) in groups
         .group_links
         .iter()
+        .zip(&planned_attributes.groups)
         .zip(group_addresses.iter().copied())
     {
         let header = encode_group_header_from_plan(
             group_links,
             &group_addresses,
             &header_addresses,
-            &[],
+            attributes,
             heap_address,
         )?;
         group_emissions.push(GroupEmission {
@@ -1537,13 +1617,23 @@ fn prepare_datasets(
     Ok(prepared)
 }
 
-fn plan_group_hierarchy(prepared: &[PreparedDataset<'_>]) -> Result<GroupHierarchy> {
+fn plan_group_hierarchy(
+    prepared: &[PreparedDataset<'_>],
+    group_attributes: &[GroupAttributeBuilder],
+) -> Result<GroupHierarchy> {
     let mut group_paths = std::collections::BTreeSet::new();
     for prepared_dataset in prepared {
         let mut parent = parent_path(&prepared_dataset.dataset.name);
         while let Some(path) = parent {
             group_paths.insert(path.to_string());
             parent = parent_path(path);
+        }
+    }
+    for group_attribute in group_attributes {
+        let mut path = Some(group_attribute.path.as_str());
+        while let Some(group_path) = path {
+            group_paths.insert(group_path.to_string());
+            path = parent_path(group_path);
         }
     }
 
@@ -1737,15 +1827,33 @@ fn fixed_array_entry_count(chunk_index: &PreparedChunkIndex) -> Result<u64> {
 
 fn plan_attributes(
     plan: &Hdf5WritePlan,
+    groups: &GroupHierarchy,
     target_addresses: &std::collections::BTreeMap<String, u64>,
 ) -> Result<PlannedAttributes> {
     let mut heap_objects = Vec::new();
-    let root = plan_attribute_list(&plan.attributes, target_addresses, &mut heap_objects)?;
+    let root = plan_attribute_list(plan.attributes.iter(), target_addresses, &mut heap_objects)?;
+    let groups = groups
+        .paths
+        .iter()
+        .map(|path| {
+            plan_attribute_list(
+                plan.group_attributes.iter().filter_map(|group_attribute| {
+                    (group_attribute.path == *path).then_some(&group_attribute.attribute)
+                }),
+                target_addresses,
+                &mut heap_objects,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let datasets = plan
         .datasets
         .iter()
         .map(|dataset| {
-            plan_attribute_list(&dataset.attributes, target_addresses, &mut heap_objects)
+            plan_attribute_list(
+                dataset.attributes.iter(),
+                target_addresses,
+                &mut heap_objects,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let dataset_vlen_refs = plan
@@ -1755,19 +1863,20 @@ fn plan_attributes(
         .collect::<Result<Vec<_>>>()?;
     Ok(PlannedAttributes {
         root,
+        groups,
         datasets,
         dataset_vlen_refs,
         heap_objects,
     })
 }
 
-fn plan_attribute_list(
-    attributes: &[AttributeBuilder],
+fn plan_attribute_list<'a>(
+    attributes: impl IntoIterator<Item = &'a AttributeBuilder>,
     target_addresses: &std::collections::BTreeMap<String, u64>,
     heap_objects: &mut Vec<GlobalHeapObjectPlan>,
 ) -> Result<Vec<PlannedAttribute>> {
     attributes
-        .iter()
+        .into_iter()
         .map(|attribute| plan_attribute(attribute, target_addresses, heap_objects))
         .collect()
 }

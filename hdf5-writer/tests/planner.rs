@@ -1,4 +1,4 @@
-use hdf5_writer::{DatasetBuilder, Hdf5Builder};
+use hdf5_writer::{AttributeBuilder, DatasetBuilder, Hdf5Builder};
 
 #[test]
 fn validates_basic_contiguous_dataset_plan() {
@@ -9,6 +9,32 @@ fn validates_basic_contiguous_dataset_plan() {
 
     assert_eq!(plan.datasets().len(), 1);
     assert_eq!(plan.datasets()[0].shape(), &[2, 3]);
+}
+
+#[test]
+fn validates_group_attribute_plan() {
+    let plan = Hdf5Builder::new()
+        .group_attribute(
+            "science",
+            AttributeBuilder::fixed_string("title", "profile"),
+        )
+        .into_plan()
+        .unwrap();
+
+    assert_eq!(plan.group_attributes().len(), 1);
+    assert_eq!(plan.group_attributes()[0].path(), "science");
+    assert_eq!(plan.group_attributes()[0].attribute().name(), "title");
+}
+
+#[test]
+fn rejects_duplicate_group_attributes() {
+    let err = Hdf5Builder::new()
+        .group_attribute("science", AttributeBuilder::fixed_string("title", "one"))
+        .group_attribute("science", AttributeBuilder::fixed_string("title", "two"))
+        .into_plan()
+        .unwrap_err();
+
+    assert!(err.to_string().contains("duplicate attribute"));
 }
 
 #[test]
