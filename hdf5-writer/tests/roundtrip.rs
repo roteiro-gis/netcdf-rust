@@ -437,6 +437,40 @@ fn writes_chunked_vlen_string_dataset_backed_by_global_heap() {
 }
 
 #[test]
+fn writes_filtered_chunked_vlen_string_dataset_backed_by_global_heap() {
+    let values = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data("names", vec![2, 3], &values)
+                .unwrap()
+                .chunked(vec![1, 2])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/names").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 2]);
+    assert_eq!(
+        dataset.read_strings().unwrap(),
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn writes_vlen_sequence_dataset_backed_by_global_heap() {
     let base = Datatype::FixedPoint {
         size: 2,
@@ -477,6 +511,56 @@ fn writes_vlen_sequence_dataset_backed_by_global_heap() {
             padding: StringPadding::NullTerminate,
         }
     );
+
+    let raw = dataset.read_raw_bytes().unwrap();
+    let ref_size = dataset.vlen_reference_size();
+    let decoded = raw
+        .chunks_exact(ref_size)
+        .map(|reference| dataset.resolve_vlen_reference_bytes(reference, 2).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn writes_filtered_chunked_vlen_sequence_dataset_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: true,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let values = vec![
+        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        [3_i16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_i16.to_le_bytes(),
+            11_i16.to_le_bytes(),
+            12_i16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_sequence_data("ragged", base, vec![2, 2], values.clone())
+                .unwrap()
+                .chunked(vec![1, 1])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/ragged").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 1]);
 
     let raw = dataset.read_raw_bytes().unwrap();
     let ref_size = dataset.vlen_reference_size();

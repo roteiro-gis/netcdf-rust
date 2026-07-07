@@ -1718,6 +1718,90 @@ fn writes_nc4_filtered_chunked_variable() {
 }
 
 #[test]
+fn writes_nc4_filtered_chunked_string_variable() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 2).unwrap();
+    let x = builder.add_dimension("x", 3).unwrap();
+    let name = builder.add_string_variable("name", &[y, x]).unwrap();
+    builder.set_variable_chunking(name, vec![1, 2]).unwrap();
+    builder.set_variable_deflate(name, Some(6), false).unwrap();
+    builder
+        .write_string_variable(
+            name,
+            &["alpha", "beta", "gamma", "delta", "epsilon", "zeta"],
+        )
+        .unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        file.read_variable_as_strings("name").unwrap(),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+            "delta".to_string(),
+            "epsilon".to_string(),
+            "zeta".to_string()
+        ]
+    );
+}
+
+#[test]
+fn writes_nc4_filtered_chunked_vlen_sequence_variable() {
+    let mut builder = NcFileBuilder::new();
+    let y = builder.add_dimension("y", 2).unwrap();
+    let x = builder.add_dimension("x", 2).unwrap();
+    let dtype = NcType::VLen {
+        base: Box::new(NcType::Short),
+    };
+    let ragged = builder
+        .add_user_defined_variable("ragged", &[y, x], dtype)
+        .unwrap();
+    builder.set_variable_chunking(ragged, vec![1, 1]).unwrap();
+    builder
+        .set_variable_deflate(ragged, Some(6), false)
+        .unwrap();
+    let values = vec![
+        vec![1_i16, 2],
+        vec![3_i16],
+        Vec::new(),
+        vec![10_i16, 11, 12],
+    ];
+    builder.write_vlen_variable(ragged, &values).unwrap();
+
+    let (_format, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let file = NcFile::from_bytes(&bytes).unwrap();
+    let decoded = file.read_variable_user_defined("ragged").unwrap();
+    assert_eq!(
+        decoded.as_slice().unwrap(),
+        &[
+            netcdf_reader::NcValue::VLen(vec![
+                netcdf_reader::NcValue::Short(1),
+                netcdf_reader::NcValue::Short(2)
+            ]),
+            netcdf_reader::NcValue::VLen(vec![netcdf_reader::NcValue::Short(3)]),
+            netcdf_reader::NcValue::VLen(Vec::new()),
+            netcdf_reader::NcValue::VLen(vec![
+                netcdf_reader::NcValue::Short(10),
+                netcdf_reader::NcValue::Short(11),
+                netcdf_reader::NcValue::Short(12)
+            ])
+        ]
+    );
+}
+
+#[test]
 fn rejects_classic_variable_storage_options() {
     let mut builder = NcFileBuilder::new();
     let x = builder.add_dimension("x", 4).unwrap();

@@ -1157,7 +1157,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         )));
     }
 
-    let prepared = prepare_datasets(plan, options)?;
+    let mut prepared = prepare_datasets(plan, options)?;
     let groups = plan_group_hierarchy(&prepared, &plan.group_attributes)?;
     let placeholder_group_addresses = vec![0; groups.paths.len()];
     let placeholder_dataset_addresses = vec![0; prepared.len()];
@@ -1258,39 +1258,27 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         }
     }
 
-    let mut data_addresses = Vec::with_capacity(prepared.len());
-    for prepared_dataset in &prepared {
-        data_addresses.push(next_address);
-        if !matches!(prepared_dataset.dataset.layout, PlannedLayout::Compact) {
-            next_address = align_u64(
-                checked_add_u64(
-                    next_address,
-                    prepared_dataset.raw_data.len() as u64,
-                    "dataset raw data end",
-                )?,
-                8,
-            );
-        }
-    }
+    let data_start_address = next_address;
 
     let target_addresses =
         target_addresses(&prepared, &header_addresses, &groups, &group_addresses);
     let planned_attributes = plan_attributes(plan, &groups, &target_addresses)?;
 
-    let heap_address = if planned_attributes.heap_objects.is_empty() {
-        0
-    } else {
-        next_address
-    };
     let heap = if planned_attributes.heap_objects.is_empty() {
         Vec::new()
     } else {
         encode_global_heap_collection(&planned_attributes.heap_objects)?
     };
-    next_address = align_u64(
-        checked_add_u64(next_address, heap.len() as u64, "global heap end")?,
-        8,
-    );
+    let DataHeapLayout {
+        data_addresses,
+        heap_address,
+        eof_address,
+    } = stabilize_vlen_dataset_storage(
+        &mut prepared,
+        &planned_attributes,
+        data_start_address,
+        &heap,
+    )?;
 
     let root_header = encode_group_header_from_plan(
         &groups.root_links,
@@ -1321,16 +1309,13 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
-    for (
-        dataset_index,
-        ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address),
-    ) in prepared
-        .iter()
-        .zip(&planned_attributes.datasets)
-        .zip(header_addresses.iter().copied())
-        .zip(data_addresses.iter().copied())
-        .zip(chunk_index_addresses.iter().copied())
-        .enumerate()
+    for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
+        prepared
+            .iter()
+            .zip(&planned_attributes.datasets)
+            .zip(header_addresses.iter().copied())
+            .zip(data_addresses.iter().copied())
+            .zip(chunk_index_addresses.iter().copied())
     {
         let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
@@ -1351,14 +1336,9 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         } else {
             None
         };
-        let raw_data = if let Some(refs) = &planned_attributes.dataset_vlen_refs[dataset_index] {
-            dataset_vlen_storage_data(prepared_dataset.dataset, refs, heap_address)?
-        } else {
-            prepared_dataset.raw_data.clone()
-        };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
-            raw_data,
+            raw_data: prepared_dataset.raw_data.clone(),
             header_address,
             data_address,
             header,
@@ -1366,7 +1346,6 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         });
     }
 
-    let eof_address = next_address;
     let mut file = Vec::with_capacity(checked_usize(eof_address, "HDF5 file size")?);
     file.extend_from_slice(&encode_superblock_v2(root_address, eof_address));
     pad_to_address(&mut file, root_address)?;
@@ -1428,6 +1407,13 @@ struct PreparedChunkIndexEntry {
     filter_mask: u32,
 }
 
+#[derive(Debug, Clone)]
+struct DataHeapLayout {
+    data_addresses: Vec<u64>,
+    heap_address: u64,
+    eof_address: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FixedArrayChunkIndexAddresses {
     header: u64,
@@ -1465,12 +1451,6 @@ fn prepare_datasets(
                     dataset.name
                 )));
             }
-            if !filters.is_empty() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "filtered variable-length string HDF5 datasets are not emitted yet: '{}'",
-                    dataset.name
-                )));
-            }
             let refs = placeholder_vlen_string_references(&dataset.name, values)?;
             let raw_data = encode_vlen_heap_references(&refs, 0);
             if raw_data.len() != expected {
@@ -1480,14 +1460,13 @@ fn prepare_datasets(
                     raw_data.len()
                 )));
             }
-            match &dataset.layout {
-                PlannedLayout::Contiguous => (raw_data, None),
-                PlannedLayout::Chunked { chunk_shape } => (
-                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
-                    None,
-                ),
-                PlannedLayout::Compact => unreachable!("compact vlen string datasets rejected"),
-            }
+            prepare_raw_dataset_storage(
+                &raw_data,
+                &dataset.shape,
+                &dataset.layout,
+                &filters,
+                element_size,
+            )?
         } else if let Some(values) = &dataset.vlen_sequence_values {
             if dataset.fill_value.is_some() {
                 return Err(Error::InvalidDefinition(format!(
@@ -1498,12 +1477,6 @@ fn prepare_datasets(
             if matches!(dataset.layout, PlannedLayout::Compact) {
                 return Err(Error::UnsupportedFeature(format!(
                     "compact variable-length sequence HDF5 datasets are not emitted yet: '{}'",
-                    dataset.name
-                )));
-            }
-            if !filters.is_empty() {
-                return Err(Error::UnsupportedFeature(format!(
-                    "filtered variable-length sequence HDF5 datasets are not emitted yet: '{}'",
                     dataset.name
                 )));
             }
@@ -1529,14 +1502,13 @@ fn prepare_datasets(
                     raw_data.len()
                 )));
             }
-            match &dataset.layout {
-                PlannedLayout::Contiguous => (raw_data, None),
-                PlannedLayout::Chunked { chunk_shape } => (
-                    chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)?,
-                    None,
-                ),
-                PlannedLayout::Compact => unreachable!("compact vlen sequence datasets rejected"),
-            }
+            prepare_raw_dataset_storage(
+                &raw_data,
+                &dataset.shape,
+                &dataset.layout,
+                &filters,
+                element_size,
+            )?
         } else if let Some(raw_data) = dataset.raw_data.as_deref() {
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
@@ -1545,46 +1517,13 @@ fn prepare_datasets(
                     raw_data.len()
                 )));
             }
-            match &dataset.layout {
-                PlannedLayout::Contiguous => (raw_data.to_vec(), None),
-                PlannedLayout::Compact => (raw_data.to_vec(), None),
-                PlannedLayout::Chunked { chunk_shape } => {
-                    if filters.is_empty() {
-                        (
-                            chunked_storage_data(
-                                raw_data,
-                                &dataset.shape,
-                                chunk_shape,
-                                element_size,
-                            )?,
-                            None,
-                        )
-                    } else if chunk_count(&dataset.shape, chunk_shape)? <= 1 {
-                        let storage_data = chunked_storage_data(
-                            raw_data,
-                            &dataset.shape,
-                            chunk_shape,
-                            element_size,
-                        )?;
-                        if storage_data.is_empty() {
-                            (storage_data, None)
-                        } else {
-                            (
-                                apply_write_filters(&storage_data, &filters, element_size)?,
-                                None,
-                            )
-                        }
-                    } else {
-                        filtered_chunk_storage_data(
-                            raw_data,
-                            &dataset.shape,
-                            chunk_shape,
-                            element_size,
-                            &filters,
-                        )?
-                    }
-                }
-            }
+            prepare_raw_dataset_storage(
+                raw_data,
+                &dataset.shape,
+                &dataset.layout,
+                &filters,
+                element_size,
+            )?
         } else if dataset.fill_value.is_some() {
             if matches!(dataset.layout, PlannedLayout::Compact) {
                 return Err(Error::UnsupportedFeature(format!(
@@ -1615,6 +1554,132 @@ fn prepare_datasets(
         });
     }
     Ok(prepared)
+}
+
+fn prepare_raw_dataset_storage(
+    raw_data: &[u8],
+    shape: &[u64],
+    layout: &PlannedLayout,
+    filters: &[FilterDescription],
+    element_size: usize,
+) -> Result<(Vec<u8>, Option<PreparedChunkIndex>)> {
+    match layout {
+        PlannedLayout::Contiguous | PlannedLayout::Compact => Ok((raw_data.to_vec(), None)),
+        PlannedLayout::Chunked { chunk_shape } => {
+            if filters.is_empty() {
+                Ok((
+                    chunked_storage_data(raw_data, shape, chunk_shape, element_size)?,
+                    None,
+                ))
+            } else if chunk_count(shape, chunk_shape)? <= 1 {
+                let storage_data =
+                    chunked_storage_data(raw_data, shape, chunk_shape, element_size)?;
+                if storage_data.is_empty() {
+                    Ok((storage_data, None))
+                } else {
+                    Ok((
+                        apply_write_filters(&storage_data, filters, element_size)?,
+                        None,
+                    ))
+                }
+            } else {
+                filtered_chunk_storage_data(raw_data, shape, chunk_shape, element_size, filters)
+            }
+        }
+    }
+}
+
+fn stabilize_vlen_dataset_storage(
+    prepared: &mut [PreparedDataset<'_>],
+    planned_attributes: &PlannedAttributes,
+    data_start_address: u64,
+    heap: &[u8],
+) -> Result<DataHeapLayout> {
+    let mut layout = compute_data_heap_layout(prepared, data_start_address, heap)?;
+    for _ in 0..8 {
+        let mut address_sensitive_size_changed = false;
+        for (prepared_dataset, refs) in prepared
+            .iter_mut()
+            .zip(&planned_attributes.dataset_vlen_refs)
+        {
+            let Some(refs) = refs else {
+                continue;
+            };
+            let old_data_size = prepared_dataset.data_size;
+            let old_chunk_count = prepared_dataset
+                .chunk_index
+                .as_ref()
+                .map(|chunk_index| chunk_index.chunks.len());
+            let (raw_data, chunk_index) = dataset_vlen_storage_data(
+                prepared_dataset.dataset,
+                refs,
+                layout.heap_address,
+                &prepared_dataset.filters,
+            )?;
+            let data_size = u64::try_from(raw_data.len()).map_err(|_| {
+                Error::InvalidDefinition(format!(
+                    "dataset '{}' storage byte length exceeds u64 capacity",
+                    prepared_dataset.dataset.name
+                ))
+            })?;
+            let new_chunk_count = chunk_index
+                .as_ref()
+                .map(|chunk_index| chunk_index.chunks.len());
+            if old_chunk_count != new_chunk_count {
+                return Err(Error::InvalidDefinition(format!(
+                    "dataset '{}' changed filtered chunk index cardinality during VLen address stabilization",
+                    prepared_dataset.dataset.name
+                )));
+            }
+            prepared_dataset.raw_data = raw_data;
+            prepared_dataset.data_size = data_size;
+            prepared_dataset.chunk_index = chunk_index;
+            if data_size != old_data_size {
+                address_sensitive_size_changed = true;
+            }
+        }
+        if !address_sensitive_size_changed {
+            return Ok(layout);
+        }
+        layout = compute_data_heap_layout(prepared, data_start_address, heap)?;
+    }
+
+    Err(Error::InvalidDefinition(
+        "HDF5 VLen dataset storage did not stabilize after repeated address planning".into(),
+    ))
+}
+
+fn compute_data_heap_layout(
+    prepared: &[PreparedDataset<'_>],
+    data_start_address: u64,
+    heap: &[u8],
+) -> Result<DataHeapLayout> {
+    let mut next_address = data_start_address;
+    let mut data_addresses = Vec::with_capacity(prepared.len());
+    for prepared_dataset in prepared {
+        data_addresses.push(next_address);
+        if !matches!(prepared_dataset.dataset.layout, PlannedLayout::Compact) {
+            next_address = align_u64(
+                checked_add_u64(
+                    next_address,
+                    prepared_dataset.raw_data.len() as u64,
+                    "dataset raw data end",
+                )?,
+                8,
+            );
+        }
+    }
+
+    let heap_address = if heap.is_empty() { 0 } else { next_address };
+    let eof_address = align_u64(
+        checked_add_u64(next_address, heap.len() as u64, "global heap end")?,
+        8,
+    );
+    Ok(DataHeapLayout {
+        data_addresses,
+        heap_address,
+        eof_address,
+    })
 }
 
 fn plan_group_hierarchy(
@@ -2114,19 +2179,23 @@ fn dataset_vlen_storage_data(
     dataset: &DatasetBuilder,
     refs: &[VLenHeapReference],
     heap_address: u64,
-) -> Result<Vec<u8>> {
+    filters: &[FilterDescription],
+) -> Result<(Vec<u8>, Option<PreparedChunkIndex>)> {
     let element_size = datatype_element_size(&dataset.datatype)?;
     let raw_data = encode_vlen_heap_references(refs, heap_address);
-    match &dataset.layout {
-        PlannedLayout::Contiguous => Ok(raw_data),
-        PlannedLayout::Chunked { chunk_shape } => {
-            chunked_storage_data(&raw_data, &dataset.shape, chunk_shape, element_size)
-        }
-        PlannedLayout::Compact => Err(Error::UnsupportedFeature(format!(
+    if matches!(&dataset.layout, PlannedLayout::Compact) {
+        return Err(Error::UnsupportedFeature(format!(
             "compact variable-length HDF5 datasets are not emitted yet: '{}'",
             dataset.name
-        ))),
+        )));
     }
+    prepare_raw_dataset_storage(
+        &raw_data,
+        &dataset.shape,
+        &dataset.layout,
+        filters,
+        element_size,
+    )
 }
 
 fn checked_heap_index(index: usize) -> Result<u16> {

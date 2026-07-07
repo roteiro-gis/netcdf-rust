@@ -3722,12 +3722,6 @@ fn validate_nc4_variable_storage(variable: &VariableDef) -> Result<()> {
     }
     if variable.storage.has_filters() {
         reject_scalar_filtered_variable(variable)?;
-        if matches!(&variable.dtype, NcType::String | NcType::VLen { .. }) {
-            return Err(Error::UnsupportedFeature(format!(
-                "filtered NetCDF-4 variable-length variable '{}' is not supported yet",
-                variable.name
-            )));
-        }
     }
     Ok(())
 }
