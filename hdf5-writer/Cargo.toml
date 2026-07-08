@@ -20,4 +20,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 hdf5-reader = { version = "0.8.0", path = "../hdf5-reader" }
+serde_json = "1"
 tempfile = "3"

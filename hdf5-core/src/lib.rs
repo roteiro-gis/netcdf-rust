@@ -103,6 +103,14 @@ pub fn fletcher32(data: &[u8]) -> u32 {
         sum2 = (sum2 & 0xffff) + (sum2 >> 16);
     }
 
+    // A trailing odd byte contributes as the high half of a final word.
+    if data.len() % 2 == 1 {
+        sum1 += (data[data.len() - 1] as u32) << 8;
+        sum2 += sum1;
+        sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+        sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+    }
+
     sum1 = (sum1 & 0xffff) + (sum1 >> 16);
     sum2 = (sum2 & 0xffff) + (sum2 >> 16);
 
@@ -464,5 +472,14 @@ mod tests {
         let data = [0x00, 0x01, 0x00, 0x02];
 
         assert_eq!(fletcher32(&data), 0x0004_0003);
+    }
+
+    #[test]
+    fn fletcher32_handles_trailing_odd_byte_like_libhdf5() {
+        // H5_checksum_fletcher32 folds a trailing odd byte in as the high
+        // half of a final 16-bit word.
+        let data = [0x01, 0x02, 0x03];
+
+        assert_eq!(fletcher32(&data), 0x0504_0402);
     }
 }
