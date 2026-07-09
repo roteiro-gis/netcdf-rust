@@ -437,6 +437,40 @@ fn writes_chunked_vlen_string_dataset_backed_by_global_heap() {
 }
 
 #[test]
+fn writes_filtered_chunked_vlen_string_dataset_backed_by_global_heap() {
+    let values = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data("names", vec![2, 3], &values)
+                .unwrap()
+                .chunked(vec![1, 2])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/names").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 2]);
+    assert_eq!(
+        dataset.read_strings().unwrap(),
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn writes_vlen_sequence_dataset_backed_by_global_heap() {
     let base = Datatype::FixedPoint {
         size: 2,
@@ -477,6 +511,56 @@ fn writes_vlen_sequence_dataset_backed_by_global_heap() {
             padding: StringPadding::NullTerminate,
         }
     );
+
+    let raw = dataset.read_raw_bytes().unwrap();
+    let ref_size = dataset.vlen_reference_size();
+    let decoded = raw
+        .chunks_exact(ref_size)
+        .map(|reference| dataset.resolve_vlen_reference_bytes(reference, 2).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, values);
+}
+
+#[test]
+fn writes_filtered_chunked_vlen_sequence_dataset_backed_by_global_heap() {
+    let base = Datatype::FixedPoint {
+        size: 2,
+        signed: true,
+        byte_order: ByteOrder::LittleEndian,
+    };
+    let values = vec![
+        [1_i16.to_le_bytes(), 2_i16.to_le_bytes()].concat(),
+        [3_i16.to_le_bytes()].concat(),
+        Vec::new(),
+        [
+            10_i16.to_le_bytes(),
+            11_i16.to_le_bytes(),
+            12_i16.to_le_bytes(),
+        ]
+        .concat(),
+    ];
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_sequence_data("ragged", base, vec![2, 2], values.clone())
+                .unwrap()
+                .chunked(vec![1, 1])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/ragged").unwrap();
+    assert_eq!(dataset.chunks().unwrap(), vec![1, 1]);
 
     let raw = dataset.read_raw_bytes().unwrap();
     let ref_size = dataset.vlen_reference_size();
@@ -1012,6 +1096,61 @@ fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
     )
     .unwrap();
     let heap_object = heap.get_object(heap_index).unwrap();
+    let refs = hdf5_reader::reference::read_object_references(
+        &heap_object.data,
+        file.superblock().offset_size,
+    )
+    .unwrap();
+    assert_eq!(refs, vec![scale.address()]);
+}
+
+#[test]
+fn writes_empty_vlen_object_reference_attribute_sequence() {
+    let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
+        .unwrap()
+        .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"));
+    let data = DatasetBuilder::typed_data("temp", vec![2, 3], &[1_i16, 2, 3, 4, 5, 6])
+        .unwrap()
+        .attribute(AttributeBuilder::vlen_object_references(
+            "DIMENSION_LIST",
+            vec![Vec::new(), vec!["x".to_string()]],
+        ));
+    let plan = Hdf5Builder::new()
+        .dataset(scale)
+        .dataset(data)
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let scale = file.dataset("/x").unwrap();
+    let data = file.dataset("/temp").unwrap();
+    let attr = data.attribute("DIMENSION_LIST").unwrap();
+    assert_eq!(attr.shape, vec![2]);
+    assert_eq!(attr.raw_data.len(), 32);
+
+    let first_seq_len = u32::from_le_bytes(attr.raw_data[0..4].try_into().unwrap());
+    let first_heap_index = u32::from_le_bytes(attr.raw_data[12..16].try_into().unwrap());
+    assert_eq!(first_seq_len, 0);
+    assert_eq!(first_heap_index, 0);
+
+    let second_seq_len = u32::from_le_bytes(attr.raw_data[16..20].try_into().unwrap());
+    let second_heap_addr = u64::from_le_bytes(attr.raw_data[20..28].try_into().unwrap());
+    let second_heap_index = u32::from_le_bytes(attr.raw_data[28..32].try_into().unwrap()) as u16;
+    assert_eq!(second_seq_len, 1);
+
+    let heap = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
+        file.storage(),
+        second_heap_addr,
+        file.superblock().offset_size,
+        file.superblock().length_size,
+    )
+    .unwrap();
+    let heap_object = heap.get_object(second_heap_index).unwrap();
     let refs = hdf5_reader::reference::read_object_references(
         &heap_object.data,
         file.superblock().offset_size,

@@ -616,6 +616,76 @@ impl NcFileBuilder {
         self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
+    pub fn write_char_variable_strings<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        values: &[S],
+    ) -> Result<()> {
+        let (name, width, inferred_unlimited) = {
+            let variable_def = self.variable(variable)?;
+            if variable_def.dtype != NcType::Char {
+                return Err(Error::TypeMismatch {
+                    expected: "Char".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            }
+            let inferred_unlimited =
+                self.validate_char_string_value_count(variable_def, values.len())?;
+            (
+                variable_def.name.clone(),
+                self.char_string_axis_width(variable_def)?,
+                inferred_unlimited,
+            )
+        };
+        let encoded = encode_char_string_values(&name, width, values)?;
+        self.write_char_variable(variable, &encoded)?;
+        if let Some((dimension, size)) = inferred_unlimited {
+            if size > self.dimensions[dimension.0].current_size {
+                self.dimensions[dimension.0].current_size = size;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_char_variable_strings_slice<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let (name, width, resolved) = {
+            let variable_def = self.variable(variable)?;
+            if variable_def.dtype != NcType::Char {
+                return Err(Error::TypeMismatch {
+                    expected: "Char".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            }
+            (
+                variable_def.name.clone(),
+                self.char_string_axis_width(variable_def)?,
+                self.resolve_char_string_write_selection(variable_def, selection)?,
+            )
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let encoded = encode_char_string_values(&name, width, values)?;
+        let mut selections = selection.selections.clone();
+        selections.push(NcSliceInfoElem::Slice {
+            start: 0,
+            end: u64::try_from(width).map_err(|_| {
+                Error::InvalidDefinition("char string width exceeds u64 capacity".into())
+            })?,
+            step: 1,
+        });
+        self.write_char_variable_slice(variable, &NcSliceInfo { selections }, &encoded)
+    }
+
     pub fn write_user_defined_variable_bytes(
         &mut self,
         variable: VariableId,
@@ -924,6 +994,130 @@ impl NcFileBuilder {
         self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
     }
 
+    pub fn write_vlen_variable_slice_bytes<S: AsRef<[u8]>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let (resolved, base_size) = {
+            let variable_def = self.variable(variable)?;
+            let NcType::VLen { base } = &variable_def.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            };
+            validate_vlen_base_nc4_type(base)?;
+            (
+                self.resolve_variable_write_selection(variable_def, selection, 1)?,
+                base.size()?,
+            )
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut sequences = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.len() % base_size != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "vlen sequence byte length {} is not a multiple of base element size {base_size}",
+                    value.len()
+                )));
+            }
+            sequences.push(value.to_vec());
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer vlen slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer vlen variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_vlen_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let vlen_values = variable_def.vlen_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "vlen variable '{}' has no initialized sequence data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(vlen_values, &resolved.dims, &strides, &sequences)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
+    }
+
+    pub fn write_vlen_variable_slice<T: NcWriteType>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[Vec<T>],
+    ) -> Result<()> {
+        let resolved = {
+            let variable_def = self.variable(variable)?;
+            let NcType::VLen { base } = &variable_def.dtype else {
+                return Err(Error::TypeMismatch {
+                    expected: "VLen".into(),
+                    actual: format!("{:?}", variable_def.dtype),
+                });
+            };
+            let expected = T::nc_type();
+            if base.as_ref() != &expected {
+                return Err(Error::TypeMismatch {
+                    expected: format!("{:?}", base),
+                    actual: format!("{expected:?}"),
+                });
+            }
+            self.resolve_variable_write_selection(variable_def, selection, 1)?
+        };
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut sequences = Vec::with_capacity(values.len());
+        for sequence in values {
+            let mut bytes = Vec::with_capacity(std::mem::size_of_val(sequence.as_slice()));
+            for &value in sequence {
+                value.write_one_le(&mut bytes);
+            }
+            sequences.push(bytes);
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer vlen slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer vlen variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_vlen_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let vlen_values = variable_def.vlen_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "vlen variable '{}' has no initialized sequence data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(vlen_values, &resolved.dims, &strides, &sequences)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
+    }
+
     pub fn write_string_variable<S: AsRef<str>>(
         &mut self,
         variable: VariableId,
@@ -954,6 +1148,61 @@ impl NcFileBuilder {
             variable.vlen_values = None;
         }
         self.update_unlimited_extents_from_element_count(variable, values.len() as u64)
+    }
+
+    pub fn write_string_variable_slice<S: AsRef<str>>(
+        &mut self,
+        variable: VariableId,
+        selection: &NcSliceInfo,
+        values: &[S],
+    ) -> Result<()> {
+        let variable_def = self.variable(variable)?;
+        if variable_def.dtype != NcType::String {
+            return Err(Error::TypeMismatch {
+                expected: "String".into(),
+                actual: format!("{:?}", variable_def.dtype),
+            });
+        }
+        let resolved = self.resolve_variable_write_selection(variable_def, selection, 1)?;
+        if values.len() != resolved.elements {
+            return Err(Error::DataLengthMismatch {
+                expected: resolved.elements,
+                actual: values.len(),
+            });
+        }
+
+        let mut strings = Vec::with_capacity(values.len());
+        for value in values {
+            let value = value.as_ref();
+            if value.as_bytes().contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "NC_STRING variable values cannot contain NUL bytes".into(),
+                ));
+            }
+            strings.push(value.to_string());
+        }
+
+        let strides = row_major_strides(&resolved.shape, "writer string slice stride")?;
+        let total_elements =
+            checked_shape_elements(&resolved.shape, "writer string variable element count")?;
+        {
+            let variable_def = self.variable_mut(variable)?;
+            ensure_variable_string_slice_buffer(
+                variable_def,
+                &resolved.old_shape,
+                &resolved.shape,
+                total_elements,
+                resolved.can_grow,
+            )?;
+            let string_values = variable_def.string_values.as_mut().ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "NC_STRING variable '{}' has no initialized string data",
+                    variable_def.name
+                ))
+            })?;
+            scatter_slice_values(string_values, &resolved.dims, &strides, &strings)?;
+        }
+        self.update_unlimited_extents_from_shape(variable, &resolved.shape)
     }
 
     pub fn write<W: Write>(&self, mut writer: W, options: NcWriteOptions) -> Result<NcFormat> {
@@ -1360,6 +1609,21 @@ impl NcFileBuilder {
         resolve_write_selection(&variable.name, &extents, selection)
     }
 
+    fn resolve_char_string_write_selection(
+        &self,
+        variable: &VariableDef,
+        selection: &NcSliceInfo,
+    ) -> Result<ResolvedWriteSelection> {
+        if variable.dim_ids.is_empty() {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            )));
+        }
+        let extents = self.variable_write_extents(variable, 1)?;
+        resolve_write_selection(&variable.name, &extents[..extents.len() - 1], selection)
+    }
+
     fn variable_write_extents(
         &self,
         variable: &VariableDef,
@@ -1382,6 +1646,99 @@ impl NcFileBuilder {
                 })
             })
             .collect()
+    }
+
+    fn char_string_axis_width(&self, variable: &VariableDef) -> Result<usize> {
+        let width_dim_id = variable.dim_ids.last().ok_or_else(|| {
+            Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            ))
+        })?;
+        let dimension = &self.dimensions[width_dim_id.0];
+        let width = if dimension.is_unlimited {
+            dimension.current_size
+        } else {
+            dimension.size
+        };
+        if dimension.is_unlimited && width == 0 {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' string-width dimension cannot be inferred from string values",
+                variable.name
+            )));
+        }
+        require_usize(width, "char string width")
+    }
+
+    fn validate_char_string_value_count(
+        &self,
+        variable: &VariableDef,
+        value_count: usize,
+    ) -> Result<Option<(DimensionId, u64)>> {
+        if variable.dim_ids.is_empty() {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{}' must have a string-width dimension",
+                variable.name
+            )));
+        }
+
+        let value_count = u64::try_from(value_count).map_err(|_| {
+            Error::InvalidDefinition("char string value count exceeds u64 capacity".into())
+        })?;
+        let mut known_product = 1u64;
+        let mut unknown = Vec::new();
+        for dim_id in &variable.dim_ids[..variable.dim_ids.len() - 1] {
+            let dimension = &self.dimensions[dim_id.0];
+            let size = if dimension.is_unlimited {
+                dimension.current_size
+            } else {
+                dimension.size
+            };
+            if dimension.is_unlimited && size == 0 {
+                if !unknown.contains(dim_id) {
+                    unknown.push(*dim_id);
+                }
+                continue;
+            }
+            known_product = checked_mul_u64(known_product, size, "char string value count shape")?;
+        }
+
+        let mut inferred_unlimited = None;
+        if unknown.is_empty() {
+            if value_count != known_product {
+                return Err(Error::DataLengthMismatch {
+                    expected: require_usize(known_product, "char string value count")?,
+                    actual: require_usize(value_count, "char string value count")?,
+                });
+            }
+        } else if unknown.len() == 1 {
+            if known_product == 0 {
+                if value_count != 0 {
+                    return Err(Error::DataLengthMismatch {
+                        expected: 0,
+                        actual: require_usize(value_count, "char string value count")?,
+                    });
+                }
+            } else if value_count % known_product != 0 {
+                return Err(Error::InvalidDefinition(format!(
+                    "char string value count {value_count} is not divisible by known leading dimension product {known_product}"
+                )));
+            } else {
+                inferred_unlimited = Some((unknown[0], value_count / known_product));
+            }
+        } else {
+            let names = unknown
+                .iter()
+                .map(|id| self.dimensions[id.0].name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(Error::InvalidDefinition(format!(
+                "cannot infer multiple unlimited char string dimensions {names} for variable '{}'",
+                variable.name
+            )));
+        }
+
+        Ok(inferred_unlimited)
     }
 
     fn update_unlimited_extents_from_element_count(
@@ -2458,6 +2815,100 @@ fn ensure_variable_native_slice_buffer(
     Ok(())
 }
 
+fn encode_char_string_values<S: AsRef<str>>(
+    variable_name: &str,
+    width: usize,
+    values: &[S],
+) -> Result<Vec<u8>> {
+    let mut encoded = Vec::with_capacity(checked_mul_usize(
+        values.len(),
+        width,
+        "char string byte count",
+    )?);
+    for value in values {
+        let value = value.as_ref();
+        let bytes = value.as_bytes();
+        if bytes.contains(&0) {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{variable_name}' string values cannot contain NUL bytes"
+            )));
+        }
+        if bytes.len() > width {
+            return Err(Error::InvalidDefinition(format!(
+                "char variable '{variable_name}' string value is {} bytes, exceeding fixed width {width}",
+                bytes.len()
+            )));
+        }
+        encoded.extend_from_slice(bytes);
+        encoded.resize(encoded.len() + (width - bytes.len()), 0);
+    }
+    Ok(encoded)
+}
+
+fn ensure_variable_string_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    can_grow: bool,
+) -> Result<()> {
+    if variable.dtype != NcType::String {
+        return Err(Error::TypeMismatch {
+            expected: "String".into(),
+            actual: format!("{:?}", variable.dtype),
+        });
+    }
+    let expected = require_usize(total_elements, "string variable element count")?;
+    let values = variable.string_values.get_or_insert_with(Vec::new);
+    if values.is_empty() {
+        values.resize(expected, String::new());
+    } else if values.len() < expected && can_grow {
+        resize_variable_values(values, old_shape, new_shape, String::new())?;
+    } else if values.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: values.len(),
+        });
+    }
+
+    variable.data.clear();
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.vlen_values = None;
+    Ok(())
+}
+
+fn ensure_variable_vlen_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    can_grow: bool,
+) -> Result<()> {
+    if !matches!(&variable.dtype, NcType::VLen { .. }) {
+        return Err(Error::TypeMismatch {
+            expected: "VLen".into(),
+            actual: format!("{:?}", variable.dtype),
+        });
+    }
+    let expected = require_usize(total_elements, "vlen variable element count")?;
+    let values = variable.vlen_values.get_or_insert_with(Vec::new);
+    if values.is_empty() {
+        values.resize(expected, Vec::new());
+    } else if values.len() < expected && can_grow {
+        resize_variable_values(values, old_shape, new_shape, Vec::new())?;
+    } else if values.len() != expected {
+        return Err(Error::DataLengthMismatch {
+            expected,
+            actual: values.len(),
+        });
+    }
+
+    variable.data.clear();
+    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.string_values = None;
+    Ok(())
+}
+
 fn resize_variable_data(
     data: &mut Vec<u8>,
     old_shape: &[u64],
@@ -2503,6 +2954,46 @@ fn resize_variable_data(
     let mut resized = filled_data_buffer(new_len, elem_size, fill_pattern)?;
     copy_reshaped_variable_data(&old, &mut resized, old_shape, new_shape, elem_size)?;
     *data = resized;
+    Ok(())
+}
+
+fn resize_variable_values<T: Clone>(
+    values: &mut Vec<T>,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    fill_value: T,
+) -> Result<()> {
+    if old_shape.len() != new_shape.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "cannot resize variable values from rank {} to rank {}",
+            old_shape.len(),
+            new_shape.len()
+        )));
+    }
+    let old_elements = require_usize(
+        checked_shape_elements(old_shape, "old variable value shape element count")?,
+        "old variable value element count",
+    )?;
+    if values.len() != old_elements {
+        return Err(Error::DataLengthMismatch {
+            expected: old_elements,
+            actual: values.len(),
+        });
+    }
+
+    let new_len = require_usize(
+        checked_shape_elements(new_shape, "new variable value shape element count")?,
+        "new variable value element count",
+    )?;
+    if old_shape.get(1..) == new_shape.get(1..) {
+        values.resize(new_len, fill_value);
+        return Ok(());
+    }
+
+    let old = std::mem::take(values);
+    let mut resized = vec![fill_value; new_len];
+    copy_reshaped_values(&old, &mut resized, old_shape, new_shape)?;
+    *values = resized;
     Ok(())
 }
 
@@ -2578,6 +3069,63 @@ fn copy_reshaped_variable_data(
     Ok(())
 }
 
+fn copy_reshaped_values<T: Clone>(
+    old: &[T],
+    new: &mut [T],
+    old_shape: &[u64],
+    new_shape: &[u64],
+) -> Result<()> {
+    let old_elements = checked_shape_elements(old_shape, "old variable value copy element count")?;
+    if old_elements == 0 {
+        return Ok(());
+    }
+    if old_shape.is_empty() {
+        if old.len() != 1 || new.len() != 1 {
+            return Err(Error::DataLengthMismatch {
+                expected: 1,
+                actual: old.len().max(new.len()),
+            });
+        }
+        new[0] = old[0].clone();
+        return Ok(());
+    }
+
+    let old_strides = row_major_strides(old_shape, "old variable value copy stride")?;
+    let new_strides = row_major_strides(new_shape, "new variable value copy stride")?;
+    let rank = old_shape.len();
+    let mut coords = vec![0u64; rank];
+    for old_index in 0..old_elements {
+        let mut remainder = old_index;
+        for dim in 0..rank {
+            let stride = old_strides[dim];
+            coords[dim] = remainder / stride;
+            remainder %= stride;
+        }
+        if coords
+            .iter()
+            .zip(new_shape)
+            .any(|(&coord, &extent)| coord >= extent)
+        {
+            continue;
+        }
+        let new_index =
+            coords
+                .iter()
+                .zip(&new_strides)
+                .try_fold(0u64, |acc, (&coord, &stride)| {
+                    checked_add(
+                        acc,
+                        checked_mul_u64(coord, stride, "new variable value copy coordinate")?,
+                        "new variable value copy element index",
+                    )
+                })?;
+        let old_index = require_usize(old_index, "old variable value copy element")?;
+        let new_index = require_usize(new_index, "new variable value copy element")?;
+        new[new_index] = old[old_index].clone();
+    }
+    Ok(())
+}
+
 fn filled_data_buffer(len: usize, elem_size: usize, fill_pattern: &[u8]) -> Result<Vec<u8>> {
     if elem_size == 0 {
         return if len == 0 {
@@ -2641,6 +3189,80 @@ fn scatter_slice_bytes(
         )));
     }
     Ok(())
+}
+
+fn scatter_slice_values<T: Clone>(
+    data: &mut [T],
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    values: &[T],
+) -> Result<()> {
+    let mut src_elem = 0usize;
+    scatter_slice_values_recursive(data, dims, strides, values, 0, 0, &mut src_elem)?;
+    if src_elem != values.len() {
+        return Err(Error::InvalidDefinition(format!(
+            "slice scatter wrote {src_elem} elements but expected {}",
+            values.len()
+        )));
+    }
+    Ok(())
+}
+
+fn scatter_slice_values_recursive<T: Clone>(
+    data: &mut [T],
+    dims: &[ResolvedWriteSelectionDim],
+    strides: &[u64],
+    values: &[T],
+    dim: usize,
+    dst_elem: u64,
+    src_elem: &mut usize,
+) -> Result<()> {
+    if dim == dims.len() {
+        let dst = require_usize(dst_elem, "slice destination element")?;
+        if dst >= data.len() || *src_elem >= values.len() {
+            return Err(Error::InvalidDefinition(
+                "slice write exceeded planned value bounds".into(),
+            ));
+        }
+        data[dst] = values[*src_elem].clone();
+        *src_elem += 1;
+        return Ok(());
+    }
+
+    match dims[dim] {
+        ResolvedWriteSelectionDim::Index(index) => {
+            let next = checked_add(
+                dst_elem,
+                checked_mul_u64(index, strides[dim], "slice index stride")?,
+                "slice destination element",
+            )?;
+            scatter_slice_values_recursive(data, dims, strides, values, dim + 1, next, src_elem)
+        }
+        ResolvedWriteSelectionDim::Slice { start, step, count } => {
+            for offset in 0..count {
+                let coord = checked_add(
+                    start,
+                    checked_mul_u64(offset as u64, step, "slice coordinate step")?,
+                    "slice coordinate",
+                )?;
+                let next = checked_add(
+                    dst_elem,
+                    checked_mul_u64(coord, strides[dim], "slice coordinate stride")?,
+                    "slice destination element",
+                )?;
+                scatter_slice_values_recursive(
+                    data,
+                    dims,
+                    strides,
+                    values,
+                    dim + 1,
+                    next,
+                    src_elem,
+                )?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3100,12 +3722,6 @@ fn validate_nc4_variable_storage(variable: &VariableDef) -> Result<()> {
     }
     if variable.storage.has_filters() {
         reject_scalar_filtered_variable(variable)?;
-        if matches!(&variable.dtype, NcType::String | NcType::VLen { .. }) {
-            return Err(Error::UnsupportedFeature(format!(
-                "filtered NetCDF-4 variable-length variable '{}' is not supported yet",
-                variable.name
-            )));
-        }
     }
     Ok(())
 }
