@@ -126,6 +126,10 @@ jobs:
         working-directory: hdf5-reader
         run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
 
+      - name: Run classic NetCDF parser fuzz check under ASan
+        working-directory: netcdf-reader
+        run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_netcdf_from_bytes --sanitizer address -- -runs=256
+
   fixtures:
     name: Integration tests with fixtures
     runs-on: ubuntu-24.04
