@@ -1,10 +1,54 @@
 # Changelog
 
-## 0.7.1 - 2026-07-10
+## 0.8.0 - 2026-07-10
 
+- breaking: move shared public HDF5 format types and NetCDF data-model types
+  into the new `hdf5-core` and `netcdf-core` crates, while re-exporting them
+  from the reader crates at their existing paths
+- breaking: add `decoded_strings` to the public `hdf5_reader::Attribute` type
+  so byte-backed and range-backed opens can expose decoded variable-length
+  string attributes
+
+- add independently publishable `hdf5-core` and `netcdf-core` crates used by
+  the reader crates
+- decode variable-length HDF5 string attributes for both byte-backed and
+  storage-backed opens
+- add NetCDF-4 `NC_CHAR` variable reading through the unified string API
+- classify HDF5 child objects containing attributes but no dataset messages as
+  groups instead of dropping them from group traversal
+- correct implicit HDF5 chunk enumeration for empty unlimited dimensions
+- optimize native 2D unit-stride HDF5 slices contained within one chunk
 - fix dense HDF5 attribute name and creation-order B-tree records to decode
   fields in their on-disk order, preventing invalid fractal-heap offsets when
   NetCDF-4 objects cross the compact-to-dense attribute threshold
+
+- keep the in-development `hdf5-writer` and `netcdf-writer` crates unpublished
+  in this release
+- add the initial `hdf5-writer` crate and HDF5 file-emission path used by the
+  NetCDF-4 writer bridge
+- add compact datasets, nested groups, and chunked datasets using implicit and
+  fixed-array chunk indexes
+- add HDF5 fill values plus Deflate and shuffle filter pipelines
+- add fixed and variable-length string data, variable-length sequence datasets
+  and attributes, and enhanced enum, opaque, compound, and array datatypes
+- support filtered variable-length datasets and empty HDF5 variable-length
+  references
+
+- add the initial classic CDF writer and NetCDF-4 writer bridge
+- emit NetCDF-4 dimension-list metadata and support fixed, unlimited, and
+  multiple-unlimited dimensions
+- add nested group authoring and NetCDF-4 string attributes
+- add `NC_CHAR`, `NC_STRING`, enum, opaque, compound, fixed-size array, and
+  variable-length sequence variables, including typed enhanced-value writes
+- add variable storage controls for layout, chunking, and filters
+- add explicit fill values and default-fill prewrites for classic and NetCDF-4
+  variables
+- add hyperslab writes and unlimited-dimension appends for numeric, character,
+  string, variable-length, and enhanced variables, including character-string
+  convenience writes
+- harden multi-unlimited slice planning and writer size/address accounting
+
+- add package checks and release-order documentation for the new core crates
 
 ## 0.7.0 - 2026-06-23
 

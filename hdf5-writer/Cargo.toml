@@ -2,6 +2,7 @@
 name = "hdf5-writer"
 description = "Pure-Rust HDF5 writer architecture and encoding utilities"
 version.workspace = true
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,9 +15,9 @@ categories = ["science", "encoding"]
 
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-hdf5-core = { version = "0.7.1", path = "../hdf5-core" }
+hdf5-core = { version = "0.8.0", path = "../hdf5-core" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-hdf5-reader = { version = "0.7.1", path = "../hdf5-reader" }
+hdf5-reader = { version = "0.8.0", path = "../hdf5-reader" }
 tempfile = "3"
