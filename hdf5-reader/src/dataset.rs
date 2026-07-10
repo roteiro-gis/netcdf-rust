@@ -2037,6 +2037,7 @@ impl Dataset {
                 chunk_dims,
                 selection.elem_size,
                 selection.chunk_bounds,
+                self.context.storage.len(),
             ),
             Some(ChunkIndexing::FixedArray { .. }) => {
                 crate::fixed_array::collect_fixed_array_chunk_entries_storage(
