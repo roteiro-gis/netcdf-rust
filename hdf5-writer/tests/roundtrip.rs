@@ -1154,6 +1154,43 @@ fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
 }
 
 #[test]
+fn writes_object_reference_list_attribute() {
+    // A dimension-scale REFERENCE_LIST: an inline compound of
+    // {object reference, dimension index} pointing back at referencing
+    // datasets, resolved to object addresses at write time.
+    let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
+        .unwrap()
+        .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+        .attribute(AttributeBuilder::object_reference_list(
+            "REFERENCE_LIST",
+            vec![("temp".to_string(), 1)],
+        ));
+    let data = DatasetBuilder::typed_data("temp", vec![2, 3], &(0_i32..6).collect::<Vec<_>>())
+        .unwrap();
+    let plan = Hdf5Builder::new()
+        .dataset(scale)
+        .dataset(data)
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let temp = file.dataset("/temp").unwrap();
+    let attr = file.dataset("/x").unwrap().attribute("REFERENCE_LIST").unwrap();
+    assert_eq!(attr.shape, vec![1]);
+    assert_eq!(attr.raw_data.len(), 16);
+    // Entry: object reference (8 bytes) then dimension index (u32) at offset 8.
+    let reference = u64::from_le_bytes(attr.raw_data[0..8].try_into().unwrap());
+    let dimension = u32::from_le_bytes(attr.raw_data[8..12].try_into().unwrap());
+    assert_eq!(reference, temp.address());
+    assert_eq!(dimension, 1);
+}
+
+#[test]
 fn writes_empty_vlen_object_reference_attribute_sequence() {
     let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
         .unwrap()

@@ -1348,6 +1348,9 @@ impl NcFileBuilder {
                     H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
                         .map_err(hdf5_error_to_unsupported)?,
                 );
+            if let Some(reference_list) = self.reference_list_attribute(DimensionId(dim_id))? {
+                dataset = dataset.attribute(reference_list);
+            }
             if dimension.is_unlimited {
                 dataset = dataset
                     .max_shape(vec![H5_UNLIMITED])
@@ -1436,6 +1439,9 @@ impl NcFileBuilder {
                         H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id.0 as i32)
                             .map_err(hdf5_error_to_unsupported)?,
                     );
+                if let Some(reference_list) = self.reference_list_attribute(dim_id)? {
+                    dataset = dataset.attribute(reference_list);
+                }
             } else if variable.dim_ids.is_empty() {
                 dataset = dataset.attribute(empty_dimension_list_attribute());
             } else {
@@ -1493,6 +1499,31 @@ impl NcFileBuilder {
         self.variables.iter().find(|variable| {
             variable.name == dim.name && variable.dim_ids.as_slice() == [dimension]
         })
+    }
+
+    /// Build the `REFERENCE_LIST` back-reference attribute for a dimension
+    /// scale: one entry per (variable, dimension position) that references the
+    /// dimension, excluding the scale's own coordinate variable. Returns `None`
+    /// when no data variable references the dimension (netcdf-c omits the
+    /// attribute in that case).
+    #[cfg(feature = "netcdf4")]
+    fn reference_list_attribute(&self, dim_id: DimensionId) -> Result<Option<H5AttributeBuilder>> {
+        let dim_name = &self.dimensions[dim_id.0].name;
+        let mut entries = Vec::new();
+        for variable in &self.variables {
+            let is_scale_itself =
+                variable.name == *dim_name && variable.dim_ids.as_slice() == [dim_id];
+            if is_scale_itself {
+                continue;
+            }
+            for (position, vid) in variable.dim_ids.iter().enumerate() {
+                if *vid == dim_id {
+                    entries.push((variable.name.clone(), position as u32));
+                }
+            }
+        }
+        Ok((!entries.is_empty())
+            .then(|| H5AttributeBuilder::object_reference_list("REFERENCE_LIST", entries)))
     }
 
     #[cfg(feature = "netcdf4")]

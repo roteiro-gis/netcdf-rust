@@ -552,6 +552,10 @@ pub struct AttributeBuilder {
     vlen_object_reference_targets: Option<Vec<Vec<String>>>,
     vlen_string_values: Option<Vec<String>>,
     vlen_sequence_values: Option<Vec<Vec<u8>>>,
+    /// Inline compound `{object reference, dimension}` list, resolved to object
+    /// addresses at layout time. Used for HDF5 dimension-scale `REFERENCE_LIST`
+    /// back-references.
+    object_reference_list: Option<Vec<(String, u32)>>,
 }
 
 impl AttributeBuilder {
@@ -569,6 +573,7 @@ impl AttributeBuilder {
             vlen_object_reference_targets: None,
             vlen_string_values: None,
             vlen_sequence_values: None,
+            object_reference_list: None,
         }
     }
 
@@ -648,6 +653,24 @@ impl AttributeBuilder {
             vlen_object_reference_targets: Some(target_sequences),
             vlen_string_values: None,
             vlen_sequence_values: None,
+            object_reference_list: None,
+        }
+    }
+
+    /// An inline `{object reference, dimension}` compound list, resolved to
+    /// object-header addresses at write time. This is the HDF5 dimension-scale
+    /// `REFERENCE_LIST` attribute: `entries` pairs each referencing dataset
+    /// (by object path) with the dimension index it attaches the scale to.
+    pub fn object_reference_list(name: impl Into<String>, entries: Vec<(String, u32)>) -> Self {
+        Self {
+            name: name.into(),
+            datatype: reference_list_datatype(),
+            shape: vec![entries.len() as u64],
+            raw_data: Vec::new(),
+            vlen_object_reference_targets: None,
+            vlen_string_values: None,
+            vlen_sequence_values: None,
+            object_reference_list: Some(entries),
         }
     }
 
@@ -687,6 +710,7 @@ impl AttributeBuilder {
             vlen_object_reference_targets: None,
             vlen_string_values: Some(strings),
             vlen_sequence_values: None,
+            object_reference_list: None,
         })
     }
 
@@ -726,6 +750,7 @@ impl AttributeBuilder {
             vlen_object_reference_targets: None,
             vlen_string_values: None,
             vlen_sequence_values: Some(values),
+            object_reference_list: None,
         })
     }
 
@@ -809,6 +834,18 @@ impl AttributeBuilder {
             }
             return Ok(());
         }
+        if let Some(entries) = &self.object_reference_list {
+            if self.shape != [entries.len() as u64] {
+                return Err(Error::InvalidDefinition(format!(
+                    "attribute '{}' reference-list shape must match entry count",
+                    self.name
+                )));
+            }
+            for (target, _) in entries {
+                validate_name(target)?;
+            }
+            return Ok(());
+        }
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         if self.raw_data.len() != expected {
             return Err(Error::InvalidDefinition(format!(
@@ -818,6 +855,38 @@ impl AttributeBuilder {
             )));
         }
         Ok(())
+    }
+}
+
+/// Byte size of one `REFERENCE_LIST` compound entry, matching netcdf-c:
+/// object reference (8) at offset 0, dimension `u32` at offset 8, padded to 16.
+const REFERENCE_LIST_ENTRY_SIZE: u32 = 16;
+const REFERENCE_LIST_DIMENSION_OFFSET: usize = 8;
+
+/// The compound datatype netcdf-c uses for dimension-scale `REFERENCE_LIST`
+/// attributes: `{ dataset: object reference, dimension: u32 }`.
+fn reference_list_datatype() -> Datatype {
+    Datatype::Compound {
+        size: REFERENCE_LIST_ENTRY_SIZE,
+        fields: vec![
+            CompoundField {
+                name: "dataset".to_string(),
+                byte_offset: 0,
+                datatype: Datatype::Reference {
+                    ref_type: ReferenceType::Object,
+                    size: OFFSET_SIZE,
+                },
+            },
+            CompoundField {
+                name: "dimension".to_string(),
+                byte_offset: REFERENCE_LIST_DIMENSION_OFFSET as u32,
+                datatype: Datatype::FixedPoint {
+                    size: 4,
+                    signed: false,
+                    byte_order: ByteOrder::LittleEndian,
+                },
+            },
+        ],
     }
 }
 
@@ -2133,6 +2202,28 @@ fn plan_attribute(
             datatype: attribute.datatype.clone(),
             shape: attribute.shape.clone(),
             raw_data: PlannedAttributeRaw::GlobalHeapVLenReferences(refs),
+        })
+    } else if let Some(entries) = &attribute.object_reference_list {
+        // Inline compound of resolved object references + dimension index,
+        // one 16-byte entry each (address, u32 dimension, padding).
+        let mut data = Vec::with_capacity(entries.len() * REFERENCE_LIST_ENTRY_SIZE as usize);
+        for (target, dimension) in entries {
+            let address = target_addresses.get(target).ok_or_else(|| {
+                Error::InvalidDefinition(format!(
+                    "attribute '{}' references unknown HDF5 object '{}'",
+                    attribute.name, target
+                ))
+            })?;
+            let start = data.len();
+            data.extend_from_slice(&address.to_le_bytes());
+            data.extend_from_slice(&dimension.to_le_bytes());
+            data.resize(start + REFERENCE_LIST_ENTRY_SIZE as usize, 0);
+        }
+        Ok(PlannedAttribute {
+            name: attribute.name.clone(),
+            datatype: attribute.datatype.clone(),
+            shape: attribute.shape.clone(),
+            raw_data: PlannedAttributeRaw::Inline(data),
         })
     } else {
         Ok(PlannedAttribute {
