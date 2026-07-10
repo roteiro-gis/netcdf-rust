@@ -33,10 +33,7 @@ const MAX_HEADER_CONTINUATIONS: usize = 1024;
 
 /// Guard a continuation-chunk visit: reject revisits (cycles) and enforce the
 /// per-header chunk budget.
-fn enter_continuation(
-    visited: &mut std::collections::HashSet<u64>,
-    offset: u64,
-) -> Result<()> {
+fn enter_continuation(visited: &mut std::collections::HashSet<u64>, offset: u64) -> Result<()> {
     if !visited.insert(offset) {
         return Err(Error::InvalidData(format!(
             "object header continuation cycle at offset {offset:#x}"

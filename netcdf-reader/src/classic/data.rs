@@ -432,6 +432,16 @@ pub fn read_record_variable<T: NcReadType>(
             ))
         })?;
 
+    // Validate that every record fits in the file before allocating, so a
+    // crafted `numrecs` cannot force a huge up-front allocation.
+    validate_record_span(
+        var,
+        numrecs,
+        record_stride,
+        bytes_per_record as u64,
+        file_data.len() as u64,
+    )?;
+
     let mut values = Vec::with_capacity(total_elements);
 
     for rec in 0..numrecs_usize {
@@ -494,6 +504,13 @@ pub(crate) fn read_record_variable_from_storage<T: NcReadType>(
                 var.name
             ))
         })?;
+    validate_record_span(
+        var,
+        numrecs,
+        record_stride,
+        bytes_per_record as u64,
+        storage.len(),
+    )?;
     let mut values = Vec::with_capacity(total_elements);
 
     for rec in 0..numrecs {
@@ -540,6 +557,13 @@ pub(crate) fn read_record_variable_parallel_from_storage<T: NcReadType>(
             var.name
         ))
     })?;
+    validate_record_span(
+        var,
+        numrecs,
+        record_stride,
+        bytes_per_record as u64,
+        storage.len(),
+    )?;
     let policy = storage.parallel_read_policy();
     if logical_bytes < policy.min_bytes || numrecs_usize <= 1 {
         return read_record_variable_from_storage(storage, var, numrecs, record_stride);
@@ -828,6 +852,37 @@ pub(crate) fn variable_data_bytes<T: NcReadType>(
             "variable '{var_name}' size in bytes exceeds platform usize"
         ))
     })
+}
+
+/// Validate that all `numrecs` records fit within `available` bytes before a
+/// caller allocates the whole result buffer, so a crafted record count cannot
+/// force a huge up-front allocation ahead of the per-record bounds checks.
+pub(crate) fn validate_record_span(
+    var: &NcVariable,
+    numrecs: u64,
+    record_stride: u64,
+    bytes_per_record: u64,
+    available: u64,
+) -> Result<()> {
+    if numrecs == 0 {
+        return Ok(());
+    }
+    let last_record_start = record_byte_offset(var, numrecs - 1, record_stride)?;
+    let end = last_record_start
+        .checked_add(bytes_per_record)
+        .ok_or_else(|| {
+            Error::InvalidData(format!(
+                "record variable '{}' data extent exceeds u64",
+                var.name
+            ))
+        })?;
+    if end > available {
+        return Err(Error::InvalidData(format!(
+            "record variable '{}' needs {end} bytes but only {available} are available",
+            var.name
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn record_byte_offset(var: &NcVariable, record: u64, record_stride: u64) -> Result<u64> {
