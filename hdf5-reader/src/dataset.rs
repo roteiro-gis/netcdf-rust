@@ -4508,4 +4508,80 @@ mod tests {
 
         assert!(matches!(err, Error::InvalidData(_)));
     }
+
+    // ------------------------------------------------------------------
+    // validate_chunk_grid_coverage: the gate for the uninitialized-output
+    // fast path. It must return Ok(true) only for an exact, gap-free,
+    // duplicate-free tiling; otherwise the caller falls back to a
+    // zero-initialized buffer, so returning false (not true) on a missing
+    // chunk is what keeps the assume_init path sound.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn grid_coverage_true_for_exact_tiling() {
+        // 4x6 dataset, 2x3 chunks -> a full 2x2 chunk grid.
+        let shape = [4u64, 6];
+        let chunk_shape = [2u64, 3];
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x100),
+            chunk_entry(&[0, 3], 0x200),
+            chunk_entry(&[2, 0], 0x300),
+            chunk_entry(&[2, 3], 0x400),
+        ];
+        let covered =
+            validate_chunk_grid_coverage(&mut entries, &shape, &chunk_shape, &[0, 0], &[1, 1])
+                .unwrap();
+        assert!(covered);
+    }
+
+    #[test]
+    fn grid_coverage_false_when_a_chunk_is_missing() {
+        // Drop the last chunk: coverage is incomplete, so the fast path must
+        // be declined (Ok(false)), never Ok(true).
+        let shape = [4u64, 6];
+        let chunk_shape = [2u64, 3];
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x100),
+            chunk_entry(&[0, 3], 0x200),
+            chunk_entry(&[2, 0], 0x300),
+        ];
+        let covered =
+            validate_chunk_grid_coverage(&mut entries, &shape, &chunk_shape, &[0, 0], &[1, 1])
+                .unwrap();
+        assert!(!covered);
+    }
+
+    #[test]
+    fn grid_coverage_rejects_duplicate_chunks() {
+        let shape = [4u64, 6];
+        let chunk_shape = [2u64, 3];
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x100),
+            chunk_entry(&[0, 0], 0x999),
+            chunk_entry(&[0, 3], 0x200),
+            chunk_entry(&[2, 0], 0x300),
+            chunk_entry(&[2, 3], 0x400),
+        ];
+        let err =
+            validate_chunk_grid_coverage(&mut entries, &shape, &chunk_shape, &[0, 0], &[1, 1])
+                .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(msg) if msg.contains("duplicate chunk")));
+    }
+
+    #[test]
+    fn grid_coverage_rejects_out_of_grid_offsets() {
+        // An offset not aligned to the chunk grid must be rejected outright.
+        let shape = [4u64, 6];
+        let chunk_shape = [2u64, 3];
+        let mut entries = vec![
+            chunk_entry(&[0, 0], 0x100),
+            chunk_entry(&[1, 3], 0x200), // row offset 1 is not a multiple of 2
+            chunk_entry(&[2, 0], 0x300),
+            chunk_entry(&[2, 3], 0x400),
+        ];
+        let err =
+            validate_chunk_grid_coverage(&mut entries, &shape, &chunk_shape, &[0, 0], &[1, 1])
+                .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
 }
