@@ -44,6 +44,11 @@ traversals, recursion-depth limits, and file-size-bounded allocation. The reader
 crates are exercised by a corpus/property/fuzz suite in addition to
 reference-oracle tests against the C libraries.
 
+Not yet supported (contributions welcome): writing the szip / lz4 / nbit /
+scaleoffset filters; typed compound-value writing; appending to or updating an
+existing file in place; HDF5 virtual datasets; and object-header messages larger
+than 64 KiB.
+
 ## Usage
 
 ```rust
