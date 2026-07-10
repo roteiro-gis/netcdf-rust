@@ -45,10 +45,27 @@ pub fn parse(cursor: &mut Cursor<'_>, msg_size: usize) -> Result<DatatypeMessage
     Ok(DatatypeMessage { datatype: dt, size })
 }
 
+/// Maximum nesting depth for composite datatypes (compound members, enum,
+/// variable-length, and array bases). A malformed file cannot recurse the
+/// parser into a stack overflow.
+const MAX_DATATYPE_NESTING_DEPTH: usize = 32;
+
 /// Parse a single datatype description (the 4-byte header + properties).
 ///
 /// This is also called recursively for compound members, arrays, enums, etc.
 pub fn parse_datatype_description(cursor: &mut Cursor<'_>) -> Result<(Datatype, u32)> {
+    parse_datatype_description_at_depth(cursor, 0)
+}
+
+fn parse_datatype_description_at_depth(
+    cursor: &mut Cursor<'_>,
+    depth: usize,
+) -> Result<(Datatype, u32)> {
+    if depth > MAX_DATATYPE_NESTING_DEPTH {
+        return Err(Error::InvalidData(format!(
+            "datatype nesting exceeds {MAX_DATATYPE_NESTING_DEPTH} levels"
+        )));
+    }
     let class_and_flags = cursor.read_u32_le()?;
     let class = (class_and_flags & 0x0F) as u8;
     let version = ((class_and_flags >> 4) & 0x0F) as u8;
@@ -62,11 +79,11 @@ pub fn parse_datatype_description(cursor: &mut Cursor<'_>) -> Result<(Datatype, 
         3 => parse_string(class_flags, size)?,
         4 => parse_bitfield(cursor, class_flags, size)?,
         5 => parse_opaque(cursor, class_flags, size)?,
-        6 => parse_compound(cursor, class_flags, size, version)?,
+        6 => parse_compound(cursor, class_flags, size, version, depth)?,
         7 => parse_reference(class_flags, size)?,
-        8 => parse_enum(cursor, class_flags, size)?,
-        9 => parse_varlen(cursor, class_flags, size)?,
-        10 => parse_array(cursor, size, version)?,
+        8 => parse_enum(cursor, class_flags, size, depth)?,
+        9 => parse_varlen(cursor, class_flags, size, depth)?,
+        10 => parse_array(cursor, size, version, depth)?,
         c => return Err(Error::UnsupportedDatatypeClass(c)),
     };
 
@@ -224,7 +241,13 @@ fn parse_opaque(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Dataty
 // Class 6: Compound
 // ---------------------------------------------------------------------------
 
-fn parse_compound(cursor: &mut Cursor<'_>, flags: u32, size: u32, version: u8) -> Result<Datatype> {
+fn parse_compound(
+    cursor: &mut Cursor<'_>,
+    flags: u32,
+    size: u32,
+    version: u8,
+    depth: usize,
+) -> Result<Datatype> {
     // Lower 16 bits of class flags = number of members
     let n_members = (flags & 0xFFFF) as usize;
     let byte_offset_size = compound_member_offset_size(size);
@@ -262,7 +285,7 @@ fn parse_compound(cursor: &mut Cursor<'_>, flags: u32, size: u32, version: u8) -
             cursor.skip(16)?; // 4 dimension sizes (each u32)
         }
 
-        let (member_dt, _member_size) = parse_datatype_description(cursor)?;
+        let (member_dt, _member_size) = parse_datatype_description_at_depth(cursor, depth + 1)?;
 
         fields.push(CompoundField {
             name,
@@ -307,11 +330,11 @@ fn parse_reference(flags: u32, size: u32) -> Result<Datatype> {
 // Class 8: Enum
 // ---------------------------------------------------------------------------
 
-fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Datatype> {
+fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32, depth: usize) -> Result<Datatype> {
     let n_members = (flags & 0xFFFF) as usize;
 
     // Base type
-    let (base_dt, _base_size) = parse_datatype_description(cursor)?;
+    let (base_dt, _base_size) = parse_datatype_description_at_depth(cursor, depth + 1)?;
 
     // Member names (null-terminated)
     let mut names = Vec::with_capacity(n_members);
@@ -337,7 +360,7 @@ fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32) -> Result<Datatype
 // Class 9: Variable-length
 // ---------------------------------------------------------------------------
 
-fn parse_varlen(cursor: &mut Cursor<'_>, flags: u32, _size: u32) -> Result<Datatype> {
+fn parse_varlen(cursor: &mut Cursor<'_>, flags: u32, _size: u32, depth: usize) -> Result<Datatype> {
     // Bits 0-3: type (0 = sequence, 1 = string)
     let kind = match flags & 0x0F {
         0 => VarLenKind::Sequence,
@@ -350,7 +373,7 @@ fn parse_varlen(cursor: &mut Cursor<'_>, flags: u32, _size: u32) -> Result<Datat
     let encoding = string_encoding_from_bits((flags >> 8) & 0x0F);
 
     // Base type follows
-    let (base_dt, _base_size) = parse_datatype_description(cursor)?;
+    let (base_dt, _base_size) = parse_datatype_description_at_depth(cursor, depth + 1)?;
 
     Ok(Datatype::VarLen {
         base: Box::new(base_dt),
@@ -381,7 +404,7 @@ fn string_encoding_from_bits(bits: u32) -> StringEncoding {
 // Class 10: Array
 // ---------------------------------------------------------------------------
 
-fn parse_array(cursor: &mut Cursor<'_>, _size: u32, version: u8) -> Result<Datatype> {
+fn parse_array(cursor: &mut Cursor<'_>, _size: u32, version: u8, depth: usize) -> Result<Datatype> {
     let rank = cursor.read_u8()? as usize;
 
     if version < 3 {
@@ -400,7 +423,7 @@ fn parse_array(cursor: &mut Cursor<'_>, _size: u32, version: u8) -> Result<Datat
     }
 
     // Base type
-    let (base_dt, _base_size) = parse_datatype_description(cursor)?;
+    let (base_dt, _base_size) = parse_datatype_description_at_depth(cursor, depth + 1)?;
 
     Ok(Datatype::Array {
         base: Box::new(base_dt),
@@ -419,6 +442,53 @@ mod tests {
     /// Build the 4-byte class+version+flags word.
     fn class_word(class: u8, version: u8, flags: u32) -> u32 {
         (class as u32) | ((version as u32) << 4) | (flags << 8)
+    }
+
+    /// Encode `levels` nested v3 array datatypes around a 4-byte fixed-point
+    /// base.
+    fn nested_array_datatype(levels: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..levels {
+            data.extend_from_slice(&class_word(10, 3, 0x00).to_le_bytes());
+            data.extend_from_slice(&4u32.to_le_bytes());
+            data.push(1); // rank
+            data.extend_from_slice(&2u32.to_le_bytes()); // dim
+        }
+        // Fixed-point base.
+        data.extend_from_slice(&class_word(0, 1, 0x00).to_le_bytes());
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&32u16.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn deeply_nested_datatype_is_rejected() {
+        let data = nested_array_datatype(64);
+        let mut cursor = Cursor::new(&data);
+        let err = parse(&mut cursor, data.len()).unwrap_err();
+        assert!(
+            err.to_string().contains("nesting exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn moderately_nested_datatype_parses() {
+        let data = nested_array_datatype(4);
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, data.len()).unwrap();
+        let mut dt = &msg.datatype;
+        for _ in 0..4 {
+            match dt {
+                Datatype::Array { base, dims } => {
+                    assert_eq!(dims.as_slice(), &[2]);
+                    dt = base;
+                }
+                other => panic!("expected Array, got {other:?}"),
+            }
+        }
+        assert!(matches!(dt, Datatype::FixedPoint { size: 4, .. }));
     }
 
     #[test]
