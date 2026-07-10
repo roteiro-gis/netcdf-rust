@@ -1,20 +1,19 @@
 # Releasing
 
-This repository publishes crates that must be released in dependency order:
+This repository currently publishes these crates in dependency order:
 
 1. `hdf5-core`
 2. `netcdf-core`
 3. `hdf5-reader`
-4. `hdf5-writer`
-5. `netcdf-reader`
-6. `netcdf-writer`
+4. `netcdf-reader`
+
+The `hdf5-writer` and `netcdf-writer` workspace crates are still under
+development, have `publish = false`, and must not be included in releases.
 
 Publish verification for crates with newly versioned workspace dependencies will
 fail until those dependencies have been published and the crates.io index has
-updated. In particular, `hdf5-reader` and `hdf5-writer` depend on
-`hdf5-core`; `netcdf-reader` depends on `netcdf-core` and, by default,
-`hdf5-reader`; `netcdf-writer` depends on `netcdf-core` and, by default,
-`hdf5-writer`.
+updated. In particular, `hdf5-reader` depends on `hdf5-core`; `netcdf-reader`
+depends on `netcdf-core` and, by default, `hdf5-reader`.
 
 ## Version prep
 
@@ -43,9 +42,7 @@ crates.io index:
 
 ```sh
 cargo package -p hdf5-reader
-cargo package -p hdf5-writer
 cargo package -p netcdf-reader
-cargo package -p netcdf-writer
 ```
 
 Optional but recommended:
@@ -73,12 +70,9 @@ cargo publish -p hdf5-core
 cargo publish -p netcdf-core
 # wait for crates.io index to update
 cargo publish -p hdf5-reader
-cargo publish -p hdf5-writer
 # wait for crates.io index to update
 cargo package -p netcdf-reader
 cargo publish -p netcdf-reader
-cargo package -p netcdf-writer
-cargo publish -p netcdf-writer
 ```
 
 After all publishes succeed:

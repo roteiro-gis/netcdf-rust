@@ -87,9 +87,12 @@ jobs:
       - name: Fetch package dependencies
         run: cargo fetch --locked
 
-      - name: Package workspace offline
+      - name: Package publishable crates offline
         run: |
-          cargo package --workspace --offline --locked --no-verify
+          cargo package --workspace \
+            --exclude hdf5-writer \
+            --exclude netcdf-writer \
+            --offline --locked --no-verify
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.1 --locked
