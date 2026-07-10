@@ -347,21 +347,42 @@ fn parse_record(
             BTreeV2Record::ChunkedNonFiltered { address, offsets }
         }
 
-        // Type 11: filtered chunk
+        // Type 11: filtered chunk. The on-disk chunk-size field width is not
+        // the file's global length size — libhdf5 sizes it to the nominal
+        // chunk byte count. We recover that width from the record size:
+        //   record_size = address + chunk_size_field + filter_mask(4) + offsets
+        // where the number of scaled 8-byte offsets equals the dimensionality.
         11 => {
-            // nbytes (chunk size on disk) is encoded using length_size bytes.
-            let nbytes_size = length_size as usize;
-            let fixed_size = offset_size as usize + nbytes_size + 4; // filter_mask
-            let remaining = record_payload_len(
-                record_size,
-                fixed_size,
-                "B-tree v2 type-11 chunk record is shorter than its fixed fields",
-            )?;
+            let ndims_val = ndims
+                .map(|n| n as usize)
+                .or_else(|| (!chunk_dims.is_empty()).then_some(chunk_dims.len()))
+                .ok_or_else(|| {
+                    Error::InvalidData(
+                        "B-tree v2 type-11 chunk record needs a known dimensionality".to_string(),
+                    )
+                })?;
+            let offsets_bytes = ndims_val
+                .checked_mul(8)
+                .ok_or_else(|| Error::InvalidData("chunk offset bytes overflow".to_string()))?;
+            let fixed_size = offset_size as usize + 4 + offsets_bytes;
+            let chunk_size_len =
+                (record_size as usize)
+                    .checked_sub(fixed_size)
+                    .ok_or_else(|| {
+                        Error::InvalidData(
+                            "B-tree v2 type-11 chunk record is shorter than its fixed fields"
+                                .to_string(),
+                        )
+                    })?;
+            if chunk_size_len == 0 || chunk_size_len > 8 {
+                return Err(Error::InvalidData(format!(
+                    "B-tree v2 type-11 chunk-size field width {chunk_size_len} is out of range"
+                )));
+            }
             let address = cursor.read_offset(offset_size)?;
-            let chunk_size = cursor.read_length(length_size)?;
+            let chunk_size = cursor.read_length(chunk_size_len as u8)?;
             let filter_mask = cursor.read_u32_le()?;
-            let num_offsets = remaining / 8;
-            let offsets = read_scaled_chunk_offsets(cursor, num_offsets, ndims, chunk_dims)?;
+            let offsets = read_scaled_chunk_offsets(cursor, ndims_val, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedFiltered {
                 address,
                 chunk_size,
@@ -1683,7 +1704,9 @@ mod tests {
         data.extend_from_slice(&0xAu32.to_le_bytes());
         let mut cursor = Cursor::new(&data);
 
-        let err = parse_record(&mut cursor, 11, 16, 8, 8, None, &[], 0).unwrap_err();
+        // One dimension: fixed fields are address(8) + chunk_size(>=1) +
+        // filter_mask(4) + offset(8) = 21+, so a 16-byte record is too short.
+        let err = parse_record(&mut cursor, 11, 16, 8, 8, Some(1), &[], 0).unwrap_err();
         assert!(
             matches!(err, Error::InvalidData(message) if message.contains("shorter than its fixed fields"))
         );
