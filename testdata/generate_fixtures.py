@@ -792,6 +792,16 @@ def generate_netcdf4_fixtures(base_dir):
     # Intentionally write zero records
     ds.close()
 
+    # ---- 12. dense_empty_attributes.nc ----
+    # Tests: the eighth user attribute moves NetCDF-4 root attributes from
+    # compact object-header storage into a fractal heap with v2 B-tree indexes.
+    path = os.path.join(nc4_dir, "dense_empty_attributes.nc")
+    print(f"  Generating {path}")
+    ds = netCDF4.Dataset(path, "w", format="NETCDF4")
+    for index in range(8):
+        ds.setncattr(f"att_{index}", "")
+    ds.close()
+
 
 SECTION_GENERATORS = {
     "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),
