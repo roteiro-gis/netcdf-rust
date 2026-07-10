@@ -469,6 +469,20 @@ fn nc4_basic() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn nc4_dense_empty_global_attributes() {
+    let path = required_fixture("netcdf4", "dense_empty_attributes.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let attributes = file.global_attributes().unwrap();
+    assert_eq!(attributes.len(), 8);
+    for (index, attribute) in attributes.iter().enumerate() {
+        assert_eq!(attribute.name, format!("att_{index}"));
+        assert_eq!(attribute.value.as_string().unwrap(), "");
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn parallel_created_nc4_fixture_reads_like_ordinary_nc4_file() {
     let path = required_fixture("parallel", "parallel_nc4_compat.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();

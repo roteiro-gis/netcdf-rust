@@ -311,10 +311,10 @@ fn parse_record(
 
         // Type 8: attribute name hash
         8 => {
-            let hash = cursor.read_u32_le()?;
+            let heap_id = cursor.read_bytes(heap_id_len)?.to_vec();
             let flags = cursor.read_u8()?;
             let creation_order = cursor.read_u32_le()?;
-            let heap_id = cursor.read_bytes(heap_id_len)?.to_vec();
+            let hash = cursor.read_u32_le()?;
             BTreeV2Record::AttributeNameHash {
                 hash,
                 flags,
@@ -325,8 +325,9 @@ fn parse_record(
 
         // Type 9: attribute creation order
         9 => {
-            let order = cursor.read_u32_le()?;
             let heap_id = cursor.read_bytes(heap_id_len)?.to_vec();
+            let _flags = cursor.read_u8()?;
+            let order = cursor.read_u32_le()?;
             BTreeV2Record::AttributeCreationOrder { order, heap_id }
         }
 
@@ -1389,15 +1390,15 @@ fn parse_internal_node_storage(
 /// Compute the heap ID length from the record size and tree type.
 ///
 /// For link/attribute B-trees (types 5, 6, 8, 9), the heap ID occupies
-/// the remaining bytes after the fixed fields. For chunk types (10, 11)
-/// or unknown types, return 0 (heap_id is not used).
+/// the bytes not used by the fixed fields. For chunk types (10, 11) or
+/// unknown types, return 0 (heap_id is not used).
 fn compute_heap_id_len(header: &BTreeV2Header) -> usize {
     let rs = header.record_size as usize;
     match header.btree_type {
         5 => rs.saturating_sub(4),         // hash(4)
         6 => rs.saturating_sub(8),         // order(8)
         8 => rs.saturating_sub(4 + 1 + 4), // hash(4) + flags(1) + creation_order(4)
-        9 => rs.saturating_sub(4),         // order(4)
+        9 => rs.saturating_sub(1 + 4),     // flags(1) + order(4)
         _ => 0,
     }
 }
@@ -1526,6 +1527,61 @@ mod tests {
             ..h5
         };
         assert_eq!(compute_heap_id_len(&h8), 8);
+
+        // Type 9: record_size - flags(1) - order(4)
+        let h9 = BTreeV2Header {
+            btree_type: 9,
+            record_size: 13,
+            ..h5
+        };
+        assert_eq!(compute_heap_id_len(&h9), 8);
+    }
+
+    #[test]
+    fn parse_attribute_name_record_uses_on_disk_field_order() {
+        let heap_id = [0x00, 0xbe, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x00];
+        let mut data = heap_id.to_vec();
+        data.push(0x02);
+        data.extend_from_slice(&6u32.to_le_bytes());
+        data.extend_from_slice(&0x0396_dda5u32.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(&mut cursor, 8, data.len() as u16, 8, 8, None, &[], 8).unwrap();
+        match record {
+            BTreeV2Record::AttributeNameHash {
+                hash,
+                flags,
+                creation_order,
+                heap_id: parsed_heap_id,
+            } => {
+                assert_eq!(parsed_heap_id, heap_id);
+                assert_eq!(flags, 0x02);
+                assert_eq!(creation_order, 6);
+                assert_eq!(hash, 0x0396_dda5);
+            }
+            other => panic!("expected attribute-name record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_attribute_creation_order_record_uses_on_disk_field_order() {
+        let heap_id = [0x00, 0x16, 0x00, 0x00, 0x00, 0x00, 0x1c, 0x00];
+        let mut data = heap_id.to_vec();
+        data.push(0x02);
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let mut cursor = Cursor::new(&data);
+
+        let record = parse_record(&mut cursor, 9, data.len() as u16, 8, 8, None, &[], 8).unwrap();
+        match record {
+            BTreeV2Record::AttributeCreationOrder {
+                order,
+                heap_id: parsed_heap_id,
+            } => {
+                assert_eq!(parsed_heap_id, heap_id);
+                assert_eq!(order, 7);
+            }
+            other => panic!("expected attribute-creation-order record, got {other:?}"),
+        }
     }
 
     #[test]

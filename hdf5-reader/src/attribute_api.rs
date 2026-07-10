@@ -447,10 +447,13 @@ fn load_dense_attribute_records_storage(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<btree_v2::BTreeV2Record>> {
-    let mut addrs = vec![("name", info.btree_name_index_address)];
+    let mut addrs = Vec::new();
+    // Match compact-attribute and NetCDF enumeration order when the object
+    // provides a creation-order index; the name index remains the fallback.
     if let Some(creation_order_addr) = info.btree_creation_order_address {
         addrs.push(("creation-order", creation_order_addr));
     }
+    addrs.push(("name", info.btree_name_index_address));
 
     let mut last_error = None;
     for (index_name, addr) in addrs {

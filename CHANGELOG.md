@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1 - 2026-07-10
+
+- fix dense HDF5 attribute name and creation-order B-tree records to decode
+  fields in their on-disk order, preventing invalid fractal-heap offsets when
+  NetCDF-4 objects cross the compact-to-dense attribute threshold
+
 ## 0.7.0 - 2026-06-23
 
 - breaking: change `netcdf_reader::classic::data::compute_record_stride` to return

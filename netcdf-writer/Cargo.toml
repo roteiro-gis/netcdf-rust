@@ -13,8 +13,8 @@ keywords = ["netcdf", "encoder", "scientific-data"]
 categories = ["science", "encoding"]
 
 [dependencies]
-netcdf-core = { version = "0.7.0", path = "../netcdf-core" }
-hdf5-writer = { version = "0.7.0", path = "../hdf5-writer", optional = true }
+netcdf-core = { version = "0.7.1", path = "../netcdf-core" }
+hdf5-writer = { version = "0.7.1", path = "../hdf5-writer", optional = true }
 thiserror = { workspace = true }
 
 [features]
@@ -22,4 +22,4 @@ default = ["netcdf4"]
 netcdf4 = ["dep:hdf5-writer"]
 
 [dev-dependencies]
-netcdf-reader = { version = "0.7.0", path = "../netcdf-reader" }
+netcdf-reader = { version = "0.7.1", path = "../netcdf-reader" }

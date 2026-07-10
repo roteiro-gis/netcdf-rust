@@ -13,11 +13,11 @@ keywords = ["netcdf", "hdf5", "decoder", "scientific-data", "read-only"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
-netcdf-core = { version = "0.7.0", path = "../netcdf-core" }
+netcdf-core = { version = "0.7.1", path = "../netcdf-core" }
 ndarray = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = { workspace = true }
-hdf5-reader = { version = "0.7.0", path = "../hdf5-reader", optional = true }
+hdf5-reader = { version = "0.7.1", path = "../hdf5-reader", optional = true }
 rayon = { version = "1", optional = true }
 
 [dev-dependencies]
