@@ -12,8 +12,16 @@
 use crate::error::{Error, Result};
 
 /// Decompress HDF5 LZ4-filtered data.
+/// LZ4 cannot expand data by more than ~255x; bound the unlimited path's
+/// declared output size by this multiple of the input so a crafted header
+/// cannot force a huge up-front allocation.
+const LZ4_MAX_EXPANSION: usize = 256;
+
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    decompress_inner(data, None)
+    // Even without a caller-supplied limit, cap the declared output size by
+    // what the input could plausibly expand to.
+    let implicit_limit = data.len().saturating_mul(LZ4_MAX_EXPANSION);
+    decompress_inner(data, Some(implicit_limit))
 }
 
 /// Decompress HDF5 LZ4-filtered data, rejecting declared output sizes above

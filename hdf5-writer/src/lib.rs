@@ -47,9 +47,6 @@ pub enum Error {
 
     #[error("unsupported write feature: {0}")]
     UnsupportedFeature(String),
-
-    #[error("writer has already been finalized")]
-    AlreadyFinalized,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -1043,26 +1040,19 @@ impl Hdf5WritePlan {
 pub struct Hdf5Writer<W: Write + Seek> {
     sink: W,
     options: WriteOptions,
-    finalized: bool,
 }
 
 impl<W: Write + Seek> Hdf5Writer<W> {
     pub fn new(sink: W, options: WriteOptions) -> Self {
-        Self {
-            sink,
-            options,
-            finalized: false,
-        }
+        Self { sink, options }
     }
 
+    /// Encode `plan` and write the file to the sink. Consumes the writer, so a
+    /// writer can be finished at most once.
     pub fn finish(mut self, plan: Hdf5WritePlan) -> Result<W> {
-        if self.finalized {
-            return Err(Error::AlreadyFinalized);
-        }
         let bytes = encode_hdf5_file(&plan, self.options)?;
         self.sink.seek(SeekFrom::Start(0))?;
         self.sink.write_all(&bytes)?;
-        self.finalized = true;
         Ok(self.sink)
     }
 

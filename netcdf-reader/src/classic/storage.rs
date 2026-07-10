@@ -43,7 +43,11 @@ pub(crate) struct ClassicParallelReadPolicy {
 impl ClassicParallelReadPolicy {
     const LOCAL_MIN_BYTES: usize = 32 * 1024 * 1024;
     const LOCAL_TARGET_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+    // Only referenced by the range-backed (HDF5-storage) arm below, which is
+    // itself gated on `netcdf4`; without that feature these would be dead code.
+    #[cfg(feature = "netcdf4")]
     const RANGE_MIN_BYTES: usize = 1024 * 1024;
+    #[cfg(feature = "netcdf4")]
     const RANGE_TARGET_CHUNK_BYTES: usize = 1024 * 1024;
 
     fn for_kind(kind: ClassicStorageKind) -> Self {
