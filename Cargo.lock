@@ -743,6 +743,7 @@ dependencies = [
  "hdf5-writer",
  "netcdf-core",
  "netcdf-reader",
+ "proptest",
  "serde_json",
  "tempfile",
  "thiserror",

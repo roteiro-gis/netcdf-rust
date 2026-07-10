@@ -294,6 +294,23 @@ pub(crate) fn read_non_record_variable_parallel_from_storage<T: NcReadType>(
         return read_non_record_variable_from_storage(storage, var);
     }
 
+    // The parallel path allocates the whole result up front, so validate the
+    // declared byte range fits in storage before dispatching; the serial path
+    // already bounds-checks per read.
+    let end = var
+        .data_offset
+        .checked_add(total_bytes as u64)
+        .ok_or_else(|| {
+            Error::InvalidData(format!("variable '{}' byte range exceeds u64", var.name))
+        })?;
+    if end > storage.len() {
+        return Err(Error::InvalidData(format!(
+            "variable '{}' data extends beyond file: needs {end} bytes, have {}",
+            var.name,
+            storage.len()
+        )));
+    }
+
     let values = read_contiguous_range_parallel::<T>(
         storage,
         var.data_offset,
