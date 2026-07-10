@@ -149,8 +149,8 @@ Minimum supported Rust version: 1.81.
 
 ```toml
 [dependencies]
-netcdf-reader = "0.7.0"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.7.0", default-features = false }  # CDF-1/2/5 only
+netcdf-reader = "0.7.1"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.7.1", default-features = false }  # CDF-1/2/5 only
 ```
 
 | Flag | Default | Description |

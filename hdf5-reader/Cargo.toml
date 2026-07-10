@@ -13,7 +13,7 @@ keywords = ["hdf5", "decoder", "scientific-data", "read-only"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
-hdf5-core = { version = "0.7.0", path = "../hdf5-core" }
+hdf5-core = { version = "0.7.1", path = "../hdf5-core" }
 ndarray = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = { workspace = true }
