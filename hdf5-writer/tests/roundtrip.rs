@@ -1165,8 +1165,8 @@ fn writes_object_reference_list_attribute() {
             "REFERENCE_LIST",
             vec![("temp".to_string(), 1)],
         ));
-    let data = DatasetBuilder::typed_data("temp", vec![2, 3], &(0_i32..6).collect::<Vec<_>>())
-        .unwrap();
+    let data =
+        DatasetBuilder::typed_data("temp", vec![2, 3], &(0_i32..6).collect::<Vec<_>>()).unwrap();
     let plan = Hdf5Builder::new()
         .dataset(scale)
         .dataset(data)
@@ -1180,7 +1180,11 @@ fn writes_object_reference_list_attribute() {
 
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let temp = file.dataset("/temp").unwrap();
-    let attr = file.dataset("/x").unwrap().attribute("REFERENCE_LIST").unwrap();
+    let attr = file
+        .dataset("/x")
+        .unwrap()
+        .attribute("REFERENCE_LIST")
+        .unwrap();
     assert_eq!(attr.shape, vec![1]);
     assert_eq!(attr.raw_data.len(), 16);
     // Entry: object reference (8 bytes) then dimension index (u32) at offset 8.
