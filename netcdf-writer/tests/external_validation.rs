@@ -52,6 +52,16 @@ fn run_validator(dir: &Path, manifest: Value) {
         serde_json::to_string_pretty(&manifest).unwrap(),
     )
     .expect("write manifest");
+    if let Ok(export) = std::env::var("NETCDF_RUST_VALIDATION_EXPORT") {
+        let export = PathBuf::from(export);
+        std::fs::create_dir_all(&export).expect("create export dir");
+        for entry in std::fs::read_dir(dir).expect("read validation dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                std::fs::copy(&path, export.join(path.file_name().unwrap())).expect("export file");
+            }
+        }
+    }
     let script = repo_root().join("testdata/validate_writer_files.py");
     let output = Command::new(validator_python())
         .arg(&script)
