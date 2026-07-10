@@ -33,6 +33,15 @@ cargo clippy --all -- -D warnings
 cargo test --workspace
 cargo test -p hdf5-reader --no-default-features
 cargo test -p netcdf-reader --no-default-features
+# MSRV: compile-check the whole workspace, then unit-test the crates that have
+# no dev-dependencies. The other crates are only compile-checked on MSRV
+# because their test-only dependencies (proptest, tempfile, criterion, the C
+# libnetcdf) pull in transitive crates that require a newer Rust edition.
+rustup run 1.81.0 cargo check --workspace --all-features --locked
+rustup run 1.81.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
+# Writer output conformance against the reference C libraries (needs Python
+# with netCDF4 + h5py).
+scripts/validate-writer-output.sh
 cargo package -p hdf5-core --offline --locked
 cargo package -p netcdf-core --offline --locked
 ```
