@@ -171,21 +171,6 @@ impl ObjectHeader {
         Ok(())
     }
 
-    /// Resolve shared messages by following references via random-access storage.
-    pub fn resolve_shared_messages_storage(
-        &mut self,
-        storage: &dyn Storage,
-        offset_size: u8,
-        length_size: u8,
-    ) -> Result<()> {
-        self.resolve_shared_messages_storage_with_sohm(
-            storage,
-            offset_size,
-            length_size,
-            |_heap_id, _message_type| Ok(None),
-        )
-    }
-
     /// Resolve shared messages using random-access storage and a SOHM resolver.
     pub(crate) fn resolve_shared_messages_storage_with_sohm<F>(
         &mut self,

@@ -825,3 +825,27 @@ fn chunked_lz4_compressed() {
     assert_eq!(data.shape(), &[10, 20]);
     assert!(data.iter().all(|&v| v == 0.0));
 }
+
+#[test]
+fn sohm_shared_attributes_resolve_on_group_and_dataset() {
+    // A shared object header message (SOHM) attribute stored once and
+    // referenced from both a group and a dataset must resolve on both paths.
+    // The fixture is only produced on h5py builds with the shared-message API.
+    let path = skip_if_missing!("sohm_shared_attrs.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let group = file.root_group().unwrap().group("shared_group").unwrap();
+    let group_meta = group
+        .attributes()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "shared_meta")
+        .expect("group shared_meta attribute");
+    assert_eq!(group_meta.read_1d::<i32>().unwrap(), vec![0, 1, 2, 3]);
+
+    let ds = file.dataset("/shared_data").unwrap();
+    let ds_meta = ds
+        .attribute("shared_meta")
+        .expect("dataset shared_meta attribute");
+    assert_eq!(ds_meta.read_1d::<i32>().unwrap(), vec![0, 1, 2, 3]);
+}

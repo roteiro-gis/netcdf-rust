@@ -186,12 +186,10 @@ impl Group {
 
     /// List attributes on this group.
     pub fn attributes(&self) -> Result<Vec<Attribute>> {
-        let mut header = (*self.cached_header(self.address)?).clone();
-        header.resolve_shared_messages_storage(
-            self.context.storage.as_ref(),
-            self.offset_size(),
-            self.length_size(),
-        )?;
+        // `cached_header` already resolves shared messages, including those
+        // stored in the shared object header message (SOHM) table, so the
+        // group attribute path supports the same sharing the dataset path does.
+        let header = self.cached_header(self.address)?;
         Ok(collect_attribute_messages_storage(
             &header,
             self.context.storage.as_ref(),
