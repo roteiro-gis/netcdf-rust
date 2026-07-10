@@ -1982,7 +1982,6 @@ struct PlannedVar {
 
 #[derive(Debug, Clone)]
 struct ClassicWritePlan {
-    format: NcFormat,
     num_records: u64,
     header: Vec<u8>,
     fixed_vars: Vec<PlannedVar>,
@@ -2012,7 +2011,6 @@ impl ClassicWritePlan {
         let fixed_vars = planned.iter().filter(|v| !v.is_record).cloned().collect();
         let record_vars = planned.iter().filter(|v| v.is_record).cloned().collect();
         Ok(Self {
-            format,
             num_records,
             header,
             fixed_vars,
