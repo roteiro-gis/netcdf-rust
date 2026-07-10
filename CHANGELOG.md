@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased
+
+### Writers (first release of `hdf5-writer` and `netcdf-writer`)
+
+- validate all writer output against the reference C libraries (libhdf5 via
+  h5py, netcdf-c via netCDF4-python) with a new harness, in addition to
+  round-tripping through the reader crates
+- emit Link Info and Group Info messages on HDF5 groups so libhdf5 accepts the
+  files (previously every writer file was rejected)
+- fix HDF5 encoding to match libhdf5: floating-point sign-bit position,
+  variable-length string datatype, the v4 chunk-layout element-size dimension,
+  fixed-array page bits and variable chunk-size field width, the global-heap
+  free-space object, and empty variable-length references
+- write classic `vsize` padded to 4 bytes and implement the single-record-
+  variable no-padding exception, matching netcdf-c byte-for-byte; the reader
+  now recomputes record strides from dimensions so it reads conformant files
+  with a lone odd-sized record variable
+- emit a version-2 B-tree chunk index for datasets with unlimited maximum
+  dimensions (the implicit and fixed-array indices are only valid for fixed
+  max dims)
+- emit `REFERENCE_LIST` back-references on dimension scales so HDF5
+  dimension-scale tooling (`h5py` H5DS) sees data variables as attached
+- fill native-endian slice growth gaps with the variable's fill value instead
+  of zeros
+- eliminate redundant full-file copies in the HDF5 write path
+
+### Reader hardening
+
+- guard object-header continuation following with a visited-set and depth
+  limit, and check continuation offset arithmetic, to stop infinite loops on
+  crafted files
+- limit datatype-parsing recursion depth to prevent stack overflow on deeply
+  nested compound/array/enum/vlen datatypes
+- bound classic attribute and record-count allocations by the available file
+  size so a tiny crafted header cannot force a multi-gigabyte allocation
+- bound the variable dimension-count and the parallel non-record read against
+  the file size before allocating (found by the new mutation property test)
+- parse libhdf5's filtered v2 B-tree chunk records, which use a minimal
+  chunk-size field width rather than the file's global length size
+- resolve shared object header message (SOHM) attributes on the group path,
+  matching the dataset path
+- reject chunk dimensions that exceed `u32` and bound the implicit chunk-index
+  entry count by the file size
+
+### Tests and infrastructure
+
+- add a classic-NetCDF parser fuzz target and seed both fuzz corpora
+- add a writer→reader roundtrip property test (a true classic-format oracle)
+  and a reader byte-mutation property test with bounded-allocation assertions
+- add unit tests for the chunk-grid coverage gate that guards the
+  uninitialized-output fast path
+- run core-crate unit tests on the MSRV toolchain and test classic-only
+  parallel reads without the HDF5 stack
+
+### Other
+
+- allow parallel classic reads without enabling the HDF5 backend
+  (`rayon` no longer implies `netcdf4`)
+- bound the unlimited LZ4 decompression path's declared output size by the
+  input length
+- remove the unreachable `Hdf5Writer` finalized flag
+
 ## 0.8.0 - 2026-07-10
 
 - breaking: move shared public HDF5 format types and NetCDF data-model types

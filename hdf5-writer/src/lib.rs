@@ -1,9 +1,30 @@
-//! Pure-Rust HDF5 writer crate.
+//! Pure-Rust HDF5 writer.
 //!
-//! This crate owns the write-side API surface and shared encoding decisions.
-//! The first implementation milestone exposes validated builders and format
-//! planning types. Full HDF5 serialization is intentionally gated until the
-//! object-header, heap, chunk-index, and checksum encoders are complete.
+//! Build a file from [`DatasetBuilder`]s and [`AttributeBuilder`]s with
+//! [`Hdf5Builder`], turn it into an [`Hdf5WritePlan`], and serialize it with
+//! [`Hdf5Writer`] (a seekable sink) or [`Hdf5WritePlan::encode`] (bytes):
+//!
+//! ```
+//! use std::io::Cursor;
+//! use hdf5_writer::{DatasetBuilder, Hdf5Builder, Hdf5Writer, WriteOptions};
+//!
+//! let plan = Hdf5Builder::new()
+//!     .dataset(DatasetBuilder::typed_data("grid", vec![2, 3], &[0_i32, 1, 2, 3, 4, 5]).unwrap())
+//!     .into_plan()
+//!     .unwrap();
+//! let bytes = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+//!     .finish(plan)
+//!     .unwrap()
+//!     .into_inner();
+//! assert_eq!(&bytes[..8], b"\x89HDF\r\n\x1a\n");
+//! ```
+//!
+//! Supported: superblock v2; contiguous, compact, and chunked layouts (implicit,
+//! single-chunk, fixed-array, and version-2 B-tree indices, the last for
+//! unlimited maximum dimensions); groups; attributes; the deflate, shuffle, and
+//! fletcher32 filters; and fixed-point, floating-point, string (fixed and
+//! variable-length), reference, variable-length, bitfield, opaque, compound,
+//! enum, and array datatypes. Output is validated against libhdf5.
 
 use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
@@ -201,6 +222,9 @@ fn native_order() -> ByteOrder {
 }
 
 /// Dataset definition used by the write planner.
+/// Builds a single HDF5 dataset: its name/path, datatype, shape, layout
+/// (contiguous, compact, or chunked), optional max shape, filters, fill value,
+/// data, and attributes.
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     name: String,
@@ -540,6 +564,9 @@ impl DatasetBuilder {
 }
 
 /// Attribute definition used by HDF5 object headers.
+/// Builds a single HDF5 attribute attached to a dataset, group, or the file
+/// root. Supports scalars, vectors, fixed and variable-length strings, object
+/// references, and reference lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeBuilder {
     name: String,
@@ -917,6 +944,8 @@ impl GroupAttributeBuilder {
 }
 
 /// Root HDF5 file builder.
+/// Accumulates datasets, root attributes, and group attributes, then produces
+/// a validated [`Hdf5WritePlan`] via [`Hdf5Builder::into_plan`].
 #[derive(Debug, Clone, Default)]
 pub struct Hdf5Builder {
     datasets: Vec<DatasetBuilder>,
@@ -998,6 +1027,8 @@ impl Hdf5Builder {
 }
 
 /// Validated HDF5 write plan.
+/// A validated set of datasets and attributes ready to be serialized by
+/// [`Hdf5Writer`] or [`Hdf5WritePlan::encode`].
 #[derive(Debug, Clone)]
 pub struct Hdf5WritePlan {
     datasets: Vec<DatasetBuilder>,
