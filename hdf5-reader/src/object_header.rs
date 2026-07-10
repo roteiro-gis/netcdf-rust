@@ -27,6 +27,29 @@ const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 /// Magic signature for v2 continuation chunks.
 const OCHK_SIGNATURE: [u8; 4] = *b"OCHK";
 
+/// Upper bound on continuation chunks per object header; a malformed file
+/// cannot make the parser loop unboundedly.
+const MAX_HEADER_CONTINUATIONS: usize = 1024;
+
+/// Guard a continuation-chunk visit: reject revisits (cycles) and enforce the
+/// per-header chunk budget.
+fn enter_continuation(
+    visited: &mut std::collections::HashSet<u64>,
+    offset: u64,
+) -> Result<()> {
+    if !visited.insert(offset) {
+        return Err(Error::InvalidData(format!(
+            "object header continuation cycle at offset {offset:#x}"
+        )));
+    }
+    if visited.len() > MAX_HEADER_CONTINUATIONS {
+        return Err(Error::InvalidData(format!(
+            "object header exceeds {MAX_HEADER_CONTINUATIONS} continuation chunks"
+        )));
+    }
+    Ok(())
+}
+
 /// Header continuation message type id.
 const MSG_TYPE_CONTINUATION: u16 = 0x0010;
 
@@ -265,8 +288,12 @@ impl ObjectHeader {
         )?;
 
         // Follow continuation messages.
+        let mut visited = std::collections::HashSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
-            let cont_end = cont_offset + cont_length;
+            enter_continuation(&mut visited, cont_offset)?;
+            let cont_end = cont_offset.checked_add(cont_length).ok_or_else(|| {
+                Error::InvalidData("v1 object header continuation end overflows u64".to_string())
+            })?;
             Self::read_v1_messages(
                 base,
                 cont_offset,
@@ -320,7 +347,9 @@ impl ObjectHeader {
             &mut continuations,
         )?;
 
+        let mut visited = std::collections::HashSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
+            enter_continuation(&mut visited, cont_offset)?;
             let cont_length = checked_usize(cont_length, "v1 object header continuation length")?;
             let chunk = storage.read_range(cont_offset, cont_length)?;
             Self::read_v1_messages_from_slice(
@@ -507,7 +536,9 @@ impl ObjectHeader {
         )?;
 
         // Follow continuation chunks.
+        let mut visited = std::collections::HashSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
+            enter_continuation(&mut visited, cont_offset)?;
             Self::read_v2_continuation_chunk(
                 base,
                 cont_offset,
@@ -625,7 +656,9 @@ impl ObjectHeader {
             &mut continuations,
         )?;
 
+        let mut visited = std::collections::HashSet::new();
         while let Some((cont_offset, cont_length)) = continuations.pop() {
+            enter_continuation(&mut visited, cont_offset)?;
             Self::read_v2_continuation_chunk_storage(
                 storage,
                 cont_offset,
@@ -1486,6 +1519,133 @@ mod tests {
             }
             other => panic!("expected Unknown from OCHK, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn v1_continuation_cycle_is_rejected() {
+        // A continuation chunk whose only message is a continuation pointing
+        // back at itself must error instead of looping forever.
+        let main_header_base_size = 16;
+        let cont_msg_envelope_size = 8 + 16;
+        let cont_chunk_offset = (main_header_base_size + cont_msg_envelope_size) as u64;
+
+        // The self-referential chunk: one continuation message pointing at
+        // this chunk's own offset.
+        let mut cont_chunk = Vec::new();
+        cont_chunk.extend_from_slice(&MSG_TYPE_CONTINUATION.to_le_bytes());
+        cont_chunk.extend_from_slice(&16u16.to_le_bytes());
+        cont_chunk.push(0);
+        cont_chunk.extend_from_slice(&[0u8; 3]);
+        let cont_chunk_len = (cont_chunk.len() + 16) as u64;
+        cont_chunk.extend_from_slice(&cont_chunk_offset.to_le_bytes());
+        cont_chunk.extend_from_slice(&cont_chunk_len.to_le_bytes());
+
+        let mut cont_payload = Vec::new();
+        cont_payload.extend_from_slice(&cont_chunk_offset.to_le_bytes());
+        cont_payload.extend_from_slice(&cont_chunk_len.to_le_bytes());
+
+        let main_header = build_v1_header(&[(MSG_TYPE_CONTINUATION, 0, &cont_payload)], 1);
+        let mut file_data = main_header;
+        assert_eq!(file_data.len() as u64, cont_chunk_offset);
+        file_data.extend_from_slice(&cont_chunk);
+
+        let err = ObjectHeader::parse_at(&file_data, 0, 8, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("continuation cycle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_continuation_cycle_is_rejected() {
+        // An OCHK whose only message is a continuation pointing back at the
+        // same OCHK must error instead of looping forever.
+        let mut cont_payload = vec![0u8; 16];
+        let ohdr_size = 4 + 1 + 1 + 1 + (4 + cont_payload.len()) + 4;
+        let ochk_offset = ohdr_size as u64;
+
+        // Build the self-referential OCHK with a placeholder payload first to
+        // learn its length, then rebuild with the real values.
+        let placeholder = build_v2_ochk(&[(0x10, 0, &[0u8; 16])], false);
+        let ochk_len = placeholder.len() as u64;
+        let mut self_payload = Vec::new();
+        self_payload.extend_from_slice(&ochk_offset.to_le_bytes());
+        self_payload.extend_from_slice(&ochk_len.to_le_bytes());
+        let ochk = build_v2_ochk(&[(0x10, 0, &self_payload)], false);
+        assert_eq!(ochk.len() as u64, ochk_len);
+
+        cont_payload.clear();
+        cont_payload.extend_from_slice(&ochk_offset.to_le_bytes());
+        cont_payload.extend_from_slice(&ochk_len.to_le_bytes());
+        let ohdr = build_v2_header(0x00, &[(0x10, 0, &cont_payload)], None, None);
+        assert_eq!(ohdr.len(), ohdr_size);
+
+        let mut file_data = ohdr;
+        file_data.extend_from_slice(&ochk);
+
+        let err = ObjectHeader::parse_at(&file_data, 0, 8, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("continuation cycle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v1_storage_continuation_cycle_is_rejected() {
+        let main_header_base_size = 16;
+        let cont_msg_envelope_size = 8 + 16;
+        let cont_chunk_offset = (main_header_base_size + cont_msg_envelope_size) as u64;
+
+        let mut cont_chunk = Vec::new();
+        cont_chunk.extend_from_slice(&MSG_TYPE_CONTINUATION.to_le_bytes());
+        cont_chunk.extend_from_slice(&16u16.to_le_bytes());
+        cont_chunk.push(0);
+        cont_chunk.extend_from_slice(&[0u8; 3]);
+        let cont_chunk_len = (cont_chunk.len() + 16) as u64;
+        cont_chunk.extend_from_slice(&cont_chunk_offset.to_le_bytes());
+        cont_chunk.extend_from_slice(&cont_chunk_len.to_le_bytes());
+
+        let mut cont_payload = Vec::new();
+        cont_payload.extend_from_slice(&cont_chunk_offset.to_le_bytes());
+        cont_payload.extend_from_slice(&cont_chunk_len.to_le_bytes());
+
+        let mut file_data = build_v1_header(&[(MSG_TYPE_CONTINUATION, 0, &cont_payload)], 1);
+        assert_eq!(file_data.len() as u64, cont_chunk_offset);
+        file_data.extend_from_slice(&cont_chunk);
+        let storage = BytesStorage::new(file_data);
+
+        let err = ObjectHeader::parse_at_storage(&storage, 0, 8, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("continuation cycle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn v2_storage_continuation_cycle_is_rejected() {
+        let mut cont_payload = vec![0u8; 16];
+        let ohdr_size = 4 + 1 + 1 + 1 + (4 + cont_payload.len()) + 4;
+        let ochk_offset = ohdr_size as u64;
+
+        let placeholder = build_v2_ochk(&[(0x10, 0, &[0u8; 16])], false);
+        let ochk_len = placeholder.len() as u64;
+        let mut self_payload = Vec::new();
+        self_payload.extend_from_slice(&ochk_offset.to_le_bytes());
+        self_payload.extend_from_slice(&ochk_len.to_le_bytes());
+        let ochk = build_v2_ochk(&[(0x10, 0, &self_payload)], false);
+
+        cont_payload.clear();
+        cont_payload.extend_from_slice(&ochk_offset.to_le_bytes());
+        cont_payload.extend_from_slice(&ochk_len.to_le_bytes());
+        let mut file_data = build_v2_header(0x00, &[(0x10, 0, &cont_payload)], None, None);
+        file_data.extend_from_slice(&ochk);
+        let storage = BytesStorage::new(file_data);
+
+        let err = ObjectHeader::parse_at_storage(&storage, 0, 8, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("continuation cycle"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
