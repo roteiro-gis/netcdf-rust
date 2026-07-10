@@ -6,14 +6,13 @@
 //! represent losslessly.
 
 #[cfg(feature = "netcdf4")]
-use std::io::Cursor as IoCursor;
 use std::io::Write;
 
 #[cfg(feature = "netcdf4")]
 use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
     CompoundField as H5CompoundField, DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype,
-    EnumMember as H5EnumMember, FilterDescription as H5FilterDescription, Hdf5Builder, Hdf5Writer,
+    EnumMember as H5EnumMember, FilterDescription as H5FilterDescription, Hdf5Builder,
     ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
     StringPadding as H5StringPadding, StringSize as H5StringSize, VarLenKind as H5VarLenKind,
     WriteOptions as H5WriteOptions, FILTER_DEFLATE as H5_FILTER_DEFLATE,
@@ -1254,10 +1253,12 @@ impl NcFileBuilder {
     fn write_nc4(&self, writer: &mut impl Write, format: NcFormat) -> Result<NcFormat> {
         self.validate_for_nc4_bridge(format)?;
         let hdf5_plan = self.build_hdf5_plan(format)?;
-        let cursor = Hdf5Writer::new(IoCursor::new(Vec::new()), H5WriteOptions::default())
-            .finish(hdf5_plan)
+        // Encode straight to bytes and write them to the caller's sink, rather
+        // than routing through an intermediate seekable in-memory writer.
+        let bytes = hdf5_plan
+            .encode(H5WriteOptions::default())
             .map_err(hdf5_error_to_unsupported)?;
-        writer.write_all(&cursor.into_inner())?;
+        writer.write_all(&bytes)?;
         Ok(format)
     }
 

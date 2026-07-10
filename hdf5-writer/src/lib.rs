@@ -1029,10 +1029,17 @@ impl Hdf5WritePlan {
         }
         .validate()
     }
+
+    /// Encode the plan to the complete HDF5 file bytes. Callers that already
+    /// hold a plain [`Write`] sink (and cannot supply a [`Seek`] one) can write
+    /// these bytes directly, avoiding an intermediate in-memory copy.
+    pub fn encode(&self, options: WriteOptions) -> Result<Vec<u8>> {
+        encode_hdf5_file(self, options)
+    }
 }
 
-/// Streaming HDF5 writer placeholder. It validates definitions now and will
-/// host the binary emitters as they are added.
+/// Writes an [`Hdf5WritePlan`] to a seekable sink. Use
+/// [`Hdf5WritePlan::encode`] when the sink is a plain [`Write`].
 pub struct Hdf5Writer<W: Write + Seek> {
     sink: W,
     options: WriteOptions,
@@ -1372,9 +1379,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
+    // Consume `prepared` so each dataset's storage bytes move into the emission
+    // instead of being cloned.
     for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
         prepared
-            .iter()
+            .into_iter()
             .zip(&planned_attributes.datasets)
             .zip(header_addresses.iter().copied())
             .zip(data_addresses.iter().copied())
@@ -1382,7 +1391,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     {
         let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
-            encode_dataset_header(prepared_dataset, attributes, layout_address, heap_address)?;
+            encode_dataset_header(&prepared_dataset, attributes, layout_address, heap_address)?;
         let chunk_index = if let (Some(chunk_index), Some(addresses)) =
             (&prepared_dataset.chunk_index, chunk_index_address)
         {
@@ -1403,7 +1412,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
-            raw_data: prepared_dataset.raw_data.clone(),
+            raw_data: prepared_dataset.raw_data,
             header_address,
             data_address,
             header,
