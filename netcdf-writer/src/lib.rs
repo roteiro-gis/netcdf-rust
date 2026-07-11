@@ -2810,48 +2810,15 @@ fn ensure_variable_slice_buffer(
     elem_size: usize,
     can_grow: bool,
 ) -> Result<()> {
-    if variable.data_encoding != VariableDataEncoding::ClassicBigEndian && !variable.data.is_empty()
-    {
-        return Err(Error::UnsupportedFeature(format!(
-            "typed slice writes cannot update native-endian payload for variable '{}'",
-            variable.name
-        )));
-    }
-
-    let expected = checked_mul_usize(
-        require_usize(total_elements, "variable element count")?,
+    ensure_variable_byte_slice_buffer(
+        variable,
+        old_shape,
+        new_shape,
+        total_elements,
         elem_size,
-        "variable byte size",
-    )?;
-    if variable.data.is_empty() {
-        let fill_pattern = match &variable.fill_value {
-            Some(fill_value) => fill_value.classic_bytes.clone(),
-            None => default_classic_fill_bytes(&variable.dtype)?,
-        };
-        variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
-    } else if variable.data.len() < expected && can_grow {
-        let fill_pattern = match &variable.fill_value {
-            Some(fill_value) => fill_value.classic_bytes.clone(),
-            None => default_classic_fill_bytes(&variable.dtype)?,
-        };
-        resize_variable_data(
-            &mut variable.data,
-            old_shape,
-            new_shape,
-            elem_size,
-            &fill_pattern,
-        )?;
-    } else if variable.data.len() != expected {
-        return Err(Error::DataLengthMismatch {
-            expected,
-            actual: variable.data.len(),
-        });
-    }
-
-    variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
-    variable.string_values = None;
-    variable.vlen_values = None;
-    Ok(())
+        can_grow,
+        VariableDataEncoding::ClassicBigEndian,
+    )
 }
 
 fn ensure_variable_native_slice_buffer(
@@ -2862,19 +2829,49 @@ fn ensure_variable_native_slice_buffer(
     elem_size: usize,
     can_grow: bool,
 ) -> Result<()> {
-    if variable.data_encoding != VariableDataEncoding::Hdf5Native && !variable.data.is_empty() {
+    ensure_variable_byte_slice_buffer(
+        variable,
+        old_shape,
+        new_shape,
+        total_elements,
+        elem_size,
+        can_grow,
+        VariableDataEncoding::Hdf5Native,
+    )
+}
+
+/// Create or grow a variable's byte payload for a slice write, in either the
+/// classic big-endian or HDF5 native little-endian encoding. Gaps are filled
+/// with the encoding-appropriate fill pattern (the variable's fill value, or
+/// the type default).
+fn ensure_variable_byte_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    elem_size: usize,
+    can_grow: bool,
+    encoding: VariableDataEncoding,
+) -> Result<()> {
+    if variable.data_encoding != encoding && !variable.data.is_empty() {
         return Err(Error::UnsupportedFeature(format!(
-            "native slice writes cannot update classic-endian payload for variable '{}'",
+            "slice writes cannot change the payload encoding of variable '{}'",
             variable.name
         )));
     }
 
     let expected = checked_mul_usize(
-        require_usize(total_elements, "native variable element count")?,
+        require_usize(total_elements, "variable element count")?,
         elem_size,
-        "native variable byte size",
+        "variable byte size",
     )?;
-    let fill_pattern = native_fill_pattern(variable, elem_size)?;
+    let fill_pattern = match encoding {
+        VariableDataEncoding::Hdf5Native => native_fill_pattern(variable, elem_size)?,
+        VariableDataEncoding::ClassicBigEndian => match &variable.fill_value {
+            Some(fill_value) => fill_value.classic_bytes.clone(),
+            None => default_classic_fill_bytes(&variable.dtype)?,
+        },
+    };
     if variable.data.is_empty() {
         variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
     } else if variable.data.len() < expected && can_grow {
@@ -2892,7 +2889,7 @@ fn ensure_variable_native_slice_buffer(
         });
     }
 
-    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.data_encoding = encoding;
     variable.string_values = None;
     variable.vlen_values = None;
     Ok(())
