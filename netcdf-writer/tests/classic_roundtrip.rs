@@ -391,7 +391,7 @@ fn rejects_group_paths_for_classic_writes() {
     builder.write_variable(variable, &[1_i32, 2]).unwrap();
 
     let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
-    assert!(err.to_string().contains("requires NetCDF-4"));
+    assert!(matches!(err, netcdf_writer::Error::RequiresNetcdf4 { .. }));
 }
 
 #[test]
@@ -406,7 +406,7 @@ fn rejects_group_attributes_for_classic_writes() {
         .unwrap();
 
     let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
-    assert!(err.to_string().contains("requires NetCDF-4"));
+    assert!(matches!(err, netcdf_writer::Error::RequiresNetcdf4 { .. }));
 }
 
 /// `/tmp` reference bytes produced by netcdf-c (via netCDF4-python) for a
@@ -506,4 +506,23 @@ fn reads_netcdf_c_multiple_record_variables() {
             .unwrap(),
         &[100, 200]
     );
+}
+
+#[test]
+fn cdf5_only_data_reports_format_capacity_exceeded() {
+    // Unsigned 64-bit data cannot be represented in CDF-1; requesting it
+    // yields a matchable FormatCapacityExceeded so callers can retry as CDF-5.
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 2).unwrap();
+    let v = builder.add_variable::<u64>("v", &[x]).unwrap();
+    builder.write_variable(v, &[1_u64, 2]).unwrap();
+
+    let err = builder.to_vec(NcWriteOptions::classic()).unwrap_err();
+    assert!(matches!(
+        err,
+        netcdf_writer::Error::FormatCapacityExceeded { .. }
+    ));
+
+    // The same schema succeeds as CDF-5.
+    assert!(builder.to_vec(NcWriteOptions::cdf5()).is_ok());
 }

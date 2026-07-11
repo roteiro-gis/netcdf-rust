@@ -50,6 +50,18 @@ pub enum Error {
     #[error("data length mismatch: expected {expected}, got {actual}")]
     DataLengthMismatch { expected: usize, actual: usize },
 
+    /// The schema needs the NetCDF-4 data model (e.g. a type, name, or
+    /// structure the requested classic format cannot represent). Callers can
+    /// match on this and retry with [`NcWriteFormat::Nc4`].
+    #[error("requires the NetCDF-4 data model: {reason}")]
+    RequiresNetcdf4 { reason: String },
+
+    /// A value exceeds the capacity of the requested classic format (for
+    /// example a 32-bit offset or size field). Callers can match on this and
+    /// retry with a larger classic format such as CDF-5.
+    #[error("exceeds the capacity of the requested classic format: {reason}")]
+    FormatCapacityExceeded { reason: String },
+
     #[error("unsupported write feature: {0}")]
     UnsupportedFeature(String),
 }
@@ -1952,15 +1964,16 @@ impl NcFileBuilder {
         }
         let unlimited_count = self.dimensions.iter().filter(|d| d.is_unlimited).count();
         if unlimited_count > 1 {
-            return Err(Error::InvalidDefinition(
-                "classic NetCDF supports at most one unlimited dimension".into(),
-            ));
+            return Err(Error::RequiresNetcdf4 {
+                reason: "classic NetCDF supports at most one unlimited dimension".into(),
+            });
         }
         if format != NcFormat::Cdf5 && self.requires_cdf5() {
-            return Err(Error::InvalidDefinition(
-                "CDF-5 is required for unsigned integer, 64-bit integer, or 64-bit count data"
+            return Err(Error::FormatCapacityExceeded {
+                reason: "CDF-5 is required for unsigned integer, 64-bit integer, or 64-bit count \
+                         data"
                     .into(),
-            ));
+            });
         }
         validate_root_only_names(self)?;
         for variable in &self.variables {
@@ -3744,9 +3757,9 @@ fn infer_num_records_for_var(builder: &NcFileBuilder, variable: &VariableDef) ->
 
 fn validate_classic_type(dtype: &NcType) -> Result<()> {
     if dtype.classic_type_code().is_none() {
-        return Err(Error::UnsupportedFeature(format!(
-            "{dtype:?} requires NetCDF-4"
-        )));
+        return Err(Error::RequiresNetcdf4 {
+            reason: format!("the {dtype:?} datatype is not representable in classic NetCDF"),
+        });
     }
     Ok(())
 }
@@ -4053,25 +4066,25 @@ fn path_leaf_name(path: &str) -> &str {
 fn validate_root_only_names(builder: &NcFileBuilder) -> Result<()> {
     for dimension in &builder.dimensions {
         if dimension.name.contains('/') {
-            return Err(Error::UnsupportedFeature(format!(
-                "dimension '{}' requires NetCDF-4",
-                dimension.name
-            )));
+            return Err(Error::RequiresNetcdf4 {
+                reason: format!("grouped dimension '{}' needs NetCDF-4", dimension.name),
+            });
         }
     }
     for variable in &builder.variables {
         if variable.name.contains('/') {
-            return Err(Error::UnsupportedFeature(format!(
-                "variable '{}' requires NetCDF-4",
-                variable.name
-            )));
+            return Err(Error::RequiresNetcdf4 {
+                reason: format!("grouped variable '{}' needs NetCDF-4", variable.name),
+            });
         }
     }
     if let Some(group_attr) = builder.group_attributes.first() {
-        return Err(Error::UnsupportedFeature(format!(
-            "group '{}' requires NetCDF-4",
-            group_attr.group_path
-        )));
+        return Err(Error::RequiresNetcdf4 {
+            reason: format!(
+                "group attribute on '{}' needs NetCDF-4",
+                group_attr.group_path
+            ),
+        });
     }
     Ok(())
 }
@@ -4190,8 +4203,9 @@ fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
 }
 
 fn require_u32(value: u64, context: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| Error::InvalidDefinition(format!("{context} exceeds u32 capacity")))
+    u32::try_from(value).map_err(|_| Error::FormatCapacityExceeded {
+        reason: format!("{context} exceeds the 32-bit classic field capacity"),
+    })
 }
 
 fn require_usize(value: u64, context: &str) -> Result<usize> {

@@ -66,6 +66,15 @@ pub enum Error {
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
 
+    /// The supplied data does not match the declared shape/type. `context`
+    /// names what was being written (e.g. `dataset 'grid'`).
+    #[error("{context}: expected {expected} element(s), got {actual}")]
+    DataLengthMismatch {
+        context: String,
+        expected: usize,
+        actual: usize,
+    },
+
     #[error("unsupported write feature: {0}")]
     UnsupportedFeature(String),
 }
@@ -293,11 +302,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} string elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' string data"),
+                expected,
+                actual: values.len(),
+            });
         }
         let (datatype, raw_data) = encode_fixed_string_values(values)?;
         Ok(Self::new(name, datatype, shape).raw_data(raw_data))
@@ -312,11 +321,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} string elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' string data"),
+                expected,
+                actual: values.len(),
+            });
         }
 
         let mut strings = Vec::with_capacity(values.len());
@@ -363,11 +372,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} vlen sequence elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' vlen sequence data"),
+                expected,
+                actual: values.len(),
+            });
         }
         validate_vlen_sequence_base(&base)?;
         let base_size = datatype_element_size(&base)?;
@@ -441,10 +450,11 @@ impl DatasetBuilder {
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         let actual = std::mem::size_of_val(values);
         if actual != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} data bytes, got {actual}",
-                self.name
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{}' data (bytes)", self.name),
+                expected,
+                actual,
+            });
         }
 
         let mut bytes = Vec::with_capacity(actual);
@@ -872,11 +882,11 @@ impl AttributeBuilder {
         }
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         if self.raw_data.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "attribute '{}' expects {expected} data bytes, got {}",
-                self.name,
-                self.raw_data.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("attribute '{}' data (bytes)", self.name),
+                expected,
+                actual: self.raw_data.len(),
+            });
         }
         Ok(())
     }

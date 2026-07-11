@@ -74,3 +74,19 @@ fn rejects_fill_value_with_wrong_element_size() {
 
     assert!(err.to_string().contains("fill value byte length"));
 }
+
+#[test]
+fn wrong_length_data_returns_structured_mismatch() {
+    // Writing fewer values than the shape requires yields a matchable
+    // DataLengthMismatch, not an opaque string error. The numeric data path
+    // reports byte counts (6 elements * 4 bytes expected, 3 * 4 supplied).
+    let err = DatasetBuilder::typed_data("grid", vec![2, 3], &[0_i32, 1, 2]).unwrap_err();
+    assert!(matches!(
+        err,
+        hdf5_writer::Error::DataLengthMismatch {
+            expected: 24,
+            actual: 12,
+            ..
+        }
+    ));
+}

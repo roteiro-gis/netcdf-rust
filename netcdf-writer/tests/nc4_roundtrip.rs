@@ -1355,7 +1355,7 @@ fn rejects_nc4_classic_string_variable() {
         })
         .unwrap_err();
 
-    assert!(err.to_string().contains("requires NetCDF-4"));
+    assert!(matches!(err, netcdf_writer::Error::RequiresNetcdf4 { .. }));
 }
 
 #[test]
@@ -1373,7 +1373,7 @@ fn rejects_nc4_classic_group_paths() {
         })
         .unwrap_err();
 
-    assert!(err.to_string().contains("requires NetCDF-4"));
+    assert!(matches!(err, netcdf_writer::Error::RequiresNetcdf4 { .. }));
 }
 
 #[test]
@@ -1393,7 +1393,7 @@ fn rejects_nc4_classic_group_attributes() {
         })
         .unwrap_err();
 
-    assert!(err.to_string().contains("requires NetCDF-4"));
+    assert!(matches!(err, netcdf_writer::Error::RequiresNetcdf4 { .. }));
 }
 
 #[test]
