@@ -1573,7 +1573,7 @@ fn prepare_datasets(
                     dataset.name
                 )));
             }
-            let refs = placeholder_vlen_string_references(&dataset.name, values)?;
+            let refs = vlen_string_heap_references(&dataset.name, values, None)?;
             let raw_data = encode_vlen_heap_references(&refs, 0);
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
@@ -1616,7 +1616,7 @@ fn prepare_datasets(
             };
             validate_vlen_sequence_base(base)?;
             let base_size = datatype_element_size(base)?;
-            let refs = placeholder_vlen_sequence_references(&dataset.name, values, base_size)?;
+            let refs = vlen_sequence_heap_references(&dataset.name, values, base_size, None)?;
             let raw_data = encode_vlen_heap_references(&refs, 0);
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
@@ -2171,7 +2171,7 @@ fn plan_attribute(
 ) -> Result<PlannedAttribute> {
     attribute.validate()?;
     if let Some(values) = &attribute.vlen_string_values {
-        let refs = plan_vlen_string_heap_references(&attribute.name, values, heap_objects)?;
+        let refs = vlen_string_heap_references(&attribute.name, values, Some(heap_objects))?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -2193,7 +2193,7 @@ fn plan_attribute(
         validate_vlen_sequence_base(base)?;
         let base_size = datatype_element_size(base)?;
         let refs =
-            plan_vlen_sequence_heap_references(&attribute.name, values, base_size, heap_objects)?;
+            vlen_sequence_heap_references(&attribute.name, values, base_size, Some(heap_objects))?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -2280,7 +2280,7 @@ fn plan_dataset_vlen_values(
     heap_objects: &mut Vec<GlobalHeapObjectPlan>,
 ) -> Result<Option<Vec<VLenHeapReference>>> {
     if let Some(values) = dataset.vlen_string_values.as_ref() {
-        return plan_vlen_string_heap_references(&dataset.name, values, heap_objects).map(Some);
+        return vlen_string_heap_references(&dataset.name, values, Some(heap_objects)).map(Some);
     }
     if let Some(values) = dataset.vlen_sequence_values.as_ref() {
         let Datatype::VarLen {
@@ -2296,70 +2296,65 @@ fn plan_dataset_vlen_values(
         };
         validate_vlen_sequence_base(base)?;
         let base_size = datatype_element_size(base)?;
-        return plan_vlen_sequence_heap_references(&dataset.name, values, base_size, heap_objects)
+        return vlen_sequence_heap_references(&dataset.name, values, base_size, Some(heap_objects))
             .map(Some);
     }
     Ok(None)
 }
 
-fn plan_vlen_string_heap_references(
+/// Plan the global-heap references for variable-length string values.
+///
+/// With `heap_objects` present the strings are written to the heap and each
+/// reference points at its real index; with `None` only the sequence lengths
+/// are computed (the placeholder pass used for address sizing, heap index 0).
+fn vlen_string_heap_references(
     context: &str,
     values: &[String],
-    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+    mut heap_objects: Option<&mut Vec<GlobalHeapObjectPlan>>,
 ) -> Result<Vec<VLenHeapReference>> {
     let mut refs = Vec::with_capacity(values.len());
     for value in values {
-        let index = checked_heap_index(heap_objects.len() + 1)?;
-        let mut data = Vec::with_capacity(value.len() + 1);
-        data.extend_from_slice(value.as_bytes());
-        data.push(0);
-        let sequence_len = u32::try_from(data.len()).map_err(|_| {
-            Error::UnsupportedFeature(format!(
-                "'{context}' variable-length string exceeds u32 capacity"
-            ))
-        })?;
-        heap_objects.push(GlobalHeapObjectPlan {
-            index,
-            reference_count: 1,
-            data,
-        });
+        // The stored object is the string plus a NUL terminator.
+        let sequence_len = value
+            .len()
+            .checked_add(1)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "'{context}' variable-length string exceeds u32 capacity"
+                ))
+            })?;
+        let heap_index = match heap_objects.as_deref_mut() {
+            Some(heap) => {
+                let index = checked_heap_index(heap.len() + 1)?;
+                let mut data = Vec::with_capacity(value.len() + 1);
+                data.extend_from_slice(value.as_bytes());
+                data.push(0);
+                heap.push(GlobalHeapObjectPlan {
+                    index,
+                    reference_count: 1,
+                    data,
+                });
+                index
+            }
+            None => 0,
+        };
         refs.push(VLenHeapReference {
             sequence_len,
-            heap_index: index,
+            heap_index,
         });
     }
     Ok(refs)
 }
 
-fn placeholder_vlen_string_references(
-    context: &str,
-    values: &[String],
-) -> Result<Vec<VLenHeapReference>> {
-    values
-        .iter()
-        .map(|value| {
-            let sequence_len = value
-                .len()
-                .checked_add(1)
-                .and_then(|len| u32::try_from(len).ok())
-                .ok_or_else(|| {
-                    Error::UnsupportedFeature(format!(
-                        "'{context}' variable-length string exceeds u32 capacity"
-                    ))
-                })?;
-            Ok(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            })
-        })
-        .collect()
-}
-
-fn plan_vlen_sequence_heap_references(
+/// Plan the global-heap references for variable-length sequence values. As with
+/// [`vlen_string_heap_references`], `None` computes only sequence lengths.
+/// Empty sequences never occupy a heap object (index 0).
+fn vlen_sequence_heap_references(
     context: &str,
     values: &[Vec<u8>],
     base_size: usize,
-    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+    mut heap_objects: Option<&mut Vec<GlobalHeapObjectPlan>>,
 ) -> Result<Vec<VLenHeapReference>> {
     let mut refs = Vec::with_capacity(values.len());
     for value in values {
@@ -2374,52 +2369,24 @@ fn plan_vlen_sequence_heap_references(
                 "'{context}' variable-length sequence exceeds u32 element capacity"
             ))
         })?;
-        if sequence_len == 0 {
-            refs.push(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            });
-            continue;
-        }
-        let index = checked_heap_index(heap_objects.len() + 1)?;
-        heap_objects.push(GlobalHeapObjectPlan {
-            index,
-            reference_count: 1,
-            data: value.clone(),
-        });
+        let heap_index = match heap_objects.as_deref_mut() {
+            Some(heap) if sequence_len != 0 => {
+                let index = checked_heap_index(heap.len() + 1)?;
+                heap.push(GlobalHeapObjectPlan {
+                    index,
+                    reference_count: 1,
+                    data: value.clone(),
+                });
+                index
+            }
+            _ => 0,
+        };
         refs.push(VLenHeapReference {
             sequence_len,
-            heap_index: index,
+            heap_index,
         });
     }
     Ok(refs)
-}
-
-fn placeholder_vlen_sequence_references(
-    context: &str,
-    values: &[Vec<u8>],
-    base_size: usize,
-) -> Result<Vec<VLenHeapReference>> {
-    values
-        .iter()
-        .map(|value| {
-            if value.len() % base_size != 0 {
-                return Err(Error::InvalidDefinition(format!(
-                    "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
-                    value.len()
-                )));
-            }
-            let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
-                Error::UnsupportedFeature(format!(
-                    "'{context}' variable-length sequence exceeds u32 element capacity"
-                ))
-            })?;
-            Ok(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            })
-        })
-        .collect()
 }
 
 fn dataset_vlen_storage_data(
