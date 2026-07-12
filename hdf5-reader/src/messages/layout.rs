@@ -259,8 +259,10 @@ fn parse_chunk_indexing_v4_v5(
 ) -> Result<ChunkIndexing> {
     match index_type {
         1 => {
-            // Single chunk
-            let idx_flags = if (flags & 0x01) != 0 {
+            // Single chunk. Flag bit 1 ("single index with filter") marks the
+            // inline filtered-chunk size and filter mask; bit 0 is the
+            // unrelated "don't filter partial edge chunks" option.
+            let idx_flags = if (flags & 0x02) != 0 {
                 let filtered_size = cursor.read_u64_le()?;
                 let filter_mask = cursor.read_u32_le()?;
                 Some((filtered_size, filter_mask))

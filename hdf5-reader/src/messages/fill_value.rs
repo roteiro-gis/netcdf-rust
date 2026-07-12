@@ -91,8 +91,9 @@ fn parse_new_v3(cursor: &mut Cursor<'_>) -> Result<FillValueMessage> {
 
     let _alloc_time = flags & 0x03;
     let fill_time_bits = (flags >> 2) & 0x03;
-    let undefined = (flags & 0x20) != 0;
-    let defined = (flags & 0x10) != 0;
+    // Spec: flag bit 4 marks the fill value undefined, bit 5 marks it defined.
+    let undefined = (flags & 0x10) != 0;
+    let defined = (flags & 0x20) != 0;
 
     let fill_time = match fill_time_bits {
         0 => FillTime::IfSet,
@@ -173,7 +174,33 @@ mod tests {
     fn parse_new_v3_undefined() {
         let data = [
             0x03, // version 3
-            0x20, // flags: undefined bit set
+            0x10, // flags: undefined bit set
+        ];
+        let mut cursor = Cursor::new(&data);
+        let msg = parse_new(&mut cursor, 8, 8, data.len()).unwrap();
+        assert!(!msg.defined);
+        assert!(msg.value.is_none());
+    }
+
+    #[test]
+    fn parse_new_v3_defined() {
+        let mut data = vec![
+            0x03, // version 3
+            0x2A, // flags: late alloc, write if set, defined bit set
+        ];
+        data.extend_from_slice(&4u32.to_le_bytes());
+        data.extend_from_slice(&[0xAB; 4]);
+        let mut cursor = Cursor::new(&data);
+        let msg = parse_new(&mut cursor, 8, 8, data.len()).unwrap();
+        assert!(msg.defined);
+        assert_eq!(msg.value.unwrap(), vec![0xAB; 4]);
+    }
+
+    #[test]
+    fn parse_new_v3_default_fill_without_value() {
+        let data = [
+            0x03, // version 3
+            0x0B, // flags: incremental alloc, write if set, no defined bit
         ];
         let mut cursor = Cursor::new(&data);
         let msg = parse_new(&mut cursor, 8, 8, data.len()).unwrap();

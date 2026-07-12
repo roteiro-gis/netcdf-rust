@@ -455,6 +455,7 @@ dependencies = [
  "flate2",
  "hdf5-core",
  "hdf5-reader",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]
@@ -742,6 +743,8 @@ dependencies = [
  "hdf5-writer",
  "netcdf-core",
  "netcdf-reader",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

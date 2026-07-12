@@ -22,10 +22,12 @@ const LENGTH_SIZE: u8 = 8;
 const UNDEFINED_ADDRESS: u64 = u64::MAX;
 
 const MSG_DATASPACE: u8 = 0x01;
+const MSG_LINK_INFO: u8 = 0x02;
 const MSG_DATATYPE: u8 = 0x03;
 const MSG_FILL_VALUE: u8 = 0x05;
 const MSG_LINK: u8 = 0x06;
 const MSG_DATA_LAYOUT: u8 = 0x08;
+const MSG_GROUP_INFO: u8 = 0x0a;
 const MSG_FILTER_PIPELINE: u8 = 0x0b;
 const MSG_ATTRIBUTE: u8 = 0x0c;
 
@@ -1136,6 +1138,12 @@ impl PlannedAttribute {
 fn encode_vlen_heap_references(refs: &[VLenHeapReference], heap_address: u64) -> Vec<u8> {
     let mut raw_data = Vec::with_capacity(refs.len() * (4 + usize::from(OFFSET_SIZE) + 4));
     for reference in refs {
+        if reference.heap_index == 0 {
+            // Empty sequence: an all-zero reference, never dereferenced
+            // (index 0 is the collection's free-space object).
+            raw_data.resize(raw_data.len() + 4 + usize::from(OFFSET_SIZE) + 4, 0);
+            continue;
+        }
         raw_data.extend_from_slice(&reference.sequence_len.to_le_bytes());
         raw_data.extend_from_slice(&heap_address.to_le_bytes());
         raw_data.extend_from_slice(&(u32::from(reference.heap_index)).to_le_bytes());
@@ -1219,8 +1227,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     for prepared_dataset in &prepared {
         if let Some(chunk_index) = &prepared_dataset.chunk_index {
             let header_address = next_address;
-            let placeholder_header =
-                encode_fixed_array_chunk_index_header(fixed_array_entry_count(chunk_index)?, 0)?;
+            let placeholder_header = encode_fixed_array_chunk_index_header(
+                fixed_array_entry_count(chunk_index)?,
+                chunk_index.chunk_size_len,
+                0,
+            )?;
             next_address = align_u64(
                 checked_add_u64(
                     next_address,
@@ -1232,8 +1243,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
 
             let data_block_address = next_address;
             let placeholder_entries = fixed_array_entries(chunk_index, 0)?;
-            let placeholder_data_block =
-                encode_fixed_array_chunk_index_data_block(header_address, &placeholder_entries)?;
+            let placeholder_data_block = encode_fixed_array_chunk_index_data_block(
+                header_address,
+                &placeholder_entries,
+                chunk_index.chunk_size_len,
+            )?;
             next_address = align_u64(
                 checked_add_u64(
                     next_address,
@@ -1323,9 +1337,14 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
                 data_block_address: addresses.data_block,
                 header: encode_fixed_array_chunk_index_header(
                     fixed_array_entry_count(chunk_index)?,
+                    chunk_index.chunk_size_len,
                     addresses.data_block,
                 )?,
-                data_block: encode_fixed_array_chunk_index_data_block(addresses.header, &entries)?,
+                data_block: encode_fixed_array_chunk_index_data_block(
+                    addresses.header,
+                    &entries,
+                    chunk_index.chunk_size_len,
+                )?,
             })
         } else {
             None
@@ -1392,6 +1411,8 @@ struct PreparedDataset<'a> {
 #[derive(Debug)]
 struct PreparedChunkIndex {
     chunks: Vec<PreparedChunkIndexEntry>,
+    /// Byte width of the encoded chunk-size field in each entry.
+    chunk_size_len: u8,
 }
 
 #[derive(Debug)]
@@ -2205,6 +2226,9 @@ fn checked_heap_index(index: usize) -> Result<u16> {
     })
 }
 
+/// Smallest global heap collection libhdf5 accepts (H5HG_MINSIZE).
+const GLOBAL_HEAP_MIN_COLLECTION_SIZE: u64 = 4096;
+
 fn encode_global_heap_collection(objects: &[GlobalHeapObjectPlan]) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     for object in objects {
@@ -2216,15 +2240,26 @@ fn encode_global_heap_collection(objects: &[GlobalHeapObjectPlan]) -> Result<Vec
         let padded_len = align_u64(object.data.len() as u64, 8) as usize;
         body.resize(body.len() + (padded_len - object.data.len()), 0);
     }
-    body.extend_from_slice(&0u16.to_le_bytes());
 
-    let collection_size = checked_add_u64(16, body.len() as u64, "global heap size")?;
+    // Close the collection with the free-space object (index 0) covering the
+    // remaining bytes, its declared size including its own 16-byte header.
+    // libhdf5 also rejects collections below its 4096-byte floor.
+    let used = checked_add_u64(16, body.len() as u64, "global heap size")?;
+    let collection_size = align_u64(checked_add_u64(used, 16, "global heap free object end")?, 8)
+        .max(GLOBAL_HEAP_MIN_COLLECTION_SIZE);
+    let free_space = collection_size - used;
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&[0; 4]);
+    body.extend_from_slice(&free_space.to_le_bytes());
+
     let mut bytes = Vec::with_capacity(checked_usize(collection_size, "global heap size")?);
     bytes.extend_from_slice(b"GCOL");
     bytes.push(1);
     bytes.extend_from_slice(&[0, 0, 0]);
     bytes.extend_from_slice(&collection_size.to_le_bytes());
     bytes.extend_from_slice(&body);
+    bytes.resize(checked_usize(collection_size, "global heap size")?, 0);
     Ok(bytes)
 }
 
@@ -2260,7 +2295,19 @@ fn encode_group_header_from_links(
     attributes: &[PlannedAttribute],
     heap_address: u64,
 ) -> Result<Vec<u8>> {
-    let mut messages = encode_attribute_header_messages(attributes, heap_address)?;
+    // New-style groups must carry a Link Info message so readers can resolve
+    // the link storage style (libhdf5 rejects group headers without one).
+    let mut messages = vec![
+        HeaderMessage {
+            type_id: MSG_LINK_INFO,
+            payload: encode_link_info_message(),
+        },
+        HeaderMessage {
+            type_id: MSG_GROUP_INFO,
+            payload: encode_group_info_message(),
+        },
+    ];
+    messages.extend(encode_attribute_header_messages(attributes, heap_address)?);
     let link_messages: Result<Vec<_>> = links
         .iter()
         .map(|(name, address)| {
@@ -2272,6 +2319,23 @@ fn encode_group_header_from_links(
         .collect();
     messages.extend(link_messages?);
     encode_object_header_v2(&messages)
+}
+
+/// Link Info message: version 0, no creation-order tracking. Links are stored
+/// compactly in the header, so the fractal heap and name-index B-tree
+/// addresses are undefined.
+fn encode_link_info_message() -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(18);
+    bytes.push(0);
+    bytes.push(0);
+    bytes.extend_from_slice(&UNDEFINED_ADDRESS.to_le_bytes());
+    bytes.extend_from_slice(&UNDEFINED_ADDRESS.to_le_bytes());
+    bytes
+}
+
+/// Group Info message: version 0, default phase-change values and estimates.
+fn encode_group_info_message() -> Vec<u8> {
+    vec![0, 0]
 }
 
 fn encode_dataset_header(
@@ -2292,12 +2356,14 @@ fn encode_dataset_header(
         type_id: MSG_DATATYPE,
         payload: encode_datatype_message(&dataset.dataset.datatype)?,
     });
-    if let Some(fill_value) = &dataset.dataset.fill_value {
-        messages.push(HeaderMessage {
-            type_id: MSG_FILL_VALUE,
-            payload: encode_fill_value_message(fill_value)?,
-        });
-    }
+    let alloc_time = space_allocation_time(dataset);
+    messages.push(HeaderMessage {
+        type_id: MSG_FILL_VALUE,
+        payload: match &dataset.dataset.fill_value {
+            Some(fill_value) => encode_fill_value_message(fill_value, alloc_time)?,
+            None => encode_default_fill_value_message(alloc_time),
+        },
+    });
     if !dataset.filters.is_empty() {
         messages.push(HeaderMessage {
             type_id: MSG_FILTER_PIPELINE,
@@ -2324,16 +2390,53 @@ fn encode_data_layout_message(dataset: &PreparedDataset<'_>, data_address: u64) 
             dataset.data_size,
         )),
         PlannedLayout::Chunked { chunk_shape } => {
+            let element_size = chunk_element_size(&dataset.dataset.datatype)?;
             if dataset.filters.is_empty() {
-                encode_implicit_chunked_layout_message(storage_address, chunk_shape)
-            } else if dataset.chunk_index.is_some() {
-                encode_fixed_array_chunked_layout_message(storage_address, chunk_shape)
+                encode_implicit_chunked_layout_message(storage_address, chunk_shape, element_size)
+            } else if let Some(chunk_index) = &dataset.chunk_index {
+                let page_bits = fixed_array_page_bits(fixed_array_entry_count(chunk_index)?)?;
+                encode_fixed_array_chunked_layout_message(
+                    storage_address,
+                    chunk_shape,
+                    element_size,
+                    page_bits,
+                )
             } else {
-                encode_single_chunk_layout_message(storage_address, chunk_shape, dataset.data_size)
+                encode_single_chunk_layout_message(
+                    storage_address,
+                    chunk_shape,
+                    dataset.data_size,
+                    element_size,
+                )
             }
         }
         PlannedLayout::Compact => encode_compact_layout_message(&dataset.raw_data),
     }
+}
+
+/// Byte width of one dataset element as stored in chunked data, appended as
+/// the trailing chunk dimension in v3/v4 layout messages.
+fn chunk_element_size(datatype: &Datatype) -> Result<u32> {
+    let size = datatype_element_size(datatype)?;
+    u32::try_from(size).map_err(|_| {
+        Error::UnsupportedFeature("chunked element size exceeds layout message capacity".into())
+    })
+}
+
+/// Fixed-array data-block page size (log2). Readers reject 0, and any entry
+/// count above one page would require the paged data-block format the writer
+/// does not emit, so size the page to hold every entry.
+fn fixed_array_page_bits(num_entries: u64) -> Result<u8> {
+    let mut bits = 10u8;
+    while (1u64 << bits) < num_entries {
+        bits += 1;
+        if bits > 25 {
+            return Err(Error::UnsupportedFeature(
+                "fixed array chunk count exceeds the single-page data block limit".into(),
+            ));
+        }
+    }
+    Ok(bits)
 }
 
 fn encode_attribute_header_messages(
@@ -2464,16 +2567,19 @@ fn encode_datatype_message(datatype: &Datatype) -> Result<Vec<u8>> {
             Ok(bytes)
         }
         Datatype::FloatingPoint { size, byte_order } => {
-            let (exp_location, exp_size, mantissa_size, exp_bias) = match *size {
-                4 => (23u8, 8u8, 23u8, 127u32),
-                8 => (52u8, 11u8, 52u8, 1023u32),
+            let (exp_location, exp_size, mantissa_size, exp_bias, sign_location) = match *size {
+                4 => (23u8, 8u8, 23u8, 127u32, 31u32),
+                8 => (52u8, 11u8, 52u8, 1023u32, 63u32),
                 other => {
                     return Err(Error::UnsupportedFeature(format!(
                         "unsupported floating-point byte width {other}"
                     )))
                 }
             };
-            let flags = 0x20 | byte_order_flag(*byte_order);
+            // Class flags: byte order in bit 0, implied mantissa
+            // normalization in bits 4-5 (IEEE), and the sign-bit position in
+            // bits 8-15 (readers reject a sign bit overlapping the mantissa).
+            let flags = byte_order_flag(*byte_order) | 0x20 | (sign_location << 8);
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&class_word(1, 1, flags).to_le_bytes());
             bytes.extend_from_slice(&u32::from(*size).to_le_bytes());
@@ -2490,17 +2596,28 @@ fn encode_datatype_message(datatype: &Datatype) -> Result<Vec<u8>> {
             size,
             encoding,
             padding,
-        } => {
-            let size = match size {
-                StringSize::Fixed(size) => *size,
-                StringSize::Variable => 0,
-            };
-            let flags = string_padding_bits(*padding) | (string_encoding_bits(*encoding) << 4);
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&class_word(3, 1, flags).to_le_bytes());
-            bytes.extend_from_slice(&size.to_le_bytes());
-            Ok(bytes)
-        }
+        } => match size {
+            StringSize::Fixed(size) => {
+                let flags = string_padding_bits(*padding) | (string_encoding_bits(*encoding) << 4);
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&class_word(3, 1, flags).to_le_bytes());
+                bytes.extend_from_slice(&size.to_le_bytes());
+                Ok(bytes)
+            }
+            // A variable-length string is a class-9 (variable-length) datatype
+            // over the 1-byte fixed-point base libhdf5 uses; class 3 has no
+            // zero-size encoding.
+            StringSize::Variable => encode_datatype_message(&Datatype::VarLen {
+                base: Box::new(Datatype::FixedPoint {
+                    size: 1,
+                    signed: false,
+                    byte_order: ByteOrder::LittleEndian,
+                }),
+                kind: VarLenKind::String,
+                encoding: *encoding,
+                padding: *padding,
+            }),
+        },
         Datatype::Reference { ref_type, size } => {
             let flags = match ref_type {
                 hdf5_core::ReferenceType::Object => 0,
@@ -2741,16 +2858,48 @@ fn encode_compact_layout_message(data: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn encode_fill_value_message(fill_value: &[u8]) -> Result<Vec<u8>> {
+/// Space-allocation-time codes for the v3 fill value message.
+const ALLOC_TIME_EARLY: u8 = 1;
+const ALLOC_TIME_LATE: u8 = 2;
+const ALLOC_TIME_INCREMENTAL: u8 = 3;
+/// Fill-value-write-time "if set" (bits 2-3) shared by every emitted message.
+const FILL_WRITE_TIME_IFSET: u8 = 2 << 2;
+/// Flag bit 5: the message carries a defined fill value (size + data).
+const FILL_VALUE_DEFINED: u8 = 0x20;
+
+/// When the file's data for each layout is allocated. Implicit chunk indexes
+/// require early allocation (the writer materializes every chunk up front);
+/// libhdf5 pairs the other layouts with these defaults.
+fn space_allocation_time(dataset: &PreparedDataset<'_>) -> u8 {
+    match &dataset.dataset.layout {
+        PlannedLayout::Compact => ALLOC_TIME_EARLY,
+        PlannedLayout::Contiguous => ALLOC_TIME_LATE,
+        PlannedLayout::Chunked { .. } => {
+            if dataset.filters.is_empty() {
+                ALLOC_TIME_EARLY
+            } else {
+                ALLOC_TIME_INCREMENTAL
+            }
+        }
+    }
+}
+
+fn encode_fill_value_message(fill_value: &[u8], alloc_time: u8) -> Result<Vec<u8>> {
     let size = u32::try_from(fill_value.len()).map_err(|_| {
         Error::UnsupportedFeature("HDF5 fill value exceeds u32 byte length capacity".into())
     })?;
     let mut bytes = Vec::with_capacity(6 + fill_value.len());
     bytes.push(3);
-    bytes.push(0x10);
+    bytes.push(alloc_time | FILL_WRITE_TIME_IFSET | FILL_VALUE_DEFINED);
     bytes.extend_from_slice(&size.to_le_bytes());
     bytes.extend_from_slice(fill_value);
     Ok(bytes)
+}
+
+/// Fill value message for datasets without a user fill: allocation/write time
+/// only, no defined value (readers use the library default of all zeros).
+fn encode_default_fill_value_message(alloc_time: u8) -> Vec<u8> {
+    vec![3, alloc_time | FILL_WRITE_TIME_IFSET]
 }
 
 fn encode_filter_pipeline_message(filters: &[FilterDescription]) -> Result<Vec<u8>> {
@@ -2793,28 +2942,23 @@ fn encode_filter_pipeline_message(filters: &[FilterDescription]) -> Result<Vec<u
     Ok(bytes)
 }
 
+/// Flag bit 1 of a v4 chunked layout: the single-chunk index carries the
+/// filtered chunk size and filter mask inline.
+const V4_LAYOUT_SINGLE_INDEX_WITH_FILTER: u8 = 0x02;
+
 fn encode_single_chunk_layout_message(
     address: u64,
     chunk_shape: &[u64],
     filtered_size: u64,
+    element_size: u32,
 ) -> Result<Vec<u8>> {
-    if chunk_shape.len() > u8::MAX as usize {
-        return Err(Error::InvalidDefinition(
-            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(18 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    bytes.push(4);
-    bytes.push(2);
-    bytes.push(1);
-    bytes.push(chunk_shape.len() as u8);
-    bytes.push(4);
-    for &dim in chunk_shape {
-        let dim = u32::try_from(dim).map_err(|_| {
-            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
-        })?;
-        bytes.extend_from_slice(&dim.to_le_bytes());
-    }
+    let mut bytes = Vec::with_capacity(22 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    encode_v4_chunked_layout_preamble(
+        &mut bytes,
+        V4_LAYOUT_SINGLE_INDEX_WITH_FILTER,
+        chunk_shape,
+        element_size,
+    )?;
     bytes.push(1);
     bytes.extend_from_slice(&filtered_size.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
@@ -2822,65 +2966,87 @@ fn encode_single_chunk_layout_message(
     Ok(bytes)
 }
 
-fn encode_implicit_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> Result<Vec<u8>> {
-    if chunk_shape.len() > u8::MAX as usize {
+/// Write the v4 chunked layout preamble: version, class, flags, rank, and the
+/// chunk dimensions with the element size appended as the trailing dimension
+/// (readers validate that dimension against the datatype size).
+///
+/// Dimensions use the minimal byte width for the largest value; readers
+/// recompute that width from the decoded dimensions and reject a mismatch.
+fn encode_v4_chunked_layout_preamble(
+    bytes: &mut Vec<u8>,
+    flags: u8,
+    chunk_shape: &[u64],
+    element_size: u32,
+) -> Result<()> {
+    if chunk_shape.len() + 1 > u8::MAX as usize {
         return Err(Error::InvalidDefinition(
             "chunked dataset rank exceeds HDF5 rank field capacity".into(),
         ));
     }
-    let mut bytes = Vec::with_capacity(6 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    let max_dim = chunk_shape
+        .iter()
+        .copied()
+        .chain(std::iter::once(u64::from(element_size)))
+        .max()
+        .unwrap_or(1);
+    let dim_bytes = minimal_uint_width(max_dim);
     bytes.push(4);
     bytes.push(2);
-    bytes.push(0);
-    bytes.push(chunk_shape.len() as u8);
-    bytes.push(4);
+    bytes.push(flags);
+    bytes.push((chunk_shape.len() + 1) as u8);
+    bytes.push(dim_bytes);
     for &dim in chunk_shape {
-        let dim = u32::try_from(dim).map_err(|_| {
-            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
-        })?;
-        bytes.extend_from_slice(&dim.to_le_bytes());
+        write_uvar(dim, usize::from(dim_bytes), bytes);
     }
+    write_uvar(u64::from(element_size), usize::from(dim_bytes), bytes);
+    Ok(())
+}
+
+/// Minimal number of bytes needed to encode `value` (at least 1).
+fn minimal_uint_width(value: u64) -> u8 {
+    let bits = 64 - value.leading_zeros();
+    (bits.max(1)).div_ceil(8) as u8
+}
+
+fn encode_implicit_chunked_layout_message(
+    address: u64,
+    chunk_shape: &[u64],
+    element_size: u32,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(10 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    encode_v4_chunked_layout_preamble(&mut bytes, 0, chunk_shape, element_size)?;
     bytes.push(2);
     bytes.extend_from_slice(&address.to_le_bytes());
     Ok(bytes)
 }
 
-fn encode_fixed_array_chunked_layout_message(address: u64, chunk_shape: &[u64]) -> Result<Vec<u8>> {
-    if chunk_shape.len() > u8::MAX as usize {
-        return Err(Error::InvalidDefinition(
-            "chunked dataset rank exceeds HDF5 rank field capacity".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(7 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
-    bytes.push(4);
-    bytes.push(2);
-    bytes.push(1);
-    bytes.push(chunk_shape.len() as u8);
-    bytes.push(4);
-    for &dim in chunk_shape {
-        let dim = u32::try_from(dim).map_err(|_| {
-            Error::InvalidDefinition("chunk dimension exceeds HDF5 v4 layout capacity".into())
-        })?;
-        bytes.extend_from_slice(&dim.to_le_bytes());
-    }
+fn encode_fixed_array_chunked_layout_message(
+    address: u64,
+    chunk_shape: &[u64],
+    element_size: u32,
+    page_bits: u8,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(11 + chunk_shape.len() * 4 + usize::from(OFFSET_SIZE));
+    encode_v4_chunked_layout_preamble(&mut bytes, 0, chunk_shape, element_size)?;
     bytes.push(3);
-    bytes.push(0);
+    bytes.push(page_bits);
     bytes.extend_from_slice(&address.to_le_bytes());
     Ok(bytes)
 }
 
 fn encode_fixed_array_chunk_index_header(
     num_entries: u64,
+    chunk_size_len: u8,
     data_block_address: u64,
 ) -> Result<Vec<u8>> {
-    let entry_size = u8::try_from(usize::from(OFFSET_SIZE) + usize::from(LENGTH_SIZE) + 4)
+    let entry_size = u8::try_from(usize::from(OFFSET_SIZE) + usize::from(chunk_size_len) + 4)
         .map_err(|_| Error::UnsupportedFeature("fixed array entry size exceeds u8".into()))?;
     let mut bytes = Vec::with_capacity(4 + 1 + 1 + 1 + 1 + 8 + 8 + 4);
     bytes.extend_from_slice(b"FAHD");
     bytes.push(0);
     bytes.push(1);
     bytes.push(entry_size);
-    bytes.push(0);
+    bytes.push(fixed_array_page_bits(num_entries)?);
     bytes.extend_from_slice(&num_entries.to_le_bytes());
     bytes.extend_from_slice(&data_block_address.to_le_bytes());
     let checksum = jenkins_lookup3(&bytes);
@@ -2891,22 +3057,34 @@ fn encode_fixed_array_chunk_index_header(
 fn encode_fixed_array_chunk_index_data_block(
     header_address: u64,
     entries: &[FixedArrayChunkEntry],
+    chunk_size_len: u8,
 ) -> Result<Vec<u8>> {
-    let entry_size = usize::from(OFFSET_SIZE) + usize::from(LENGTH_SIZE) + 4;
+    let entry_size = usize::from(OFFSET_SIZE) + usize::from(chunk_size_len) + 4;
     let entries_len = checked_mul_usize(entries.len(), entry_size, "fixed array entries size")?;
     let capacity = checked_add_usize(
         4 + 1 + 1 + usize::from(OFFSET_SIZE),
         checked_add_usize(entries_len, 4, "fixed array data block size")?,
         "fixed array data block size",
     )?;
+    let size_limit = if chunk_size_len >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (8 * u32::from(chunk_size_len))) - 1
+    };
     let mut bytes = Vec::with_capacity(capacity);
     bytes.extend_from_slice(b"FADB");
     bytes.push(0);
     bytes.push(1);
     bytes.extend_from_slice(&header_address.to_le_bytes());
     for entry in entries {
+        if entry.size > size_limit {
+            return Err(Error::InvalidDefinition(format!(
+                "filtered chunk byte length {} exceeds the {chunk_size_len}-byte entry field",
+                entry.size
+            )));
+        }
         bytes.extend_from_slice(&entry.address.to_le_bytes());
-        bytes.extend_from_slice(&entry.size.to_le_bytes());
+        write_uvar(entry.size, usize::from(chunk_size_len), &mut bytes);
         bytes.extend_from_slice(&entry.filter_mask.to_le_bytes());
     }
     let checksum = jenkins_lookup3(&bytes);
@@ -3362,7 +3540,22 @@ fn filtered_chunk_storage_data(
         increment_row_major_index(&mut chunk_indices, &chunks_per_dim);
     }
 
-    Ok((storage, Some(PreparedChunkIndex { chunks: entries })))
+    Ok((
+        storage,
+        Some(PreparedChunkIndex {
+            chunks: entries,
+            chunk_size_len: fixed_array_chunk_size_len(chunk_bytes_u64),
+        }),
+    ))
+}
+
+/// Width of the encoded chunk-size field in filtered fixed-array entries.
+/// Mirrors libhdf5, which sizes the field from the nominal chunk byte size
+/// with one byte of headroom (filters can expand a chunk); readers derive the
+/// same width from the dataset properties rather than the stored entry size.
+fn fixed_array_chunk_size_len(chunk_bytes: u64) -> u8 {
+    let log2 = 63u32.saturating_sub(chunk_bytes.leading_zeros());
+    (1 + (log2 + 8) / 8).min(8) as u8
 }
 
 #[allow(clippy::too_many_arguments)]
