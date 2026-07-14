@@ -740,9 +740,16 @@ pub(crate) fn read_record_variable_into_from_storage<T: NcReadType>(
 
 /// Compute the record stride: total bytes per record across all record variables.
 ///
-/// Each record variable's per-record contribution is its `record_size` (already stored
-/// as vsize from the header), padded to 4-byte boundary.
+/// Each record variable's per-record contribution is its unpadded
+/// `record_size` (derived from its dimensions), padded to a 4-byte boundary —
+/// except in the spec's special case of exactly one record variable, whose
+/// records are packed without padding.
 pub fn compute_record_stride(variables: &[NcVariable]) -> Result<u64> {
+    let mut record_vars = variables.iter().filter(|v| v.is_record_var);
+    let (first, second) = (record_vars.next(), record_vars.next());
+    if let (Some(only), None) = (first, second) {
+        return Ok(only.record_size);
+    }
     variables
         .iter()
         .filter(|v| v.is_record_var)
@@ -1120,16 +1127,30 @@ mod tests {
 
     #[test]
     fn record_stride_rejects_padded_size_overflow() {
-        let vars = vec![NcVariable {
-            name: "huge".to_string(),
-            dimensions: vec![],
-            dtype: NcType::Byte,
-            attributes: vec![],
-            data_offset: 0,
-            _data_size: 0,
-            is_record_var: true,
-            record_size: u64::MAX,
-        }];
+        // Two record variables so per-variable padding applies (a lone
+        // record variable is packed without padding).
+        let vars = vec![
+            NcVariable {
+                name: "huge".to_string(),
+                dimensions: vec![],
+                dtype: NcType::Byte,
+                attributes: vec![],
+                data_offset: 0,
+                _data_size: 0,
+                is_record_var: true,
+                record_size: u64::MAX,
+            },
+            NcVariable {
+                name: "small".to_string(),
+                dimensions: vec![],
+                dtype: NcType::Byte,
+                attributes: vec![],
+                data_offset: 0,
+                _data_size: 0,
+                is_record_var: true,
+                record_size: 4,
+            },
+        ];
 
         let err = compute_record_stride(&vars).unwrap_err();
         assert!(matches!(err, Error::InvalidData(_)));

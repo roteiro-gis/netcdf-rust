@@ -1967,8 +1967,14 @@ impl NcFileBuilder {
 struct PlannedVar {
     def: VariableDef,
     is_record: bool,
-    vsize: u64,
-    padded_vsize: u64,
+    /// Header `vsize` field: the per-record (or fixed) byte size, always
+    /// rounded up to a multiple of 4 as the classic spec requires.
+    header_vsize: u64,
+    /// Bytes this variable actually occupies per record (or in total for
+    /// fixed variables) in the data layout. Equal to `header_vsize` except
+    /// for the spec's lone-record-variable case, where records are packed
+    /// without padding.
+    layout_vsize: u64,
     begin: u64,
     fixed_data_len: u64,
     record_slab_len: u64,
@@ -1976,7 +1982,6 @@ struct PlannedVar {
 
 #[derive(Debug, Clone)]
 struct ClassicWritePlan {
-    format: NcFormat,
     num_records: u64,
     header: Vec<u8>,
     fixed_vars: Vec<PlannedVar>,
@@ -1987,35 +1992,25 @@ impl ClassicWritePlan {
     fn build(builder: &NcFileBuilder, format: NcFormat) -> Result<Self> {
         builder.validate_for_format(format)?;
         let num_records = infer_num_records(builder)?;
-        let mut planned = plan_variables(builder, format, num_records, 0)?;
+        let mut planned = plan_variables(builder, 0)?;
         let header_without_offsets = encode_header(builder, format, num_records, &planned)?;
-        planned = plan_variables(
-            builder,
-            format,
-            num_records,
-            header_without_offsets.len() as u64,
-        )?;
+        planned = plan_variables(builder, header_without_offsets.len() as u64)?;
         let header = encode_header(builder, format, num_records, &planned)?;
-        let planned = plan_variables(builder, format, num_records, header.len() as u64)?;
+        let planned = plan_variables(builder, header.len() as u64)?;
         let header = encode_header(builder, format, num_records, &planned)?;
 
         if format == NcFormat::Classic {
             for var in &planned {
                 require_u32(var.begin, "CDF-1 variable offset")?;
-                require_u32(var.vsize, "CDF-1 variable size")?;
             }
         }
         if matches!(format, NcFormat::Classic | NcFormat::Offset64) {
-            for var in &planned {
-                require_u32(var.vsize, "CDF variable size")?;
-            }
             require_u32(num_records, "record count")?;
         }
 
         let fixed_vars = planned.iter().filter(|v| !v.is_record).cloned().collect();
         let record_vars = planned.iter().filter(|v| v.is_record).cloned().collect();
         Ok(Self {
-            format,
             num_records,
             header,
             fixed_vars,
@@ -2024,11 +2019,14 @@ impl ClassicWritePlan {
     }
 
     fn write(&self, writer: &mut impl Write) -> Result<()> {
-        let _ = self.format;
         writer.write_all(&self.header)?;
         for var in &self.fixed_vars {
             writer.write_all(&var.def.data)?;
-            write_zero_padding(writer, var.padded_vsize - var.fixed_data_len)?;
+            write_fill_padding(
+                writer,
+                var.layout_vsize - var.fixed_data_len,
+                &variable_fill_pattern(&var.def)?,
+            )?;
         }
         for record in 0..self.num_records {
             for var in &self.record_vars {
@@ -2039,19 +2037,27 @@ impl ClassicWritePlan {
                     Error::InvalidDefinition("record slab length exceeds platform usize".into())
                 })?;
                 writer.write_all(&var.def.data[start..start + slab_len])?;
-                write_zero_padding(writer, var.padded_vsize - var.record_slab_len)?;
+                write_fill_padding(
+                    writer,
+                    var.layout_vsize - var.record_slab_len,
+                    &variable_fill_pattern(&var.def)?,
+                )?;
             }
         }
         Ok(())
     }
 }
 
-fn plan_variables(
-    builder: &NcFileBuilder,
-    format: NcFormat,
-    num_records: u64,
-    data_start: u64,
-) -> Result<Vec<PlannedVar>> {
+/// The classic-encoded fill pattern used to pad a variable's data out to its
+/// padded size, matching netcdf-c (which fills the slack with fill values).
+fn variable_fill_pattern(def: &VariableDef) -> Result<Vec<u8>> {
+    match &def.fill_value {
+        Some(fill_value) => Ok(fill_value.classic_bytes.clone()),
+        None => default_classic_fill_bytes(&def.dtype),
+    }
+}
+
+fn plan_variables(builder: &NcFileBuilder, data_start: u64) -> Result<Vec<PlannedVar>> {
     let mut fixed_offset = data_start;
     let mut planned = Vec::with_capacity(builder.variables.len());
     for def in &builder.variables {
@@ -2072,20 +2078,31 @@ fn plan_variables(
         } else {
             fixed_data_len
         };
-        let padded_vsize = pad4_u64(vsize)?;
+        let header_vsize = pad4_u64(vsize)?;
         let begin = if is_record { 0 } else { fixed_offset };
         if !is_record {
-            fixed_offset = checked_add(fixed_offset, padded_vsize, "fixed data offset")?;
+            fixed_offset = checked_add(fixed_offset, header_vsize, "fixed data offset")?;
         }
         planned.push(PlannedVar {
             def: def.clone(),
             is_record,
-            vsize,
-            padded_vsize,
+            header_vsize,
+            layout_vsize: header_vsize,
             begin,
             fixed_data_len,
             record_slab_len,
         });
+    }
+
+    // The classic spec packs records without padding when the file has
+    // exactly one record variable; the header vsize stays padded.
+    let record_var_count = planned.iter().filter(|var| var.is_record).count();
+    if record_var_count == 1 {
+        for var in &mut planned {
+            if var.is_record {
+                var.layout_vsize = var.record_slab_len;
+            }
+        }
     }
 
     let record_data_start = fixed_offset;
@@ -2093,11 +2110,9 @@ fn plan_variables(
     for var in &mut planned {
         if var.is_record {
             var.begin = record_offset;
-            record_offset = checked_add(record_offset, var.padded_vsize, "record offset")?;
+            record_offset = checked_add(record_offset, var.layout_vsize, "record offset")?;
         }
     }
-    let _ = num_records;
-    let _ = format;
     Ok(planned)
 }
 
@@ -2189,7 +2204,16 @@ fn encode_variables(
                 ))
             })?,
         );
-        write_count(out, format, var.vsize)?;
+        // CDF-1/2 store vsize as a 32-bit field; the spec reserves 2^32 - 1
+        // as the marker for sizes that exceed it (readers recompute from the
+        // dimensions anyway).
+        let header_vsize = match format {
+            NcFormat::Classic | NcFormat::Offset64 if var.header_vsize > u64::from(u32::MAX) => {
+                u64::from(u32::MAX)
+            }
+            _ => var.header_vsize,
+        };
+        write_count(out, format, header_vsize)?;
         match format {
             NcFormat::Classic => write_u32(out, require_u32(var.begin, "CDF-1 begin")?),
             NcFormat::Offset64 | NcFormat::Cdf5 => write_u64(out, var.begin),
@@ -4077,13 +4101,21 @@ fn pad_vec_to_4(out: &mut Vec<u8>) {
     out.resize(out.len() + pad, 0);
 }
 
-fn write_zero_padding(writer: &mut impl Write, len: u64) -> Result<()> {
-    const ZEROS: [u8; 4] = [0; 4];
-    if len > 0 {
-        let len = usize::try_from(len)
-            .map_err(|_| Error::InvalidDefinition("padding exceeds platform usize".into()))?;
-        writer.write_all(&ZEROS[..len])?;
+/// Write up to 3 padding bytes, cycling the variable's fill pattern the way
+/// netcdf-c fills the slack between a value slab and its 4-byte boundary.
+fn write_fill_padding(writer: &mut impl Write, len: u64, fill_pattern: &[u8]) -> Result<()> {
+    if len == 0 {
+        return Ok(());
     }
+    let len = usize::try_from(len)
+        .map_err(|_| Error::InvalidDefinition("padding exceeds platform usize".into()))?;
+    let mut pad = [0u8; 4];
+    if !fill_pattern.is_empty() {
+        for (i, byte) in pad.iter_mut().enumerate().take(len.min(4)) {
+            *byte = fill_pattern[i % fill_pattern.len()];
+        }
+    }
+    writer.write_all(&pad[..len.min(4)])?;
     Ok(())
 }
 

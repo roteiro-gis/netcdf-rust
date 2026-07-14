@@ -495,10 +495,14 @@ fn parse_var_list(
         let nc_type_code = cur.read_u32_be()?;
         let dtype = nc_type_from_code(nc_type_code)?;
 
-        // vsize: the size of one record's worth of data for this variable,
-        // or the total size for non-record variables.
-        // 4 bytes for CDF-1/2, 8 bytes for CDF-5.
-        let vsize = cur.read_count(format)?;
+        // vsize: the padded size of one record's worth of data for this
+        // variable, or the padded total size for non-record variables.
+        // 4 bytes for CDF-1/2 (with 2^32 - 1 reserved as an overflow marker),
+        // 8 bytes for CDF-5. The field is redundant per the spec, so it is
+        // read for validation only; sizes are recomputed from the dimensions
+        // below, which also stays correct for writers that stored the
+        // unpadded value.
+        let _vsize = cur.read_count(format)?;
 
         // begin (data offset): 4 bytes for CDF-1, 8 bytes for CDF-2/5.
         let data_offset = match format {
@@ -507,12 +511,32 @@ fn parse_var_list(
             _ => unreachable!("classic parser only handles CDF-1/2/5"),
         };
 
-        // Compute record_size (the per-record slice size).
-        let record_size = if is_record_var { vsize } else { 0 };
-
-        // For non-record variables, data_size = vsize.
-        // For record variables, data_size = vsize * numrecs (computed at read time).
-        let data_size = if is_record_var { 0 } else { vsize };
+        // The unpadded per-record slab (record vars) or total byte size
+        // (fixed vars), derived from dimensions and element size.
+        let elem_size = dtype.size().map_err(|_| {
+            Error::InvalidData(format!(
+                "variable '{name}' has a type without a classic on-disk size"
+            ))
+        })? as u64;
+        let slab_bytes = var_dims
+            .iter()
+            .skip(usize::from(is_record_var))
+            .try_fold(1u64, |acc, dim| acc.checked_mul(dim.size))
+            .and_then(|elements| elements.checked_mul(elem_size));
+        let (record_size, data_size) = if is_record_var {
+            // A record variable whose single record overflows u64 cannot
+            // exist in any file.
+            let slab_bytes = slab_bytes.ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "record variable '{name}' per-record byte size overflows u64"
+                ))
+            })?;
+            (slab_bytes, 0)
+        } else {
+            // Huge fixed variables may overflow; full reads recompute the
+            // size and error, while metadata access and slicing still work.
+            (0, slab_bytes.unwrap_or(0))
+        };
 
         vars.push(NcVariable {
             name,
