@@ -91,6 +91,30 @@ def generate_hdf5_fixtures(base_dir):
         )
         f.create_dataset("records", data=data)
 
+    # ---- 6b. sohm_shared_attrs.h5 ----
+    # Tests: shared object header messages (SOHM). Identical attributes on a
+    # group and a dataset are stored once in the shared-message table and
+    # referenced from both object headers, exercising the SOHM resolver on both
+    # the dataset and group attribute paths. Only generated on h5py builds that
+    # expose the low-level shared-message-table configuration.
+    if hasattr(h5py.h5p.create(h5py.h5p.FILE_CREATE), "set_shared_mesg_nindexes"):
+        path = os.path.join(hdf5_dir, "sohm_shared_attrs.h5")
+        print(f"  Generating {path}")
+        fcpl = h5py.h5p.create(h5py.h5p.FILE_CREATE)
+        fcpl.set_shared_mesg_nindexes(1)
+        fcpl.set_shared_mesg_index(0, h5py.h5f.MESG_ATTR_FLAG, 1)
+        fapl = h5py.h5p.create(h5py.h5p.FILE_ACCESS)
+        fapl.set_libver_bounds(h5py.h5f.LIBVER_LATEST, h5py.h5f.LIBVER_LATEST)
+        file_id = h5py.h5f.create(path.encode(), h5py.h5f.ACC_TRUNC, fcpl=fcpl, fapl=fapl)
+        with h5py.File(file_id) as f:
+            shared_value = np.arange(4, dtype=np.int32)
+            grp = f.create_group("shared_group")
+            grp.attrs["shared_meta"] = shared_value
+            ds = f.create_dataset("shared_data", data=np.arange(6, dtype=np.int32))
+            ds.attrs["shared_meta"] = shared_value
+    else:
+        print("  Skipping sohm_shared_attrs.h5 (h5py lacks shared-message API)")
+
     # ---- 7. scalar_dataset.h5 ----
     # Tests: scalar (0-dimensional) datasets.
     path = os.path.join(hdf5_dir, "scalar_dataset.h5")

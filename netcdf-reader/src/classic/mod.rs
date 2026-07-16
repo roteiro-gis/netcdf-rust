@@ -14,7 +14,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::NcGroup;
 use crate::NcFormat;
 
@@ -125,6 +125,8 @@ fn finalize_header(
             &mut header.variables,
             header.numrecs,
         );
+    } else {
+        validate_record_extent(&header, storage_len)?;
     }
 
     let numrecs = header.numrecs;
@@ -137,6 +139,37 @@ fn finalize_header(
     };
 
     Ok((root_group, numrecs))
+}
+
+/// Reject headers whose declared record count cannot fit in the file, so a
+/// tiny crafted header cannot drive huge record-buffer allocations later.
+fn validate_record_extent(header: &header::ClassicHeader, storage_len: u64) -> Result<u64> {
+    let Some(record_data_start) = header
+        .variables
+        .iter()
+        .filter(|var| var.is_record_var)
+        .map(|var| var.data_offset)
+        .min()
+    else {
+        return Ok(0);
+    };
+
+    let record_stride = data::compute_record_stride(&header.variables)?;
+    let record_bytes = header
+        .numrecs
+        .checked_mul(record_stride)
+        .and_then(|bytes| bytes.checked_add(record_data_start))
+        .ok_or_else(|| {
+            Error::InvalidData("classic record data extent overflows u64".to_string())
+        })?;
+    if record_bytes > storage_len {
+        return Err(Error::InvalidData(format!(
+            "classic header declares {} records ({record_bytes} bytes) but the file has only \
+             {storage_len} bytes",
+            header.numrecs
+        )));
+    }
+    Ok(record_bytes)
 }
 
 fn infer_streaming_numrecs(header: &header::ClassicHeader, storage_len: u64) -> Result<u64> {

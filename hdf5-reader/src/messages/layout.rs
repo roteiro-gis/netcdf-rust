@@ -221,7 +221,11 @@ fn parse_v4_v5_chunked(
 
     let mut dims = Vec::with_capacity(ndims_raw);
     for _ in 0..ndims_raw {
-        dims.push(cursor.read_uvar(dim_bytes)? as u32);
+        let dim = cursor.read_uvar(dim_bytes)?;
+        let dim = u32::try_from(dim).map_err(|_| {
+            Error::InvalidData(format!("chunk dimension {dim} exceeds u32 capacity"))
+        })?;
+        dims.push(dim);
     }
 
     let index_type = cursor.read_u8()?;

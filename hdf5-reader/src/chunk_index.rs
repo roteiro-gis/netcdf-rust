@@ -195,6 +195,7 @@ pub fn collect_implicit_chunk_entries(
     chunk_dims: &[u32],
     elem_size: usize,
     chunk_bounds: Option<(&[u64], &[u64])>,
+    storage_len: u64,
 ) -> Result<Vec<ChunkEntry>> {
     let ndim = dataset_shape.len();
     if chunk_dims.len() != ndim {
@@ -260,6 +261,20 @@ pub fn collect_implicit_chunk_entries(
     let total_selected_chunks = chunk_counts.iter().try_fold(1u64, |acc, &count| {
         checked_mul_u64(acc, count, "implicit selected chunk count")
     })?;
+    // An implicit index stores its chunks contiguously and unfiltered, so the
+    // total chunk data cannot exceed the file. Reject a declared chunk count
+    // whose data would not fit before pre-allocating the entry vector, so a
+    // tiny file cannot declare billions of chunks.
+    if chunk_bytes > 0 {
+        let max_chunks = storage_len / chunk_bytes;
+        if total_selected_chunks > max_chunks.saturating_add(1) {
+            return Err(Error::InvalidData(format!(
+                "implicit index declares {total_selected_chunks} chunks ({} bytes each) but the \
+                 file has only {storage_len} bytes",
+                chunk_bytes
+            )));
+        }
+    }
     let mut entries = Vec::with_capacity(checked_usize(
         total_selected_chunks,
         "implicit selected chunk count",
@@ -345,7 +360,8 @@ mod tests {
 
     #[test]
     fn implicit_chunk_entries() {
-        let entries = collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None).unwrap();
+        let entries =
+            collect_implicit_chunk_entries(1000, &[10, 20], &[5, 10], 4, None, u64::MAX).unwrap();
         // 2 chunks along dim 0, 2 chunks along dim 1 = 4 total
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].address, 1000);
@@ -358,22 +374,43 @@ mod tests {
 
     #[test]
     fn implicit_chunk_entries_empty_extent() {
-        let entries = collect_implicit_chunk_entries(1000, &[0, 20], &[5, 10], 4, None).unwrap();
+        let entries =
+            collect_implicit_chunk_entries(1000, &[0, 20], &[5, 10], 4, None, u64::MAX).unwrap();
         assert!(entries.is_empty());
     }
 
     #[test]
     fn implicit_chunk_entries_reject_chunk_byte_overflow() {
-        let err = collect_implicit_chunk_entries(1000, &[10, 10], &[u32::MAX, u32::MAX], 2, None)
-            .unwrap_err();
+        let err = collect_implicit_chunk_entries(
+            1000,
+            &[10, 10],
+            &[u32::MAX, u32::MAX],
+            2,
+            None,
+            u64::MAX,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("implicit chunk byte size"));
     }
 
     #[test]
     fn implicit_chunk_entries_reject_address_overflow() {
-        let err = collect_implicit_chunk_entries(u64::MAX, &[2], &[1], 1, Some((&[1], &[1])))
-            .unwrap_err();
+        let err =
+            collect_implicit_chunk_entries(u64::MAX, &[2], &[1], 1, Some((&[1], &[1])), u64::MAX)
+                .unwrap_err();
         assert!(err.to_string().contains("implicit chunk address"));
+    }
+
+    #[test]
+    fn implicit_chunk_entries_reject_declared_count_beyond_file() {
+        // 2^32 chunks of 4 bytes each declared in a 1 KiB file must be
+        // rejected before the entry vector is allocated.
+        let err = collect_implicit_chunk_entries(1000, &[1u64 << 34, 1], &[4, 1], 1, None, 1024)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("file has only"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

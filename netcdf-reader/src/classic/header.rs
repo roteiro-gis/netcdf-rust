@@ -347,6 +347,14 @@ fn read_attr_values(
         Error::InvalidData("classic attribute byte count exceeds platform usize".to_string())
     })?;
     let padded = checked_pad_to_4(raw_bytes, "classic attribute byte count")?;
+    // Bound the declared value count by the bytes actually present before any
+    // arm allocates; a tiny crafted header must not force a huge allocation.
+    if padded > cur.remaining() {
+        return Err(Error::InvalidData(format!(
+            "classic attribute claims {padded} bytes but only {} remain",
+            cur.remaining()
+        )));
+    }
 
     match typ {
         NcType::Byte => {
