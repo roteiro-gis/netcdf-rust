@@ -48,6 +48,16 @@ jobs:
       - name: Check workspace
         run: rustup run 1.81.0 cargo check --workspace --all-features --locked
 
+      # Run the library unit tests on the MSRV toolchain for the crates that
+      # have no dev-dependencies, so no transitive test-only crate can pull the
+      # MSRV floor above 1.81. Every crate's library is still compile-checked on
+      # the MSRV toolchain by the workspace check above; only the unit-test
+      # execution is limited here, because the reader/writer crates' test-only
+      # dependencies (proptest, tempfile, criterion, the C libnetcdf) pull in
+      # transitive crates that require a newer Rust edition than 1.81.
+      - name: Test core crates on MSRV
+        run: rustup run 1.81.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
+
   no-default-features:
     name: Test without default features
     runs-on: ubuntu-24.04
@@ -125,6 +135,10 @@ jobs:
       - name: Run chunked read fuzz check under ASan
         working-directory: hdf5-reader
         run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_hdf5_chunked_reads --sanitizer address -- -runs=256
+
+      - name: Run classic NetCDF parser fuzz check under ASan
+        working-directory: netcdf-reader
+        run: rustup run nightly-2026-06-02 cargo fuzz run fuzz_netcdf_from_bytes --sanitizer address -- -runs=256
 
   fixtures:
     name: Integration tests with fixtures

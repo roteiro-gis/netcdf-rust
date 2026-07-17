@@ -474,8 +474,10 @@ fn parse_var_list(
     for _ in 0..nelems {
         let name = cur.read_name(format)?;
 
-        // Number of dimensions for this variable.
-        let ndims = checked_usize_from_u64(cur.read_count(format)?, "variable dimension count")?;
+        // Number of dimensions for this variable. Each dimension id is a
+        // NON_NEG value (at least 4 bytes), so bound the count by the bytes
+        // remaining before allocating.
+        let ndims = read_list_count(cur, format, 4, "variable dimension count")?;
 
         // Dimension IDs are NON_NEG values and widen to 64 bits in CDF-5.
         let mut var_dims = Vec::with_capacity(ndims);

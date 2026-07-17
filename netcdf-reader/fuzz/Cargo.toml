@@ -1,0 +1,22 @@
+[package]
+name = "netcdf-reader-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+netcdf-reader = { path = ".." }
+ndarray = "0.17"
+
+[[bin]]
+name = "fuzz_netcdf_from_bytes"
+path = "fuzz_targets/fuzz_netcdf_from_bytes.rs"
+test = false
+doc = false
+bench = false
