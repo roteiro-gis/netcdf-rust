@@ -7,6 +7,11 @@ use hdf5_writer::{
     WriteOptions, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, UNLIMITED,
 };
 
+/// Whether the encoded file contains a 4-byte block signature (e.g. `BTHD`).
+fn contains_signature(bytes: &[u8], signature: &[u8; 4]) -> bool {
+    bytes.windows(4).any(|window| window == signature)
+}
+
 #[test]
 fn writes_contiguous_f32_dataset_readable_by_hdf5_reader() {
     let values = [1.25_f32, 2.5, 3.75, 4.5, 5.25, 6.5];
@@ -614,11 +619,55 @@ fn writes_resizable_chunked_dataspace() {
         .unwrap();
     let bytes = cursor.into_inner();
 
+    // Unlimited maximum dimensions require a version-2 B-tree chunk index
+    // (the implicit index is only valid for fixed max dims).
+    assert!(
+        contains_signature(&bytes, b"BTHD") && contains_signature(&bytes, b"BTLF"),
+        "resizable dataset should use a v2 B-tree chunk index"
+    );
+
     let file = Hdf5File::from_bytes(&bytes).unwrap();
     let dataset = file.dataset("/stream").unwrap();
     assert_eq!(dataset.shape(), &[3, 5]);
     assert_eq!(dataset.max_dims().unwrap(), &[UNLIMITED, 5]);
     assert_eq!(dataset.chunks().unwrap(), vec![2, 3]);
+    let array = dataset.read_array::<i32>().unwrap();
+    assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
+}
+
+#[test]
+fn writes_resizable_filtered_chunked_dataspace_with_btree_index() {
+    let values = (0_i32..24).collect::<Vec<_>>();
+    let plan = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::typed_data("stream", vec![4, 6], &values)
+                .unwrap()
+                .chunked(vec![2, 3])
+                .max_shape(vec![UNLIMITED, 6])
+                .filter(FilterDescription {
+                    id: FILTER_DEFLATE,
+                    name: None,
+                    client_data: vec![6],
+                }),
+        )
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    // Filtered unlimited datasets use a filtered (type-11) v2 B-tree index.
+    assert!(
+        contains_signature(&bytes, b"BTHD") && contains_signature(&bytes, b"BTLF"),
+        "filtered resizable dataset should use a v2 B-tree chunk index"
+    );
+    assert!(!contains_signature(&bytes, b"FAHD"));
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let dataset = file.dataset("/stream").unwrap();
+    assert_eq!(dataset.max_dims().unwrap(), &[UNLIMITED, 6]);
     let array = dataset.read_array::<i32>().unwrap();
     assert_eq!(array.as_slice_memory_order().unwrap(), values.as_slice());
 }
@@ -1102,6 +1151,47 @@ fn writes_vlen_object_reference_attribute_backed_by_global_heap() {
     )
     .unwrap();
     assert_eq!(refs, vec![scale.address()]);
+}
+
+#[test]
+fn writes_object_reference_list_attribute() {
+    // A dimension-scale REFERENCE_LIST: an inline compound of
+    // {object reference, dimension index} pointing back at referencing
+    // datasets, resolved to object addresses at write time.
+    let scale = DatasetBuilder::typed_data("x", vec![3], &[0_i32, 0, 0])
+        .unwrap()
+        .attribute(AttributeBuilder::fixed_string("CLASS", "DIMENSION_SCALE"))
+        .attribute(AttributeBuilder::object_reference_list(
+            "REFERENCE_LIST",
+            vec![("temp".to_string(), 1)],
+        ));
+    let data =
+        DatasetBuilder::typed_data("temp", vec![2, 3], &(0_i32..6).collect::<Vec<_>>()).unwrap();
+    let plan = Hdf5Builder::new()
+        .dataset(scale)
+        .dataset(data)
+        .into_plan()
+        .unwrap();
+
+    let cursor = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+        .finish(plan)
+        .unwrap();
+    let bytes = cursor.into_inner();
+
+    let file = Hdf5File::from_bytes(&bytes).unwrap();
+    let temp = file.dataset("/temp").unwrap();
+    let attr = file
+        .dataset("/x")
+        .unwrap()
+        .attribute("REFERENCE_LIST")
+        .unwrap();
+    assert_eq!(attr.shape, vec![1]);
+    assert_eq!(attr.raw_data.len(), 16);
+    // Entry: object reference (8 bytes) then dimension index (u32) at offset 8.
+    let reference = u64::from_le_bytes(attr.raw_data[0..8].try_into().unwrap());
+    let dimension = u32::from_le_bytes(attr.raw_data[8..12].try_into().unwrap());
+    assert_eq!(reference, temp.address());
+    assert_eq!(dimension, 1);
 }
 
 #[test]

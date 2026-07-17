@@ -1348,6 +1348,9 @@ impl NcFileBuilder {
                     H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id as i32)
                         .map_err(hdf5_error_to_unsupported)?,
                 );
+            if let Some(reference_list) = self.reference_list_attribute(DimensionId(dim_id))? {
+                dataset = dataset.attribute(reference_list);
+            }
             if dimension.is_unlimited {
                 dataset = dataset
                     .max_shape(vec![H5_UNLIMITED])
@@ -1436,6 +1439,9 @@ impl NcFileBuilder {
                         H5AttributeBuilder::scalar("_Netcdf4Dimid", dim_id.0 as i32)
                             .map_err(hdf5_error_to_unsupported)?,
                     );
+                if let Some(reference_list) = self.reference_list_attribute(dim_id)? {
+                    dataset = dataset.attribute(reference_list);
+                }
             } else if variable.dim_ids.is_empty() {
                 dataset = dataset.attribute(empty_dimension_list_attribute());
             } else {
@@ -1493,6 +1499,31 @@ impl NcFileBuilder {
         self.variables.iter().find(|variable| {
             variable.name == dim.name && variable.dim_ids.as_slice() == [dimension]
         })
+    }
+
+    /// Build the `REFERENCE_LIST` back-reference attribute for a dimension
+    /// scale: one entry per (variable, dimension position) that references the
+    /// dimension, excluding the scale's own coordinate variable. Returns `None`
+    /// when no data variable references the dimension (netcdf-c omits the
+    /// attribute in that case).
+    #[cfg(feature = "netcdf4")]
+    fn reference_list_attribute(&self, dim_id: DimensionId) -> Result<Option<H5AttributeBuilder>> {
+        let dim_name = &self.dimensions[dim_id.0].name;
+        let mut entries = Vec::new();
+        for variable in &self.variables {
+            let is_scale_itself =
+                variable.name == *dim_name && variable.dim_ids.as_slice() == [dim_id];
+            if is_scale_itself {
+                continue;
+            }
+            for (position, vid) in variable.dim_ids.iter().enumerate() {
+                if *vid == dim_id {
+                    entries.push((variable.name.clone(), position as u32));
+                }
+            }
+        }
+        Ok((!entries.is_empty())
+            .then(|| H5AttributeBuilder::object_reference_list("REFERENCE_LIST", entries)))
     }
 
     #[cfg(feature = "netcdf4")]
@@ -2050,6 +2081,20 @@ impl ClassicWritePlan {
 
 /// The classic-encoded fill pattern used to pad a variable's data out to its
 /// padded size, matching netcdf-c (which fills the slack with fill values).
+/// The HDF5-native (little-endian) fill pattern used to initialize gaps when a
+/// native-encoded variable buffer is created or grown, mirroring netcdf-c. An
+/// explicit fill value wins; otherwise primitive types use their default fill
+/// and user-defined types (which have no primitive default) use zeros.
+fn native_fill_pattern(def: &VariableDef, elem_size: usize) -> Result<Vec<u8>> {
+    if let Some(fill_value) = &def.fill_value {
+        return Ok(fill_value.hdf5_bytes.clone());
+    }
+    match default_classic_fill_bytes(&def.dtype) {
+        Ok(classic) => convert_classic_be_data_to_hdf5_le(&def.dtype, &classic),
+        Err(_) => Ok(vec![0; elem_size]),
+    }
+}
+
 fn variable_fill_pattern(def: &VariableDef) -> Result<Vec<u8>> {
     match &def.fill_value {
         Some(fill_value) => Ok(fill_value.classic_bytes.clone()),
@@ -2815,10 +2860,10 @@ fn ensure_variable_native_slice_buffer(
         elem_size,
         "native variable byte size",
     )?;
+    let fill_pattern = native_fill_pattern(variable, elem_size)?;
     if variable.data.is_empty() {
-        variable.data = vec![0; expected];
+        variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
     } else if variable.data.len() < expected && can_grow {
-        let fill_pattern = vec![0; elem_size];
         resize_variable_data(
             &mut variable.data,
             old_shape,
