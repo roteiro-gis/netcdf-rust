@@ -123,15 +123,27 @@ def check_attributes(path, owner, expected_attrs, read_attr):
 def check_values(path, owner, spec, data):
     """Compare dataset/variable payload against the manifest spec."""
     if "values" in spec:
-        expected = np.asarray(spec["values"])
         actual = np.asarray(data)
         if actual.dtype.kind == "S":
             fail(path, f"{owner}: expected numeric data, got bytes", spec["values"], actual)
             return
-        expected = expected.astype(actual.dtype).ravel()
         actual = actual.ravel()
-        if expected.shape != actual.shape or not np.array_equal(expected, actual, equal_nan=actual.dtype.kind == "f"):
-            fail(path, f"{owner}: data mismatch", expected.tolist(), actual.tolist())
+        if actual.dtype.kind in ("i", "u"):
+            # Compare integers as Python ints. Building the expected array by
+            # inferring a dtype first (which yields float64 for large values)
+            # and casting to the actual dtype cannot represent the full 64-bit
+            # range exactly, so u64::MAX would round to 0 -- and NumPy changed
+            # that out-of-range cast behaviour between releases.
+            actual_list = [int(v) for v in actual.tolist()]
+            expected_list = [int(v) for v in spec["values"]]
+            if expected_list != actual_list:
+                fail(path, f"{owner}: data mismatch", expected_list, actual_list)
+        else:
+            expected = np.asarray(spec["values"], dtype=actual.dtype).ravel()
+            if expected.shape != actual.shape or not np.array_equal(
+                expected, actual, equal_nan=True
+            ):
+                fail(path, f"{owner}: data mismatch", expected.tolist(), actual.tolist())
     elif "strings" in spec:
         actual = [v.decode("utf-8") if isinstance(v, bytes) else str(v) for v in np.asarray(data, dtype=object).ravel()]
         if actual != spec["strings"]:

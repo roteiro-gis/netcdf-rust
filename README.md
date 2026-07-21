@@ -5,18 +5,49 @@
 [![netcdf-reader crates.io](https://img.shields.io/crates/v/netcdf-reader.svg)](https://crates.io/crates/netcdf-reader)
 [![netcdf-reader docs.rs](https://docs.rs/netcdf-reader/badge.svg)](https://docs.rs/netcdf-reader)
 
-Pure-Rust, read-only decoders for HDF5 and NetCDF. The published library dependency graph has no C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
+Pure-Rust readers and writers for HDF5 and NetCDF. The published library dependency graph has no C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
 
 Reference tests, benchmarks, fixture generators, and fuzz targets may use native
 tooling such as NetCDF-C/HDF5 through dev-only dependencies. Those paths are not
-part of the library runtime dependency graph.
+part of the library runtime dependency graph. Writer output is validated against
+the reference C libraries (libhdf5 via h5py, netcdf-c via netCDF4-python) in
+addition to round-tripping through the sibling reader crates.
 
 ## Crates
 
 | Crate | Description |
 |---|---|
+| `hdf5-core` | Shared HDF5 format model and checksums (Jenkins lookup3, Fletcher-32) |
 | `hdf5-reader` | Low-level HDF5 decoder (superblock, object headers, B-trees, chunked I/O, filters) |
+| `hdf5-writer` | HDF5 encoder (contiguous/compact/chunked layouts, groups, attributes, filters, datatypes) |
+| `netcdf-core` | Shared NetCDF data model (types, attributes, dimensions, variables) |
 | `netcdf-reader` | NetCDF reader supporting CDF-1/2/5 classic and NetCDF-4 (HDF5-backed) formats |
+| `netcdf-writer` | NetCDF writer for CDF-1/2/5 classic and NetCDF-4 (HDF5-backed) formats |
+
+## Feature support
+
+| Feature | Read | Write |
+|---|---|---|
+| Classic CDF-1 / CDF-2 / CDF-5 | ✓ | ✓ |
+| NetCDF-4 (HDF5-backed) | ✓ | ✓ |
+| Chunked layouts (incl. unlimited dims) | ✓ | ✓ |
+| Filters: deflate, shuffle, fletcher32 | ✓ | ✓ |
+| Filters: lz4, nbit, scaleoffset | ✓ | — |
+| Compound / enum / opaque / array / vlen / string datatypes | ✓ | ✓ |
+| Dimension scales (`DIMENSION_LIST` + `REFERENCE_LIST`) | ✓ | ✓ |
+| CF conventions (unpack, mask, calendars) | ✓ | n/a |
+| szip filter, virtual datasets | — | — |
+
+The minimum supported Rust version is 1.81. Reads are hardened against malformed
+input: bounds-checked cursors, cycle detection in B-tree/heap/object-header
+traversals, recursion-depth limits, and file-size-bounded allocation. The reader
+crates are exercised by a corpus/property/fuzz suite in addition to
+reference-oracle tests against the C libraries.
+
+Not yet supported (contributions welcome): writing the szip / lz4 / nbit /
+scaleoffset filters; typed compound-value writing; appending to or updating an
+existing file in place; HDF5 virtual datasets; and object-header messages larger
+than 64 KiB.
 
 ## Usage
 
@@ -98,6 +129,37 @@ let slice: ndarray::ArrayD<f64> = ds.read_slice(&sel)?;
 // String datasets
 let labels = file.dataset("/labels")?.read_strings()?;
 ```
+
+### Writing
+
+`netcdf-writer` builds a file from dimensions, variables, and attributes and
+serializes it to any classic or NetCDF-4 format:
+
+```rust
+use netcdf_writer::{NcAttrValue, NcFileBuilder, NcWriteOptions};
+
+let mut builder = NcFileBuilder::new();
+let time = builder.add_unlimited_dimension("time")?;
+let x = builder.add_dimension("x", 3)?;
+
+builder.add_attribute("title", NcAttrValue::Chars("example".into()))?;
+
+let temp = builder.add_variable::<f32>("temp", &[time, x])?;
+builder.add_variable_attribute(temp, "units", NcAttrValue::Chars("K".into()))?;
+builder.write_variable(temp, &[280.0_f32, 281.0, 282.0, 283.0, 284.0, 285.0])?;
+
+// AutoClassic picks CDF-1/2/5 from the schema; other options force a format.
+let (_format, bytes) = builder.to_vec(NcWriteOptions::default())?;
+std::fs::write("out.nc", bytes)?;
+
+// NetCDF-4 (HDF5-backed) output:
+use netcdf_writer::NcWriteFormat;
+let (_format, nc4_bytes) =
+    builder.to_vec(NcWriteOptions { format: NcWriteFormat::Nc4 })?;
+```
+
+`hdf5-writer` offers the same for raw HDF5 via `Hdf5Builder` / `DatasetBuilder`
+/ `AttributeBuilder`.
 
 ## Features
 

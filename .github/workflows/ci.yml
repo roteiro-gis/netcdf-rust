@@ -73,6 +73,9 @@ jobs:
       - name: Test netcdf-reader no defaults
         run: cargo test -p netcdf-reader --no-default-features --locked
 
+      - name: Test netcdf-reader classic-only parallel reads
+        run: cargo test -p netcdf-reader --no-default-features --features rayon --locked
+
   cf-feature:
     name: Test CF feature
     runs-on: ubuntu-24.04
@@ -158,6 +161,25 @@ jobs:
 
       - name: Test with fixtures
         run: cargo test --workspace --locked
+
+  writer-validation:
+    name: Writer output validation against reference libraries
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.91.0 --profile minimal --component rustfmt,clippy --no-self-update
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install reference libraries
+        run: python -m pip install --disable-pip-version-check h5py netCDF4 numpy
+
+      - name: Validate writer output against libhdf5 and netcdf-c
+        run: scripts/validate-writer-output.sh
 
   bench-regression-check:
     name: Benchmark regression CI check

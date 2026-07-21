@@ -6,14 +6,13 @@
 //! represent losslessly.
 
 #[cfg(feature = "netcdf4")]
-use std::io::Cursor as IoCursor;
 use std::io::Write;
 
 #[cfg(feature = "netcdf4")]
 use hdf5_writer::{
     AttributeBuilder as H5AttributeBuilder, ByteOrder as H5ByteOrder,
     CompoundField as H5CompoundField, DatasetBuilder as H5DatasetBuilder, Datatype as H5Datatype,
-    EnumMember as H5EnumMember, FilterDescription as H5FilterDescription, Hdf5Builder, Hdf5Writer,
+    EnumMember as H5EnumMember, FilterDescription as H5FilterDescription, Hdf5Builder,
     ReferenceType as H5ReferenceType, StringEncoding as H5StringEncoding,
     StringPadding as H5StringPadding, StringSize as H5StringSize, VarLenKind as H5VarLenKind,
     WriteOptions as H5WriteOptions, FILTER_DEFLATE as H5_FILTER_DEFLATE,
@@ -50,6 +49,18 @@ pub enum Error {
 
     #[error("data length mismatch: expected {expected}, got {actual}")]
     DataLengthMismatch { expected: usize, actual: usize },
+
+    /// The schema needs the NetCDF-4 data model (e.g. a type, name, or
+    /// structure the requested classic format cannot represent). Callers can
+    /// match on this and retry with [`NcWriteFormat::Nc4`].
+    #[error("requires the NetCDF-4 data model: {reason}")]
+    RequiresNetcdf4 { reason: String },
+
+    /// A value exceeds the capacity of the requested classic format (for
+    /// example a 32-bit offset or size field). Callers can match on this and
+    /// retry with a larger classic format such as CDF-5.
+    #[error("exceeds the capacity of the requested classic format: {reason}")]
+    FormatCapacityExceeded { reason: String },
 
     #[error("unsupported write feature: {0}")]
     UnsupportedFeature(String),
@@ -1254,10 +1265,12 @@ impl NcFileBuilder {
     fn write_nc4(&self, writer: &mut impl Write, format: NcFormat) -> Result<NcFormat> {
         self.validate_for_nc4_bridge(format)?;
         let hdf5_plan = self.build_hdf5_plan(format)?;
-        let cursor = Hdf5Writer::new(IoCursor::new(Vec::new()), H5WriteOptions::default())
-            .finish(hdf5_plan)
+        // Encode straight to bytes and write them to the caller's sink, rather
+        // than routing through an intermediate seekable in-memory writer.
+        let bytes = hdf5_plan
+            .encode(H5WriteOptions::default())
             .map_err(hdf5_error_to_unsupported)?;
-        writer.write_all(&cursor.into_inner())?;
+        writer.write_all(&bytes)?;
         Ok(format)
     }
 
@@ -1951,15 +1964,16 @@ impl NcFileBuilder {
         }
         let unlimited_count = self.dimensions.iter().filter(|d| d.is_unlimited).count();
         if unlimited_count > 1 {
-            return Err(Error::InvalidDefinition(
-                "classic NetCDF supports at most one unlimited dimension".into(),
-            ));
+            return Err(Error::RequiresNetcdf4 {
+                reason: "classic NetCDF supports at most one unlimited dimension".into(),
+            });
         }
         if format != NcFormat::Cdf5 && self.requires_cdf5() {
-            return Err(Error::InvalidDefinition(
-                "CDF-5 is required for unsigned integer, 64-bit integer, or 64-bit count data"
+            return Err(Error::FormatCapacityExceeded {
+                reason: "CDF-5 is required for unsigned integer, 64-bit integer, or 64-bit count \
+                         data"
                     .into(),
-            ));
+            });
         }
         validate_root_only_names(self)?;
         for variable in &self.variables {
@@ -2796,48 +2810,15 @@ fn ensure_variable_slice_buffer(
     elem_size: usize,
     can_grow: bool,
 ) -> Result<()> {
-    if variable.data_encoding != VariableDataEncoding::ClassicBigEndian && !variable.data.is_empty()
-    {
-        return Err(Error::UnsupportedFeature(format!(
-            "typed slice writes cannot update native-endian payload for variable '{}'",
-            variable.name
-        )));
-    }
-
-    let expected = checked_mul_usize(
-        require_usize(total_elements, "variable element count")?,
+    ensure_variable_byte_slice_buffer(
+        variable,
+        old_shape,
+        new_shape,
+        total_elements,
         elem_size,
-        "variable byte size",
-    )?;
-    if variable.data.is_empty() {
-        let fill_pattern = match &variable.fill_value {
-            Some(fill_value) => fill_value.classic_bytes.clone(),
-            None => default_classic_fill_bytes(&variable.dtype)?,
-        };
-        variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
-    } else if variable.data.len() < expected && can_grow {
-        let fill_pattern = match &variable.fill_value {
-            Some(fill_value) => fill_value.classic_bytes.clone(),
-            None => default_classic_fill_bytes(&variable.dtype)?,
-        };
-        resize_variable_data(
-            &mut variable.data,
-            old_shape,
-            new_shape,
-            elem_size,
-            &fill_pattern,
-        )?;
-    } else if variable.data.len() != expected {
-        return Err(Error::DataLengthMismatch {
-            expected,
-            actual: variable.data.len(),
-        });
-    }
-
-    variable.data_encoding = VariableDataEncoding::ClassicBigEndian;
-    variable.string_values = None;
-    variable.vlen_values = None;
-    Ok(())
+        can_grow,
+        VariableDataEncoding::ClassicBigEndian,
+    )
 }
 
 fn ensure_variable_native_slice_buffer(
@@ -2848,19 +2829,49 @@ fn ensure_variable_native_slice_buffer(
     elem_size: usize,
     can_grow: bool,
 ) -> Result<()> {
-    if variable.data_encoding != VariableDataEncoding::Hdf5Native && !variable.data.is_empty() {
+    ensure_variable_byte_slice_buffer(
+        variable,
+        old_shape,
+        new_shape,
+        total_elements,
+        elem_size,
+        can_grow,
+        VariableDataEncoding::Hdf5Native,
+    )
+}
+
+/// Create or grow a variable's byte payload for a slice write, in either the
+/// classic big-endian or HDF5 native little-endian encoding. Gaps are filled
+/// with the encoding-appropriate fill pattern (the variable's fill value, or
+/// the type default).
+fn ensure_variable_byte_slice_buffer(
+    variable: &mut VariableDef,
+    old_shape: &[u64],
+    new_shape: &[u64],
+    total_elements: u64,
+    elem_size: usize,
+    can_grow: bool,
+    encoding: VariableDataEncoding,
+) -> Result<()> {
+    if variable.data_encoding != encoding && !variable.data.is_empty() {
         return Err(Error::UnsupportedFeature(format!(
-            "native slice writes cannot update classic-endian payload for variable '{}'",
+            "slice writes cannot change the payload encoding of variable '{}'",
             variable.name
         )));
     }
 
     let expected = checked_mul_usize(
-        require_usize(total_elements, "native variable element count")?,
+        require_usize(total_elements, "variable element count")?,
         elem_size,
-        "native variable byte size",
+        "variable byte size",
     )?;
-    let fill_pattern = native_fill_pattern(variable, elem_size)?;
+    let fill_pattern = match encoding {
+        VariableDataEncoding::Hdf5Native => native_fill_pattern(variable, elem_size)?,
+        VariableDataEncoding::ClassicBigEndian => match &variable.fill_value {
+            Some(fill_value) => fill_value.classic_bytes.clone(),
+            None => default_classic_fill_bytes(&variable.dtype)?,
+        },
+    };
     if variable.data.is_empty() {
         variable.data = filled_data_buffer(expected, elem_size, &fill_pattern)?;
     } else if variable.data.len() < expected && can_grow {
@@ -2878,7 +2889,7 @@ fn ensure_variable_native_slice_buffer(
         });
     }
 
-    variable.data_encoding = VariableDataEncoding::Hdf5Native;
+    variable.data_encoding = encoding;
     variable.string_values = None;
     variable.vlen_values = None;
     Ok(())
@@ -3743,9 +3754,9 @@ fn infer_num_records_for_var(builder: &NcFileBuilder, variable: &VariableDef) ->
 
 fn validate_classic_type(dtype: &NcType) -> Result<()> {
     if dtype.classic_type_code().is_none() {
-        return Err(Error::UnsupportedFeature(format!(
-            "{dtype:?} requires NetCDF-4"
-        )));
+        return Err(Error::RequiresNetcdf4 {
+            reason: format!("the {dtype:?} datatype is not representable in classic NetCDF"),
+        });
     }
     Ok(())
 }
@@ -4052,25 +4063,25 @@ fn path_leaf_name(path: &str) -> &str {
 fn validate_root_only_names(builder: &NcFileBuilder) -> Result<()> {
     for dimension in &builder.dimensions {
         if dimension.name.contains('/') {
-            return Err(Error::UnsupportedFeature(format!(
-                "dimension '{}' requires NetCDF-4",
-                dimension.name
-            )));
+            return Err(Error::RequiresNetcdf4 {
+                reason: format!("grouped dimension '{}' needs NetCDF-4", dimension.name),
+            });
         }
     }
     for variable in &builder.variables {
         if variable.name.contains('/') {
-            return Err(Error::UnsupportedFeature(format!(
-                "variable '{}' requires NetCDF-4",
-                variable.name
-            )));
+            return Err(Error::RequiresNetcdf4 {
+                reason: format!("grouped variable '{}' needs NetCDF-4", variable.name),
+            });
         }
     }
     if let Some(group_attr) = builder.group_attributes.first() {
-        return Err(Error::UnsupportedFeature(format!(
-            "group '{}' requires NetCDF-4",
-            group_attr.group_path
-        )));
+        return Err(Error::RequiresNetcdf4 {
+            reason: format!(
+                "group attribute on '{}' needs NetCDF-4",
+                group_attr.group_path
+            ),
+        });
     }
     Ok(())
 }
@@ -4189,8 +4200,9 @@ fn checked_mul_usize(lhs: usize, rhs: usize, context: &str) -> Result<usize> {
 }
 
 fn require_u32(value: u64, context: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| Error::InvalidDefinition(format!("{context} exceeds u32 capacity")))
+    u32::try_from(value).map_err(|_| Error::FormatCapacityExceeded {
+        reason: format!("{context} exceeds the 32-bit classic field capacity"),
+    })
 }
 
 fn require_usize(value: u64, context: &str) -> Result<usize> {

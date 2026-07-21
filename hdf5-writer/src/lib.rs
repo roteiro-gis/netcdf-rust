@@ -1,9 +1,30 @@
-//! Pure-Rust HDF5 writer crate.
+//! Pure-Rust HDF5 writer.
 //!
-//! This crate owns the write-side API surface and shared encoding decisions.
-//! The first implementation milestone exposes validated builders and format
-//! planning types. Full HDF5 serialization is intentionally gated until the
-//! object-header, heap, chunk-index, and checksum encoders are complete.
+//! Build a file from [`DatasetBuilder`]s and [`AttributeBuilder`]s with
+//! [`Hdf5Builder`], turn it into an [`Hdf5WritePlan`], and serialize it with
+//! [`Hdf5Writer`] (a seekable sink) or [`Hdf5WritePlan::encode`] (bytes):
+//!
+//! ```
+//! use std::io::Cursor;
+//! use hdf5_writer::{DatasetBuilder, Hdf5Builder, Hdf5Writer, WriteOptions};
+//!
+//! let plan = Hdf5Builder::new()
+//!     .dataset(DatasetBuilder::typed_data("grid", vec![2, 3], &[0_i32, 1, 2, 3, 4, 5]).unwrap())
+//!     .into_plan()
+//!     .unwrap();
+//! let bytes = Hdf5Writer::new(Cursor::new(Vec::new()), WriteOptions::default())
+//!     .finish(plan)
+//!     .unwrap()
+//!     .into_inner();
+//! assert_eq!(&bytes[..8], b"\x89HDF\r\n\x1a\n");
+//! ```
+//!
+//! Supported: superblock v2; contiguous, compact, and chunked layouts (implicit,
+//! single-chunk, fixed-array, and version-2 B-tree indices, the last for
+//! unlimited maximum dimensions); groups; attributes; the deflate, shuffle, and
+//! fletcher32 filters; and fixed-point, floating-point, string (fixed and
+//! variable-length), reference, variable-length, bitfield, opaque, compound,
+//! enum, and array datatypes. Output is validated against libhdf5.
 
 use flate2::{write::ZlibEncoder, Compression};
 use std::io::{Seek, SeekFrom, Write};
@@ -45,11 +66,17 @@ pub enum Error {
     #[error("invalid definition: {0}")]
     InvalidDefinition(String),
 
+    /// The supplied data does not match the declared shape/type. `context`
+    /// names what was being written (e.g. `dataset 'grid'`).
+    #[error("{context}: expected {expected} element(s), got {actual}")]
+    DataLengthMismatch {
+        context: String,
+        expected: usize,
+        actual: usize,
+    },
+
     #[error("unsupported write feature: {0}")]
     UnsupportedFeature(String),
-
-    #[error("writer has already been finalized")]
-    AlreadyFinalized,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -204,6 +231,9 @@ fn native_order() -> ByteOrder {
 }
 
 /// Dataset definition used by the write planner.
+/// Builds a single HDF5 dataset: its name/path, datatype, shape, layout
+/// (contiguous, compact, or chunked), optional max shape, filters, fill value,
+/// data, and attributes.
 #[derive(Debug, Clone)]
 pub struct DatasetBuilder {
     name: String,
@@ -272,11 +302,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} string elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' string data"),
+                expected,
+                actual: values.len(),
+            });
         }
         let (datatype, raw_data) = encode_fixed_string_values(values)?;
         Ok(Self::new(name, datatype, shape).raw_data(raw_data))
@@ -291,11 +321,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} string elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' string data"),
+                expected,
+                actual: values.len(),
+            });
         }
 
         let mut strings = Vec::with_capacity(values.len());
@@ -342,11 +372,11 @@ impl DatasetBuilder {
         let shape = shape.into();
         let expected = expected_element_count(&shape)?;
         if values.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} vlen sequence elements, got {}",
-                name,
-                values.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{name}' vlen sequence data"),
+                expected,
+                actual: values.len(),
+            });
         }
         validate_vlen_sequence_base(&base)?;
         let base_size = datatype_element_size(&base)?;
@@ -420,10 +450,11 @@ impl DatasetBuilder {
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         let actual = std::mem::size_of_val(values);
         if actual != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "dataset '{}' expects {expected} data bytes, got {actual}",
-                self.name
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("dataset '{}' data (bytes)", self.name),
+                expected,
+                actual,
+            });
         }
 
         let mut bytes = Vec::with_capacity(actual);
@@ -543,6 +574,9 @@ impl DatasetBuilder {
 }
 
 /// Attribute definition used by HDF5 object headers.
+/// Builds a single HDF5 attribute attached to a dataset, group, or the file
+/// root. Supports scalars, vectors, fixed and variable-length strings, object
+/// references, and reference lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeBuilder {
     name: String,
@@ -848,11 +882,11 @@ impl AttributeBuilder {
         }
         let expected = expected_data_len(&self.shape, datatype_element_size(&self.datatype)?)?;
         if self.raw_data.len() != expected {
-            return Err(Error::InvalidDefinition(format!(
-                "attribute '{}' expects {expected} data bytes, got {}",
-                self.name,
-                self.raw_data.len()
-            )));
+            return Err(Error::DataLengthMismatch {
+                context: format!("attribute '{}' data (bytes)", self.name),
+                expected,
+                actual: self.raw_data.len(),
+            });
         }
         Ok(())
     }
@@ -920,6 +954,8 @@ impl GroupAttributeBuilder {
 }
 
 /// Root HDF5 file builder.
+/// Accumulates datasets, root attributes, and group attributes, then produces
+/// a validated [`Hdf5WritePlan`] via [`Hdf5Builder::into_plan`].
 #[derive(Debug, Clone, Default)]
 pub struct Hdf5Builder {
     datasets: Vec<DatasetBuilder>,
@@ -1001,6 +1037,8 @@ impl Hdf5Builder {
 }
 
 /// Validated HDF5 write plan.
+/// A validated set of datasets and attributes ready to be serialized by
+/// [`Hdf5Writer`] or [`Hdf5WritePlan::encode`].
 #[derive(Debug, Clone)]
 pub struct Hdf5WritePlan {
     datasets: Vec<DatasetBuilder>,
@@ -1029,33 +1067,33 @@ impl Hdf5WritePlan {
         }
         .validate()
     }
+
+    /// Encode the plan to the complete HDF5 file bytes. Callers that already
+    /// hold a plain [`Write`] sink (and cannot supply a [`Seek`] one) can write
+    /// these bytes directly, avoiding an intermediate in-memory copy.
+    pub fn encode(&self, options: WriteOptions) -> Result<Vec<u8>> {
+        encode_hdf5_file(self, options)
+    }
 }
 
-/// Streaming HDF5 writer placeholder. It validates definitions now and will
-/// host the binary emitters as they are added.
+/// Writes an [`Hdf5WritePlan`] to a seekable sink. Use
+/// [`Hdf5WritePlan::encode`] when the sink is a plain [`Write`].
 pub struct Hdf5Writer<W: Write + Seek> {
     sink: W,
     options: WriteOptions,
-    finalized: bool,
 }
 
 impl<W: Write + Seek> Hdf5Writer<W> {
     pub fn new(sink: W, options: WriteOptions) -> Self {
-        Self {
-            sink,
-            options,
-            finalized: false,
-        }
+        Self { sink, options }
     }
 
+    /// Encode `plan` and write the file to the sink. Consumes the writer, so a
+    /// writer can be finished at most once.
     pub fn finish(mut self, plan: Hdf5WritePlan) -> Result<W> {
-        if self.finalized {
-            return Err(Error::AlreadyFinalized);
-        }
         let bytes = encode_hdf5_file(&plan, self.options)?;
         self.sink.seek(SeekFrom::Start(0))?;
         self.sink.write_all(&bytes)?;
-        self.finalized = true;
         Ok(self.sink)
     }
 
@@ -1372,9 +1410,11 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     }
 
     let mut emissions = Vec::with_capacity(prepared.len());
+    // Consume `prepared` so each dataset's storage bytes move into the emission
+    // instead of being cloned.
     for ((((prepared_dataset, attributes), header_address), data_address), chunk_index_address) in
         prepared
-            .iter()
+            .into_iter()
             .zip(&planned_attributes.datasets)
             .zip(header_addresses.iter().copied())
             .zip(data_addresses.iter().copied())
@@ -1382,7 +1422,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
     {
         let layout_address = chunk_index_address.map_or(data_address, |address| address.header);
         let header =
-            encode_dataset_header(prepared_dataset, attributes, layout_address, heap_address)?;
+            encode_dataset_header(&prepared_dataset, attributes, layout_address, heap_address)?;
         let chunk_index = if let (Some(chunk_index), Some(addresses)) =
             (&prepared_dataset.chunk_index, chunk_index_address)
         {
@@ -1403,7 +1443,7 @@ fn encode_hdf5_file(plan: &Hdf5WritePlan, options: WriteOptions) -> Result<Vec<u
         };
         emissions.push(DatasetEmission {
             dataset: prepared_dataset.dataset,
-            raw_data: prepared_dataset.raw_data.clone(),
+            raw_data: prepared_dataset.raw_data,
             header_address,
             data_address,
             header,
@@ -1533,7 +1573,7 @@ fn prepare_datasets(
                     dataset.name
                 )));
             }
-            let refs = placeholder_vlen_string_references(&dataset.name, values)?;
+            let refs = vlen_string_heap_references(&dataset.name, values, None)?;
             let raw_data = encode_vlen_heap_references(&refs, 0);
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
@@ -1576,7 +1616,7 @@ fn prepare_datasets(
             };
             validate_vlen_sequence_base(base)?;
             let base_size = datatype_element_size(base)?;
-            let refs = placeholder_vlen_sequence_references(&dataset.name, values, base_size)?;
+            let refs = vlen_sequence_heap_references(&dataset.name, values, base_size, None)?;
             let raw_data = encode_vlen_heap_references(&refs, 0);
             if raw_data.len() != expected {
                 return Err(Error::InvalidDefinition(format!(
@@ -2131,7 +2171,7 @@ fn plan_attribute(
 ) -> Result<PlannedAttribute> {
     attribute.validate()?;
     if let Some(values) = &attribute.vlen_string_values {
-        let refs = plan_vlen_string_heap_references(&attribute.name, values, heap_objects)?;
+        let refs = vlen_string_heap_references(&attribute.name, values, Some(heap_objects))?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -2153,7 +2193,7 @@ fn plan_attribute(
         validate_vlen_sequence_base(base)?;
         let base_size = datatype_element_size(base)?;
         let refs =
-            plan_vlen_sequence_heap_references(&attribute.name, values, base_size, heap_objects)?;
+            vlen_sequence_heap_references(&attribute.name, values, base_size, Some(heap_objects))?;
         Ok(PlannedAttribute {
             name: attribute.name.clone(),
             datatype: attribute.datatype.clone(),
@@ -2240,7 +2280,7 @@ fn plan_dataset_vlen_values(
     heap_objects: &mut Vec<GlobalHeapObjectPlan>,
 ) -> Result<Option<Vec<VLenHeapReference>>> {
     if let Some(values) = dataset.vlen_string_values.as_ref() {
-        return plan_vlen_string_heap_references(&dataset.name, values, heap_objects).map(Some);
+        return vlen_string_heap_references(&dataset.name, values, Some(heap_objects)).map(Some);
     }
     if let Some(values) = dataset.vlen_sequence_values.as_ref() {
         let Datatype::VarLen {
@@ -2256,70 +2296,65 @@ fn plan_dataset_vlen_values(
         };
         validate_vlen_sequence_base(base)?;
         let base_size = datatype_element_size(base)?;
-        return plan_vlen_sequence_heap_references(&dataset.name, values, base_size, heap_objects)
+        return vlen_sequence_heap_references(&dataset.name, values, base_size, Some(heap_objects))
             .map(Some);
     }
     Ok(None)
 }
 
-fn plan_vlen_string_heap_references(
+/// Plan the global-heap references for variable-length string values.
+///
+/// With `heap_objects` present the strings are written to the heap and each
+/// reference points at its real index; with `None` only the sequence lengths
+/// are computed (the placeholder pass used for address sizing, heap index 0).
+fn vlen_string_heap_references(
     context: &str,
     values: &[String],
-    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+    mut heap_objects: Option<&mut Vec<GlobalHeapObjectPlan>>,
 ) -> Result<Vec<VLenHeapReference>> {
     let mut refs = Vec::with_capacity(values.len());
     for value in values {
-        let index = checked_heap_index(heap_objects.len() + 1)?;
-        let mut data = Vec::with_capacity(value.len() + 1);
-        data.extend_from_slice(value.as_bytes());
-        data.push(0);
-        let sequence_len = u32::try_from(data.len()).map_err(|_| {
-            Error::UnsupportedFeature(format!(
-                "'{context}' variable-length string exceeds u32 capacity"
-            ))
-        })?;
-        heap_objects.push(GlobalHeapObjectPlan {
-            index,
-            reference_count: 1,
-            data,
-        });
+        // The stored object is the string plus a NUL terminator.
+        let sequence_len = value
+            .len()
+            .checked_add(1)
+            .and_then(|len| u32::try_from(len).ok())
+            .ok_or_else(|| {
+                Error::UnsupportedFeature(format!(
+                    "'{context}' variable-length string exceeds u32 capacity"
+                ))
+            })?;
+        let heap_index = match heap_objects.as_deref_mut() {
+            Some(heap) => {
+                let index = checked_heap_index(heap.len() + 1)?;
+                let mut data = Vec::with_capacity(value.len() + 1);
+                data.extend_from_slice(value.as_bytes());
+                data.push(0);
+                heap.push(GlobalHeapObjectPlan {
+                    index,
+                    reference_count: 1,
+                    data,
+                });
+                index
+            }
+            None => 0,
+        };
         refs.push(VLenHeapReference {
             sequence_len,
-            heap_index: index,
+            heap_index,
         });
     }
     Ok(refs)
 }
 
-fn placeholder_vlen_string_references(
-    context: &str,
-    values: &[String],
-) -> Result<Vec<VLenHeapReference>> {
-    values
-        .iter()
-        .map(|value| {
-            let sequence_len = value
-                .len()
-                .checked_add(1)
-                .and_then(|len| u32::try_from(len).ok())
-                .ok_or_else(|| {
-                    Error::UnsupportedFeature(format!(
-                        "'{context}' variable-length string exceeds u32 capacity"
-                    ))
-                })?;
-            Ok(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            })
-        })
-        .collect()
-}
-
-fn plan_vlen_sequence_heap_references(
+/// Plan the global-heap references for variable-length sequence values. As with
+/// [`vlen_string_heap_references`], `None` computes only sequence lengths.
+/// Empty sequences never occupy a heap object (index 0).
+fn vlen_sequence_heap_references(
     context: &str,
     values: &[Vec<u8>],
     base_size: usize,
-    heap_objects: &mut Vec<GlobalHeapObjectPlan>,
+    mut heap_objects: Option<&mut Vec<GlobalHeapObjectPlan>>,
 ) -> Result<Vec<VLenHeapReference>> {
     let mut refs = Vec::with_capacity(values.len());
     for value in values {
@@ -2334,52 +2369,24 @@ fn plan_vlen_sequence_heap_references(
                 "'{context}' variable-length sequence exceeds u32 element capacity"
             ))
         })?;
-        if sequence_len == 0 {
-            refs.push(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            });
-            continue;
-        }
-        let index = checked_heap_index(heap_objects.len() + 1)?;
-        heap_objects.push(GlobalHeapObjectPlan {
-            index,
-            reference_count: 1,
-            data: value.clone(),
-        });
+        let heap_index = match heap_objects.as_deref_mut() {
+            Some(heap) if sequence_len != 0 => {
+                let index = checked_heap_index(heap.len() + 1)?;
+                heap.push(GlobalHeapObjectPlan {
+                    index,
+                    reference_count: 1,
+                    data: value.clone(),
+                });
+                index
+            }
+            _ => 0,
+        };
         refs.push(VLenHeapReference {
             sequence_len,
-            heap_index: index,
+            heap_index,
         });
     }
     Ok(refs)
-}
-
-fn placeholder_vlen_sequence_references(
-    context: &str,
-    values: &[Vec<u8>],
-    base_size: usize,
-) -> Result<Vec<VLenHeapReference>> {
-    values
-        .iter()
-        .map(|value| {
-            if value.len() % base_size != 0 {
-                return Err(Error::InvalidDefinition(format!(
-                    "'{context}' variable-length sequence byte length {} is not a multiple of base element size {base_size}",
-                    value.len()
-                )));
-            }
-            let sequence_len = u32::try_from(value.len() / base_size).map_err(|_| {
-                Error::UnsupportedFeature(format!(
-                    "'{context}' variable-length sequence exceeds u32 element capacity"
-                ))
-            })?;
-            Ok(VLenHeapReference {
-                sequence_len,
-                heap_index: 0,
-            })
-        })
-        .collect()
 }
 
 fn dataset_vlen_storage_data(

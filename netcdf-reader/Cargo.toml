@@ -30,7 +30,9 @@ peak_alloc = "0.2"
 [features]
 default = ["netcdf4", "rayon"]
 netcdf4 = ["dep:hdf5-reader"]
-rayon = ["dep:rayon", "netcdf4", "hdf5-reader/rayon"]
+# Parallel reads for the classic backend do not require the HDF5 stack; when
+# `netcdf4` is also enabled, forward `rayon` to `hdf5-reader` as well.
+rayon = ["dep:rayon", "hdf5-reader?/rayon"]
 cf = ["dep:chrono"]
 bench-memory-profile = []
 
