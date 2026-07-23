@@ -5,7 +5,6 @@
 //! NetCDF-4 emission is intentionally strict about metadata it cannot yet
 //! represent losslessly.
 
-#[cfg(feature = "netcdf4")]
 use std::io::Write;
 
 #[cfg(feature = "netcdf4")]
@@ -239,7 +238,6 @@ enum VariableDataEncoding {
 #[derive(Debug, Clone)]
 struct VariableFillValue {
     classic_bytes: Vec<u8>,
-    #[cfg(feature = "netcdf4")]
     hdf5_bytes: Vec<u8>,
 }
 
@@ -2504,7 +2502,6 @@ fn nc4_hdf5_element_size(dtype: &NcType) -> Result<usize> {
     }
 }
 
-#[cfg(feature = "netcdf4")]
 fn convert_classic_be_data_to_hdf5_le(dtype: &NcType, data: &[u8]) -> Result<Vec<u8>> {
     let width = dtype.size()?;
     if width == 1 {
@@ -4099,7 +4096,7 @@ fn set_variable_fill_value_metadata(
     variable: &mut VariableDef,
     value: NcAttrValue,
     classic_bytes: Vec<u8>,
-    #[cfg_attr(not(feature = "netcdf4"), allow(unused_variables))] hdf5_bytes: Vec<u8>,
+    hdf5_bytes: Vec<u8>,
 ) -> Result<()> {
     if let Some(attribute) = variable
         .attributes
@@ -4122,7 +4119,6 @@ fn set_variable_fill_value_metadata(
 
     variable.fill_value = Some(VariableFillValue {
         classic_bytes,
-        #[cfg(feature = "netcdf4")]
         hdf5_bytes,
     });
     Ok(())

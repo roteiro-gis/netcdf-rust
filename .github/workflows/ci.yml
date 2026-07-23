@@ -76,6 +76,9 @@ jobs:
       - name: Test netcdf-reader classic-only parallel reads
         run: cargo test -p netcdf-reader --no-default-features --features rayon --locked
 
+      - name: Test netcdf-writer classic-only
+        run: cargo test -p netcdf-writer --no-default-features --locked
+
   cf-feature:
     name: Test CF feature
     runs-on: ubuntu-24.04
