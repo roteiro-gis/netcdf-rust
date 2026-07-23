@@ -12,6 +12,9 @@ documentation = "https://docs.rs/netcdf-reader"
 keywords = ["netcdf", "hdf5", "decoder", "scientific-data", "read-only"]
 categories = ["science", "parser-implementations"]
 
+[lints]
+workspace = true
+
 [dependencies]
 netcdf-core = { version = "0.8.0", path = "../netcdf-core" }
 ndarray = { workspace = true }

@@ -89,15 +89,21 @@ struct ChunkEntrySelection<'a> {
     chunk_bounds: Option<(&'a [u64], &'a [u64])>,
 }
 
+// SAFETY: `FlatBufferPtr` has no safe dereference operations. Callers of its
+// unsafe methods must keep the allocation alive and coordinate disjoint writes.
 unsafe impl Send for FlatBufferPtr {}
 
+// SAFETY: sharing the pointer does not itself access the allocation. Every
+// access remains unsafe and requires callers to guarantee disjoint writes.
 unsafe impl Sync for FlatBufferPtr {}
 
 impl FlatBufferPtr {
     #[cfg(feature = "rayon")]
     #[inline(always)]
     unsafe fn copy_chunk(self, chunk_data: &[u8], layout: ChunkCopyLayout<'_>) -> Result<()> {
-        copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout)
+        // SAFETY: the caller upholds this method's allocation-lifetime and
+        // disjoint-write requirements.
+        unsafe { copy_chunk_to_flat_with_strides_ptr(chunk_data, self, layout) }
     }
 
     #[cfg(feature = "rayon")]
@@ -111,16 +117,20 @@ impl FlatBufferPtr {
         elem_size: usize,
         ndim: usize,
     ) -> Result<()> {
-        copy_selected_elements_ptr(
-            chunk_data,
-            self.ptr,
-            self.len,
-            dim_indices,
-            chunk_strides,
-            result_strides,
-            elem_size,
-            ndim,
-        )
+        // SAFETY: the caller upholds this method's allocation-lifetime and
+        // disjoint-write requirements.
+        unsafe {
+            copy_selected_elements_ptr(
+                chunk_data,
+                self.ptr,
+                self.len,
+                dim_indices,
+                chunk_strides,
+                result_strides,
+                elem_size,
+                ndim,
+            )
+        }
     }
 
     #[cfg(feature = "rayon")]
@@ -130,7 +140,9 @@ impl FlatBufferPtr {
         chunk_data: &[u8],
         layout: UnitStrideCopyLayout<'_>,
     ) -> Result<()> {
-        copy_unit_stride_chunk_overlap_ptr(chunk_data, self, layout)
+        // SAFETY: the caller upholds this method's allocation-lifetime and
+        // disjoint-write requirements.
+        unsafe { copy_unit_stride_chunk_overlap_ptr(chunk_data, self, layout) }
     }
 }
 
@@ -446,19 +458,33 @@ fn row_major_strides(shape: &[u64], context: &str) -> Result<Vec<usize>> {
     Ok(strides)
 }
 
-fn assume_init_u8_vec(mut buffer: Vec<MaybeUninit<u8>>) -> Vec<u8> {
+/// Convert an allocation of maybe-uninitialized bytes without copying it.
+///
+/// # Safety
+///
+/// Every element of `buffer` must have been initialized.
+unsafe fn assume_init_u8_vec(mut buffer: Vec<MaybeUninit<u8>>) -> Vec<u8> {
     let ptr = buffer.as_mut_ptr() as *mut u8;
     let len = buffer.len();
     let capacity = buffer.capacity();
     std::mem::forget(buffer);
+    // SAFETY: guaranteed by the caller; `u8` and `MaybeUninit<u8>` have the
+    // same layout, and ownership of the allocation was transferred by forget.
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
-fn assume_init_vec<T>(mut buffer: Vec<MaybeUninit<T>>) -> Vec<T> {
+/// Convert an allocation of maybe-uninitialized values without copying it.
+///
+/// # Safety
+///
+/// Every element of `buffer` must have been initialized.
+unsafe fn assume_init_vec<T>(mut buffer: Vec<MaybeUninit<T>>) -> Vec<T> {
     let ptr = buffer.as_mut_ptr() as *mut T;
     let len = buffer.len();
     let capacity = buffer.capacity();
     std::mem::forget(buffer);
+    // SAFETY: guaranteed by the caller; `T` and `MaybeUninit<T>` have the
+    // same layout, and ownership of the allocation was transferred by forget.
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
@@ -1102,6 +1128,8 @@ impl Dataset {
 
             let elem_size = self.raw_element_size()?;
             if T::native_copy_compatible(&self.datatype) && std::mem::size_of::<T>() == elem_size {
+                // SAFETY: `dst` is a live, contiguous mutable slice, and the
+                // checked byte length exactly covers its initialized elements.
                 let dst_bytes = unsafe {
                     std::slice::from_raw_parts_mut(
                         dst.as_mut_ptr() as *mut u8,
@@ -1621,6 +1649,9 @@ impl Dataset {
                 for entry in &entries {
                     let chunk_data =
                         self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                    // SAFETY: the validated chunk grid has no duplicate
+                    // offsets, the helper checks every range, and the output
+                    // allocation remains live for the duration of the copy.
                     unsafe {
                         copy_chunk_to_flat_with_strides_ptr(
                             &chunk_data,
@@ -1642,6 +1673,9 @@ impl Dataset {
 
                 if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                     let mut cached_bytes = vec![0u8; total_bytes];
+                    // SAFETY: full chunk coverage initialized all
+                    // `total_bytes` at `result_ptr`, and both allocations are
+                    // live and distinct.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             result_ptr,
@@ -1656,7 +1690,9 @@ impl Dataset {
                 for &dim in shape {
                     result_shape.push(checked_usize(dim, "dataset dimension")?);
                 }
-                let result_values = assume_init_vec(result_values);
+                // SAFETY: exact, duplicate-free chunk-grid coverage was
+                // validated above and every chunk was copied successfully.
+                let result_values = unsafe { assume_init_vec(result_values) };
                 return ArrayD::from_shape_vec(IxDyn(&result_shape), result_values)
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
@@ -1668,6 +1704,9 @@ impl Dataset {
             for entry in &entries {
                 let chunk_data =
                     self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
+                // SAFETY: the validated chunk grid has no duplicate offsets,
+                // the helper checks every range, and the output allocation
+                // remains live for the duration of the copy.
                 unsafe {
                     copy_chunk_to_flat_with_strides_ptr(
                         &chunk_data,
@@ -1687,7 +1726,9 @@ impl Dataset {
                 }
             }
 
-            let flat_data = assume_init_u8_vec(flat_data);
+            // SAFETY: exact, duplicate-free chunk-grid coverage was validated
+            // above and every chunk was copied successfully.
+            let flat_data = unsafe { assume_init_u8_vec(flat_data) };
             if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                 let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
             }
@@ -1873,18 +1914,23 @@ impl Dataset {
                     .par_iter()
                     .map(|entry| {
                         self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                            .and_then(|data| unsafe {
-                                flat.copy_chunk(
-                                    &data,
-                                    ChunkCopyLayout {
-                                        chunk_offsets: &entry.offsets,
-                                        chunk_shape: &chunk_shape,
-                                        dataset_shape: shape,
-                                        dataset_strides: &dataset_strides,
-                                        chunk_strides: &chunk_strides,
-                                        elem_size,
-                                    },
-                                )
+                            .and_then(|data| {
+                                // SAFETY: validated chunk offsets are unique,
+                                // so parallel copies write disjoint ranges;
+                                // `result_values` remains live through collect.
+                                unsafe {
+                                    flat.copy_chunk(
+                                        &data,
+                                        ChunkCopyLayout {
+                                            chunk_offsets: &entry.offsets,
+                                            chunk_shape: &chunk_shape,
+                                            dataset_shape: shape,
+                                            dataset_strides: &dataset_strides,
+                                            chunk_strides: &chunk_strides,
+                                            elem_size,
+                                        },
+                                    )
+                                }
                             })
                     })
                     .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -1895,6 +1941,9 @@ impl Dataset {
                 }
                 if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                     let mut cached_bytes = vec![0u8; total_bytes];
+                    // SAFETY: full chunk coverage initialized all
+                    // `total_bytes` at `flat.ptr`, and both allocations are
+                    // live and distinct.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             flat.ptr,
@@ -1904,7 +1953,9 @@ impl Dataset {
                     }
                     let _ = self.full_dataset_bytes.set(Arc::new(cached_bytes));
                 }
-                let result_values = assume_init_vec(result_values);
+                // SAFETY: exact, duplicate-free chunk-grid coverage was
+                // validated above and all parallel copies completed.
+                let result_values = unsafe { assume_init_vec(result_values) };
                 return ArrayD::from_shape_vec(IxDyn(&result_shape), result_values)
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
@@ -1919,23 +1970,30 @@ impl Dataset {
                 .par_iter()
                 .map(|entry| {
                     self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                        .and_then(|data| unsafe {
-                            flat.copy_chunk(
-                                &data,
-                                ChunkCopyLayout {
-                                    chunk_offsets: &entry.offsets,
-                                    chunk_shape: &chunk_shape,
-                                    dataset_shape: shape,
-                                    dataset_strides: &dataset_strides,
-                                    chunk_strides: &chunk_strides,
-                                    elem_size,
-                                },
-                            )
+                        .and_then(|data| {
+                            // SAFETY: validated chunk offsets are unique, so
+                            // parallel copies write disjoint ranges;
+                            // `flat_data` remains live through collect.
+                            unsafe {
+                                flat.copy_chunk(
+                                    &data,
+                                    ChunkCopyLayout {
+                                        chunk_offsets: &entry.offsets,
+                                        chunk_shape: &chunk_shape,
+                                        dataset_shape: shape,
+                                        dataset_strides: &dataset_strides,
+                                        chunk_strides: &chunk_strides,
+                                        elem_size,
+                                    },
+                                )
+                            }
                         })
                 })
                 .collect::<std::result::Result<Vec<_>, Error>>()?;
 
-            let flat_data = assume_init_u8_vec(flat_data);
+            // SAFETY: exact, duplicate-free chunk-grid coverage was validated
+            // above and all parallel copies completed.
+            let flat_data = unsafe { assume_init_u8_vec(flat_data) };
             if total_bytes <= HOT_FULL_DATASET_CACHE_MAX_BYTES {
                 let _ = self.full_dataset_bytes.set(Arc::new(flat_data.clone()));
             }
@@ -1952,18 +2010,23 @@ impl Dataset {
             .par_iter()
             .map(|entry| {
                 self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)
-                    .and_then(|data| unsafe {
-                        flat.copy_chunk(
-                            &data,
-                            ChunkCopyLayout {
-                                chunk_offsets: &entry.offsets,
-                                chunk_shape: &chunk_shape,
-                                dataset_shape: shape,
-                                dataset_strides: &dataset_strides,
-                                chunk_strides: &chunk_strides,
-                                elem_size,
-                            },
-                        )
+                    .and_then(|data| {
+                        // SAFETY: validated chunk offsets are unique, so
+                        // parallel copies write disjoint ranges; `flat_data`
+                        // remains live through collect.
+                        unsafe {
+                            flat.copy_chunk(
+                                &data,
+                                ChunkCopyLayout {
+                                    chunk_offsets: &entry.offsets,
+                                    chunk_shape: &chunk_shape,
+                                    dataset_shape: shape,
+                                    dataset_strides: &dataset_strides,
+                                    chunk_strides: &chunk_strides,
+                                    elem_size,
+                                },
+                            )
+                        }
                     })
             })
             .collect::<std::result::Result<Vec<_>, Error>>()?;
@@ -2275,6 +2338,9 @@ impl Dataset {
                     let chunk_data =
                         self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
+                    // SAFETY: validated chunk offsets are unique, the overlap
+                    // helper checks every range, and the output allocation
+                    // remains live for the duration of the copy.
                     unsafe {
                         copy_unit_stride_chunk_overlap_ptr(
                             &chunk_data,
@@ -2295,7 +2361,9 @@ impl Dataset {
                     }
                 }
 
-                let result_values = assume_init_vec(result_values);
+                // SAFETY: the fully-covered selection gate proves that the
+                // successful overlap copies initialized every result element.
+                let result_values = unsafe { assume_init_vec(result_values) };
                 return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
@@ -2308,6 +2376,9 @@ impl Dataset {
                 let chunk_data =
                     self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
+                // SAFETY: validated chunk offsets are unique, the overlap
+                // helper checks every range, and the output allocation remains
+                // live for the duration of the copy.
                 unsafe {
                     copy_unit_stride_chunk_overlap_ptr(
                         &chunk_data,
@@ -2328,7 +2399,9 @@ impl Dataset {
                 }
             }
 
-            let result_buf = assume_init_u8_vec(result_buf);
+            // SAFETY: the fully-covered selection gate proves that the
+            // successful overlap copies initialized every result byte.
+            let result_buf = unsafe { assume_init_u8_vec(result_buf) };
             return self.decode_buffer_with_shape::<T>(
                 &result_buf,
                 resolved.result_elements,
@@ -2546,6 +2619,8 @@ impl Dataset {
                 )));
             }
 
+            // SAFETY: the source and destination ranges were checked above;
+            // their allocations are live and distinct.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     chunk_data.as_ptr().add(src_start),
@@ -2555,7 +2630,9 @@ impl Dataset {
             }
         }
 
-        let result_values = assume_init_vec(result_values);
+        // SAFETY: this fast path covers one complete unit-stride selection and
+        // the row loop initialized every checked destination range.
+        let result_values = unsafe { assume_init_vec(result_values) };
         ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
             .map(Some)
             .map_err(|e| Error::InvalidData(format!("array shape error: {e}")))
@@ -2669,6 +2746,9 @@ impl Dataset {
                             elem_size,
                         )?;
 
+                        // SAFETY: validated chunk offsets are unique, so
+                        // parallel overlap copies write disjoint ranges;
+                        // `result_values` remains live through collect.
                         unsafe {
                             flat.copy_unit_stride_chunk_overlap(
                                 &chunk_data,
@@ -2688,7 +2768,9 @@ impl Dataset {
                     })
                     .collect::<std::result::Result<Vec<_>, Error>>()?;
 
-                let result_values = assume_init_vec(result_values);
+                // SAFETY: the fully-covered selection gate proves that all
+                // successful parallel copies initialized the result.
+                let result_values = unsafe { assume_init_vec(result_values) };
                 return ArrayD::from_shape_vec(IxDyn(&resolved.result_shape), result_values)
                     .map_err(|e| Error::InvalidData(format!("array shape error: {e}")));
             }
@@ -2705,6 +2787,9 @@ impl Dataset {
                     let chunk_data =
                         self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
+                    // SAFETY: validated chunk offsets are unique, so parallel
+                    // overlap copies write disjoint ranges; `result_buf`
+                    // remains live through collect.
                     unsafe {
                         flat.copy_unit_stride_chunk_overlap(
                             &chunk_data,
@@ -2724,7 +2809,9 @@ impl Dataset {
                 })
                 .collect::<std::result::Result<Vec<_>, Error>>()?;
 
-            let result_buf = assume_init_u8_vec(result_buf);
+            // SAFETY: the fully-covered selection gate proves that all
+            // successful parallel copies initialized every result byte.
+            let result_buf = unsafe { assume_init_u8_vec(result_buf) };
             return self.decode_buffer_with_shape::<T>(
                 &result_buf,
                 resolved.result_elements,
@@ -2746,6 +2833,9 @@ impl Dataset {
                     self.load_exact_chunk_data(entry, index_address, &chunk_shape, elem_size)?;
 
                 if use_unit_stride_fast_path {
+                    // SAFETY: validated chunk offsets are unique, so parallel
+                    // overlap copies write disjoint ranges; `result_buf`
+                    // remains live through collect.
                     unsafe {
                         flat.copy_unit_stride_chunk_overlap(
                             &chunk_data,
@@ -3373,6 +3463,9 @@ fn copy_chunk_to_flat_with_strides(
     flat: &mut [u8],
     layout: ChunkCopyLayout<'_>,
 ) -> Result<()> {
+    // SAFETY: the mutable slice supplies a live, exclusively borrowed output
+    // allocation, and the pointer helper checks every source and destination
+    // range.
     unsafe {
         copy_chunk_to_flat_with_strides_ptr(
             chunk_data,
@@ -3411,7 +3504,11 @@ unsafe fn copy_chunk_to_flat_with_strides_ptr(
                 flat.len
             )));
         }
-        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr, layout.elem_size);
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr, layout.elem_size);
+        }
         return Ok(());
     }
 
@@ -3453,7 +3550,11 @@ unsafe fn copy_chunk_to_flat_with_strides_ptr(
                 flat.len
             )));
         }
-        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr.add(dst_start), row_bytes);
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), flat.ptr.add(dst_start), row_bytes);
+        }
         return Ok(());
     }
 
@@ -3486,11 +3587,15 @@ unsafe fn copy_chunk_to_flat_with_strides_ptr(
                 flat.len
             )));
         }
-        std::ptr::copy_nonoverlapping(
-            chunk_data.as_ptr().add(src_start),
-            flat.ptr.add(dst_start),
-            row_bytes,
-        );
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                flat.ptr.add(dst_start),
+                row_bytes,
+            );
+        }
 
         let mut carry = true;
         for d in (0..outer_idx.len()).rev() {
@@ -3560,6 +3665,9 @@ fn copy_unit_stride_chunk_overlap(
     result_buf: &mut [u8],
     layout: UnitStrideCopyLayout<'_>,
 ) -> Result<()> {
+    // SAFETY: the mutable slice supplies a live, exclusively borrowed output
+    // allocation, and the pointer helper checks every source and destination
+    // range.
     unsafe {
         copy_unit_stride_chunk_overlap_ptr(
             chunk_data,
@@ -3609,7 +3717,11 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
                 result.len
             )));
         }
-        std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), result.ptr, layout.elem_size);
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), result.ptr, layout.elem_size);
+        }
         return Ok(());
     }
 
@@ -3659,11 +3771,15 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
                 result.len
             )));
         }
-        std::ptr::copy_nonoverlapping(
-            chunk_data.as_ptr().add(src_start),
-            result.ptr.add(dst_start),
-            row_bytes,
-        );
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                result.ptr.add(dst_start),
+                row_bytes,
+            );
+        }
         return Ok(());
     }
 
@@ -3697,11 +3813,15 @@ unsafe fn copy_unit_stride_chunk_overlap_ptr(
                 result.len
             )));
         }
-        std::ptr::copy_nonoverlapping(
-            chunk_data.as_ptr().add(src_start),
-            result.ptr.add(dst_start),
-            row_bytes,
-        );
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                result.ptr.add(dst_start),
+                row_bytes,
+            );
+        }
 
         let mut carry = true;
         for d in (0..outer_idx.len()).rev() {
@@ -3860,11 +3980,15 @@ unsafe fn copy_selected_elements_ptr(
                 result_len
             )));
         }
-        std::ptr::copy_nonoverlapping(
-            chunk_data.as_ptr().add(src_start),
-            result_ptr.add(dst_start),
-            elem_size,
-        );
+        // SAFETY: both ranges were checked immediately above, and the source
+        // slice and caller-owned output allocation are distinct.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                chunk_data.as_ptr().add(src_start),
+                result_ptr.add(dst_start),
+                elem_size,
+            );
+        }
 
         let mut carry = true;
         for d in (0..ndim).rev() {

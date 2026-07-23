@@ -119,8 +119,10 @@ macro_rules! impl_nc_read_type {
                 let bytes = &raw[..total_bytes];
                 #[cfg(target_endian = "big")]
                 {
-                    // Native BE: memcpy is safe for any element size.
                     let mut values = Vec::<$ty>::with_capacity(count);
+                    // SAFETY: `values` has capacity for `count` elements,
+                    // `raw` contains exactly `count * size_of::<$ty>()` bytes,
+                    // and numeric types admit every bit pattern.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             bytes.as_ptr(),
@@ -163,6 +165,8 @@ macro_rules! impl_nc_read_type {
                 let bytes = &raw[..total_bytes];
                 #[cfg(target_endian = "big")]
                 {
+                    // SAFETY: `values` has capacity for `count` bytes and
+                    // `bytes` contains exactly `count` initialized bytes.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             bytes.as_ptr(),

@@ -13,6 +13,9 @@ documentation = "https://docs.rs/hdf5-writer"
 keywords = ["hdf5", "encoder", "scientific-data"]
 categories = ["science", "encoding"]
 
+[lints]
+workspace = true
+
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hdf5-core = { version = "0.8.0", path = "../hdf5-core" }

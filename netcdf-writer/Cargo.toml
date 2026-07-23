@@ -13,6 +13,9 @@ documentation = "https://docs.rs/netcdf-writer"
 keywords = ["netcdf", "encoder", "scientific-data"]
 categories = ["science", "encoding"]
 
+[lints]
+workspace = true
+
 [dependencies]
 netcdf-core = { version = "0.8.0", path = "../netcdf-core" }
 hdf5-writer = { version = "0.8.0", path = "../hdf5-writer", optional = true }

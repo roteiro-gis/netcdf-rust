@@ -21,3 +21,9 @@ homepage = "https://github.com/roteiro-gis/netcdf-rust"
 ndarray = "0.17"
 thiserror = "2"
 memmap2 = "0.9"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

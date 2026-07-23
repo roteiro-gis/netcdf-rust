@@ -128,6 +128,10 @@ macro_rules! impl_h5type_int {
                         let bytes = &raw[..total_bytes];
                         if byte_order_is_native(*byte_order) {
                             let mut values = Vec::<$ty>::with_capacity(count);
+                            // SAFETY: `values` has capacity for `count`
+                            // elements, `bytes` contains exactly
+                            // `count * size_of::<$ty>()` bytes, and integer
+                            // types admit every bit pattern.
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
                                     bytes.as_ptr(),
@@ -224,6 +228,9 @@ impl H5Type for f32 {
                 let bytes = &raw[..total_bytes];
                 if byte_order_is_native(*byte_order) {
                     let mut values = Vec::<f32>::with_capacity(count);
+                    // SAFETY: `values` has capacity for `count` elements,
+                    // `bytes` contains exactly `count * size_of::<f32>()`
+                    // bytes, and `f32` admits every bit pattern.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             bytes.as_ptr(),
@@ -304,6 +311,9 @@ impl H5Type for f64 {
                 let bytes = &raw[..total_bytes];
                 if byte_order_is_native(*byte_order) {
                     let mut values = Vec::<f64>::with_capacity(count);
+                    // SAFETY: `values` has capacity for `count` elements,
+                    // `bytes` contains exactly `count * size_of::<f64>()`
+                    // bytes, and `f64` admits every bit pattern.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             bytes.as_ptr(),
