@@ -72,7 +72,7 @@ fn byte_order_is_native(byte_order: ByteOrder) -> bool {
 }
 
 macro_rules! impl_h5type_int {
-    ($ty:ty, $size:expr, $signed:expr) => {
+    ($ty:ty, $size:literal, $signed:literal) => {
         impl H5Type for $ty {
             fn hdf5_type() -> Datatype {
                 Datatype::FixedPoint {

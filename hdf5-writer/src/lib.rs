@@ -116,7 +116,7 @@ pub trait H5WriteElement: H5WriteType + Copy {
 }
 
 macro_rules! impl_int_type {
-    ($ty:ty, $size:expr, $signed:expr) => {
+    ($ty:ty, $size:literal, $signed:literal) => {
         impl H5WriteType for $ty {
             fn hdf5_type() -> Datatype {
                 <$ty as H5WriteElement>::hdf5_type_with_order(native_order())
@@ -150,7 +150,7 @@ impl_int_type!(i64, 8, true);
 impl_int_type!(u64, 8, false);
 
 macro_rules! impl_byte_type {
-    ($ty:ty, $signed:expr) => {
+    ($ty:ty, $signed:literal) => {
         impl H5WriteType for $ty {
             fn hdf5_type() -> Datatype {
                 <$ty as H5WriteElement>::hdf5_type_with_order(native_order())

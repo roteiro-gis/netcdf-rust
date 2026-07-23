@@ -77,7 +77,7 @@ pub trait NcReadType: Clone + Default + Send + 'static {
 }
 
 macro_rules! impl_nc_read_type {
-    ($ty:ty, $nc_type:expr, $size:expr) => {
+    ($ty:ty, $nc_type:path, $size:literal) => {
         impl NcReadType for $ty {
             fn nc_type() -> NcType {
                 $nc_type
