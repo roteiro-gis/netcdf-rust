@@ -71,7 +71,8 @@
   unsafe operation's invariants, and enforce both checks with workspace lints
 - fix rustdoc links and adopt macro fragment specifiers that retain their
   intended meaning in future Rust editions
-- update the audited development dependency graph to `anyhow` 1.0.103
+- update the audited development dependency graph to `anyhow` 1.0.103 and
+  `rand` 0.9.3
 
 ## 0.8.0 - 2026-07-10
 
