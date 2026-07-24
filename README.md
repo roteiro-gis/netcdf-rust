@@ -2,8 +2,12 @@
 
 [![hdf5-reader crates.io](https://img.shields.io/crates/v/hdf5-reader.svg)](https://crates.io/crates/hdf5-reader)
 [![hdf5-reader docs.rs](https://docs.rs/hdf5-reader/badge.svg)](https://docs.rs/hdf5-reader)
+[![hdf5-writer crates.io](https://img.shields.io/crates/v/hdf5-writer.svg)](https://crates.io/crates/hdf5-writer)
+[![hdf5-writer docs.rs](https://docs.rs/hdf5-writer/badge.svg)](https://docs.rs/hdf5-writer)
 [![netcdf-reader crates.io](https://img.shields.io/crates/v/netcdf-reader.svg)](https://crates.io/crates/netcdf-reader)
 [![netcdf-reader docs.rs](https://docs.rs/netcdf-reader/badge.svg)](https://docs.rs/netcdf-reader)
+[![netcdf-writer crates.io](https://img.shields.io/crates/v/netcdf-writer.svg)](https://crates.io/crates/netcdf-writer)
+[![netcdf-writer docs.rs](https://docs.rs/netcdf-writer/badge.svg)](https://docs.rs/netcdf-writer)
 
 Pure-Rust readers and writers for HDF5 and NetCDF. The published library dependency graph has no C libraries or build scripts; internal `unsafe` is limited to read-only memory mapping and performance-critical decoding/copy paths.
 
@@ -211,8 +215,10 @@ Minimum supported Rust version: 1.81.
 
 ```toml
 [dependencies]
-netcdf-reader = "0.8.0"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.8.0", default-features = false }  # CDF-1/2/5 only
+netcdf-reader = "0.9.0"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.9.0", default-features = false }  # CDF-1/2/5 only
+netcdf-writer = "0.9.0"           # Classic + NetCDF-4 writer (default)
+hdf5-writer = "0.9.0"             # Raw HDF5 writer
 ```
 
 | Flag | Default | Description |
@@ -290,7 +296,7 @@ For reference comparisons and current benchmark results against
 ## Releasing
 
 See [RELEASING.md](RELEASING.md) for the release checklist and the required
-publish order for `hdf5-reader` and `netcdf-reader`.
+publish order for all six crates.
 
 ## Known limitations
 

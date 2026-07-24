@@ -142,14 +142,14 @@ dependencies = [
 
 [[package]]
 name = "hdf5-core"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "hdf5-reader"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "flate2",
  "hdf5-core",
@@ -263,14 +263,14 @@ dependencies = [
 
 [[package]]
 name = "netcdf-core"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "netcdf-reader"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "hdf5-reader",
  "memmap2",

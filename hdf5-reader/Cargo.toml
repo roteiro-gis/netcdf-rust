@@ -16,7 +16,7 @@ categories = ["science", "parser-implementations"]
 workspace = true
 
 [dependencies]
-hdf5-core = { version = "0.8.0", path = "../hdf5-core" }
+hdf5-core = { version = "0.9.0", path = "../hdf5-core" }
 ndarray = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = { workspace = true }
