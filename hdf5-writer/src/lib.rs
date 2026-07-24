@@ -116,7 +116,7 @@ pub trait H5WriteElement: H5WriteType + Copy {
 }
 
 macro_rules! impl_int_type {
-    ($ty:ty, $size:expr, $signed:expr) => {
+    ($ty:ty, $size:literal, $signed:literal) => {
         impl H5WriteType for $ty {
             fn hdf5_type() -> Datatype {
                 <$ty as H5WriteElement>::hdf5_type_with_order(native_order())
@@ -150,7 +150,7 @@ impl_int_type!(i64, 8, true);
 impl_int_type!(u64, 8, false);
 
 macro_rules! impl_byte_type {
-    ($ty:ty, $signed:expr) => {
+    ($ty:ty, $signed:literal) => {
         impl H5WriteType for $ty {
             fn hdf5_type() -> Datatype {
                 <$ty as H5WriteElement>::hdf5_type_with_order(native_order())
@@ -491,6 +491,7 @@ impl DatasetBuilder {
                 "dataset rank exceeds HDF5 rank field capacity".into(),
             ));
         }
+        datatype_element_size(&self.datatype)?;
         if let Some(max_shape) = &self.max_shape {
             if max_shape.len() != self.shape.len() {
                 return Err(Error::InvalidDefinition(
@@ -3465,7 +3466,7 @@ fn string_encoding_bits(encoding: StringEncoding) -> u32 {
 }
 
 fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
-    match datatype {
+    let size = match datatype {
         Datatype::FixedPoint { size, .. }
         | Datatype::FloatingPoint { size, .. }
         | Datatype::Bitfield { size, .. }
@@ -3476,6 +3477,16 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
         } => Ok(*size as usize),
         Datatype::Compound { size, .. } | Datatype::Opaque { size, .. } => Ok(*size as usize),
         Datatype::Array { base, dims } => {
+            if dims.is_empty() {
+                return Err(Error::InvalidDefinition(
+                    "array datatype must have at least one dimension".into(),
+                ));
+            }
+            if dims.contains(&0) {
+                return Err(Error::InvalidDefinition(
+                    "array datatype dimensions must be non-zero".into(),
+                ));
+            }
             let base_size = datatype_element_size(base)?;
             let count = dims.iter().try_fold(1usize, |acc, &dim| {
                 let dim = checked_usize(dim, "array datatype dimension")?;
@@ -3489,7 +3500,13 @@ fn datatype_element_size(datatype: &Datatype) -> Result<usize> {
             ..
         } => Ok(16),
         Datatype::VarLen { .. } => Ok(16),
+    }?;
+    if size == 0 {
+        return Err(Error::InvalidDefinition(
+            "datatype byte size must be non-zero".into(),
+        ));
     }
+    Ok(size)
 }
 
 fn validate_vlen_sequence_base(datatype: &Datatype) -> Result<()> {

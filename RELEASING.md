@@ -5,15 +5,15 @@ This repository currently publishes these crates in dependency order:
 1. `hdf5-core`
 2. `netcdf-core`
 3. `hdf5-reader`
-4. `netcdf-reader`
-
-The `hdf5-writer` and `netcdf-writer` workspace crates are still under
-development, have `publish = false`, and must not be included in releases.
+4. `hdf5-writer`
+5. `netcdf-reader`
+6. `netcdf-writer`
 
 Publish verification for crates with newly versioned workspace dependencies will
 fail until those dependencies have been published and the crates.io index has
-updated. In particular, `hdf5-reader` depends on `hdf5-core`; `netcdf-reader`
-depends on `netcdf-core` and, by default, `hdf5-reader`.
+updated. The reader and writer packages also carry sibling crates as
+development dependencies, so keep the order above and wait for each published
+version to become visible before packaging the next dependent crate.
 
 ## Version prep
 
@@ -29,10 +29,13 @@ Before running the release checks:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --all -- -D warnings
-cargo test --workspace
-cargo test -p hdf5-reader --no-default-features
-cargo test -p netcdf-reader --no-default-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
+cargo test --workspace --locked
+cargo test --workspace --all-features --locked
+cargo test -p hdf5-reader --no-default-features --locked
+cargo test -p netcdf-reader --no-default-features --locked
+cargo test -p netcdf-writer --no-default-features --locked
 # MSRV: compile-check the whole workspace, then unit-test the crates that have
 # no dev-dependencies. The other crates are only compile-checked on MSRV
 # because their test-only dependencies (proptest, tempfile, criterion, the C
@@ -42,16 +45,12 @@ rustup run 1.81.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
 # Writer output conformance against the reference C libraries (needs Python
 # with netCDF4 + h5py).
 scripts/validate-writer-output.sh
+cargo audit
+# Before publishing workspace dependencies, verify every archive can be
+# assembled. Full package verification follows the staged publish order below.
+cargo package --workspace --offline --locked --no-verify
 cargo package -p hdf5-core --offline --locked
 cargo package -p netcdf-core --offline --locked
-```
-
-Package each dependent crate only after its new dependencies are visible in the
-crates.io index:
-
-```sh
-cargo package -p hdf5-reader
-cargo package -p netcdf-reader
 ```
 
 Optional but recommended:
@@ -78,10 +77,17 @@ python3 scripts/criterion_summary.py --speedup \
 cargo publish -p hdf5-core
 cargo publish -p netcdf-core
 # wait for crates.io index to update
+cargo package -p hdf5-reader
 cargo publish -p hdf5-reader
+# wait for crates.io index to update
+cargo package -p hdf5-writer
+cargo publish -p hdf5-writer
 # wait for crates.io index to update
 cargo package -p netcdf-reader
 cargo publish -p netcdf-reader
+# wait for crates.io index to update
+cargo package -p netcdf-writer
+cargo publish -p netcdf-writer
 ```
 
 After all publishes succeed:

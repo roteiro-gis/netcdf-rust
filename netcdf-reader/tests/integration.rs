@@ -170,6 +170,7 @@ fn create_nc4_unsigned_short_fixture(path: &Path) {
 struct Quality(u8);
 
 #[cfg(feature = "netcdf4")]
+// SAFETY: `Quality` is transparent over the enum's `u8` representation.
 unsafe impl netcdf::types::NcTypeDescriptor for Quality {
     fn type_descriptor() -> netcdf::types::NcVariableType {
         netcdf::types::NcVariableType::Enum(netcdf::types::EnumType {
@@ -186,6 +187,7 @@ unsafe impl netcdf::types::NcTypeDescriptor for Quality {
 struct Opaque4([u8; 4]);
 
 #[cfg(feature = "netcdf4")]
+// SAFETY: `Opaque4` has the descriptor's exact four-byte representation.
 unsafe impl netcdf::types::NcTypeDescriptor for Opaque4 {
     fn type_descriptor() -> netcdf::types::NcVariableType {
         netcdf::types::NcVariableType::Opaque(netcdf::types::OpaqueType {
@@ -205,6 +207,8 @@ struct Observation {
 }
 
 #[cfg(feature = "netcdf4")]
+// SAFETY: `Observation` uses the declared C layout, and each descriptor field
+// is derived from the corresponding Rust field's type, size, and offset.
 unsafe impl netcdf::types::NcTypeDescriptor for Observation {
     fn type_descriptor() -> netcdf::types::NcVariableType {
         netcdf::types::NcVariableType::Compound(netcdf::types::CompoundType {
@@ -243,6 +247,8 @@ struct VLenI32 {
 }
 
 #[cfg(feature = "netcdf4")]
+// SAFETY: `VLenI32` matches the netCDF vlen ABI of a length followed by an
+// element pointer, with the descriptor's element type set to `i32`.
 unsafe impl netcdf::types::NcTypeDescriptor for VLenI32 {
     fn type_descriptor() -> netcdf::types::NcVariableType {
         netcdf::types::NcVariableType::Vlen(netcdf::types::VlenType {

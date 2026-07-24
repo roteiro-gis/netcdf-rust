@@ -271,6 +271,8 @@ fn open_unix_path(path: &Path, flags: libc::c_int) -> std::io::Result<File> {
             "filesystem path contains an interior NUL byte",
         )
     })?;
+    // SAFETY: `path` is NUL-terminated, `flags` is passed through unchanged,
+    // and the returned descriptor is checked before ownership is assumed.
     let fd = unsafe { libc::open(path.as_ptr(), flags) };
     file_from_unix_fd(fd)
 }
@@ -283,6 +285,8 @@ fn open_unix_child(dir: &File, name: &OsStr, flags: libc::c_int) -> std::io::Res
             "filesystem path contains an interior NUL byte",
         )
     })?;
+    // SAFETY: `dir` owns a live descriptor, `name` is NUL-terminated, and the
+    // returned descriptor is checked before ownership is assumed.
     let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
     file_from_unix_fd(fd)
 }
@@ -292,6 +296,8 @@ fn file_from_unix_fd(fd: libc::c_int) -> std::io::Result<File> {
     if fd < 0 {
         Err(std::io::Error::last_os_error())
     } else {
+        // SAFETY: a successful `open`/`openat` returned an owned descriptor,
+        // and this transfers that ownership exactly once to `File`.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }

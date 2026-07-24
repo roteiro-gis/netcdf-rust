@@ -2,7 +2,6 @@
 name = "netcdf-writer"
 description = "Pure-Rust NetCDF encoder for classic and NetCDF-4 data models"
 version.workspace = true
-publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,9 +12,12 @@ documentation = "https://docs.rs/netcdf-writer"
 keywords = ["netcdf", "encoder", "scientific-data"]
 categories = ["science", "encoding"]
 
+[lints]
+workspace = true
+
 [dependencies]
-netcdf-core = { version = "0.8.0", path = "../netcdf-core" }
-hdf5-writer = { version = "0.8.0", path = "../hdf5-writer", optional = true }
+netcdf-core = { version = "0.9.0", path = "../netcdf-core" }
+hdf5-writer = { version = "0.9.0", path = "../hdf5-writer", optional = true }
 thiserror = { workspace = true }
 
 [features]
@@ -23,7 +25,7 @@ default = ["netcdf4"]
 netcdf4 = ["dep:hdf5-writer"]
 
 [dev-dependencies]
-netcdf-reader = { version = "0.8.0", path = "../netcdf-reader" }
+netcdf-reader = { version = "0.9.0", path = "../netcdf-reader" }
 proptest = "1"
 serde_json = "1"
 tempfile = "3"

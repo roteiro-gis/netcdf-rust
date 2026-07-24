@@ -67,7 +67,7 @@ impl BTreeV1Node {
     /// - Left sibling address (`offset_size` bytes)
     /// - Right sibling address (`offset_size` bytes)
     /// - Then interleaved keys and child pointers:
-    ///   key[0], child[0], key[1], child[1], ..., key[K-1], child[K-1], key[K]
+    ///   `key[0], child[0], key[1], child[1], ..., key[K-1], child[K-1], key[K]`
     ///   where K = entries_used.
     pub fn parse(
         cursor: &mut Cursor,
@@ -170,7 +170,7 @@ fn parse_raw_data_key(cursor: &mut Cursor, ndims: Option<u32>) -> Result<BTreeV1
 /// Walk a v1 B-tree and collect all (key, child_address) pairs from leaf nodes.
 ///
 /// For leaf nodes (level 0), this returns one entry per child paired with the
-/// key that precedes it (key[i] for child[i]). For internal nodes, this
+/// key that precedes it (`key[i]` for `child[i]`). For internal nodes, this
 /// recurses into each child node.
 ///
 /// `data` must be the full file data (or at least the region containing the

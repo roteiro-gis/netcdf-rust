@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.0 - 2026-07-23
+
 ### Writers (first release of `hdf5-writer` and `netcdf-writer`)
 
 - validate all writer output against the reference C libraries (libhdf5 via
@@ -25,6 +27,10 @@
 - fill native-endian slice growth gaps with the variable's fill value instead
   of zeros
 - eliminate redundant full-file copies in the HDF5 write path
+- fix `netcdf-writer` without default features so classic-only builds retain
+  byte conversion, fill-value, and output-writing support
+- reject zero-sized HDF5 datatypes and zero-length array dimensions before
+  producing invalid files
 
 ### Reader hardening
 
@@ -52,7 +58,7 @@
 - add unit tests for the chunk-grid coverage gate that guards the
   uninitialized-output fast path
 - run core-crate unit tests on the MSRV toolchain and test classic-only
-  parallel reads without the HDF5 stack
+  parallel reads plus classic-only writes without the HDF5 stack
 
 ### Other
 
@@ -61,6 +67,12 @@
 - bound the unlimited LZ4 decompression path's declared output size by the
   input length
 - remove the unreachable `Hdf5Writer` finalized flag
+- make zero-copy initialization boundaries explicitly unsafe, document every
+  unsafe operation's invariants, and enforce both checks with workspace lints
+- fix rustdoc links and adopt macro fragment specifiers that retain their
+  intended meaning in future Rust editions
+- update the audited development dependency graph to `anyhow` 1.0.103 and
+  `rand` 0.9.3
 
 ## 0.8.0 - 2026-07-10
 

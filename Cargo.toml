@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.81"
 license = "MIT OR Apache-2.0"
@@ -21,3 +21,10 @@ homepage = "https://github.com/roteiro-gis/netcdf-rust"
 ndarray = "0.17"
 thiserror = "2"
 memmap2 = "0.9"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(test)"] }
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
