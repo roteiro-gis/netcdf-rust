@@ -219,7 +219,7 @@ impl ClassicFile {
         }
     }
 
-    /// Read a char variable as a String (or Vec<String> for multi-dimensional).
+    /// Read a char variable as a `String` (or `Vec<String>` for multi-dimensional).
     pub fn read_variable_as_string(&self, name: &str) -> Result<String> {
         let mut strings = self.read_variable_as_strings(name)?;
         match strings.len() {
