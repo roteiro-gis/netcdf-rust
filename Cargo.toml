@@ -23,6 +23,7 @@ thiserror = "2"
 memmap2 = "0.9"
 
 [workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(test)"] }
 unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
