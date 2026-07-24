@@ -1,3 +1,4 @@
+use hdf5_core::{Datatype, StringEncoding, StringPadding, StringSize};
 use hdf5_writer::{AttributeBuilder, DatasetBuilder, Hdf5Builder};
 
 #[test]
@@ -89,4 +90,35 @@ fn wrong_length_data_returns_structured_mismatch() {
             ..
         }
     ));
+}
+
+#[test]
+fn rejects_zero_sized_datatypes() {
+    let datatypes = [
+        Datatype::Opaque {
+            size: 0,
+            tag: String::new(),
+        },
+        Datatype::String {
+            size: StringSize::Fixed(0),
+            encoding: StringEncoding::Ascii,
+            padding: StringPadding::NullPad,
+        },
+        Datatype::Array {
+            base: Box::new(Datatype::FixedPoint {
+                size: 1,
+                signed: false,
+                byte_order: hdf5_core::ByteOrder::LittleEndian,
+            }),
+            dims: vec![0],
+        },
+    ];
+
+    for datatype in datatypes {
+        let err = Hdf5Builder::new()
+            .dataset(DatasetBuilder::new("invalid", datatype, vec![1]))
+            .into_plan()
+            .unwrap_err();
+        assert!(matches!(err, hdf5_writer::Error::InvalidDefinition(_)));
+    }
 }
