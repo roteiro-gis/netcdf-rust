@@ -849,3 +849,17 @@ fn sohm_shared_attributes_resolve_on_group_and_dataset() {
         .expect("dataset shared_meta attribute");
     assert_eq!(ds_meta.read_1d::<i32>().unwrap(), vec![0, 1, 2, 3]);
 }
+
+#[test]
+fn dense_huge_attribute_uses_short_btree_key() {
+    // Attribute heaps use 8-byte heap IDs, so a huge attribute is addressed through a
+    // 7-byte v2 B-tree key rather than a full-width length field.
+    let path = skip_if_missing!("dense_huge_attribute.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let ds = file.root_group().unwrap().dataset("data").unwrap();
+    assert_eq!(ds.attributes().len(), 13);
+    let huge: Vec<f32> = ds.attribute("huge").unwrap().read_1d().unwrap();
+    assert_eq!(huge.len(), 50_000);
+    assert_eq!(huge[0], 0.0);
+    assert_eq!(huge[49_999], 49_999.0);
+}

@@ -359,6 +359,19 @@ def generate_hdf5_fixtures(base_dir):
         f.create_dataset("int32_be", data=data_i32, dtype=be_i32)
 
 
+    # ---- 23. dense_huge_attribute.h5 ----
+    # Tests: a "huge" fractal-heap object in dense attribute storage. Attribute heaps use
+    # 8-byte heap IDs, too short to hold the address and length directly, so libhdf5
+    # stores a 7-byte B-tree key (min(id_len - 1, sizeof(hsize_t))) after the flag byte.
+    path = os.path.join(hdf5_dir, "dense_huge_attribute.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest") as f:
+        ds = f.create_dataset("data", data=np.arange(4, dtype=np.int32))
+        for i in range(12):
+            ds.attrs[f"small_{i:02d}"] = np.int32(i)
+        ds.attrs["huge"] = np.arange(50_000, dtype=np.float32)
+
+
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
     import netCDF4
