@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- list a group's children in link creation order when the group tracks it, as
+  libhdf5's creation-order index and netcdf-c do, instead of on-disk storage
+  order; NetCDF-4 variables now come back in netcdf-c's order
+
 ## 0.9.1 - 2026-07-28
 
 ### Fixed

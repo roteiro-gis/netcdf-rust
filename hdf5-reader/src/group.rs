@@ -34,6 +34,8 @@ pub struct Group {
 struct ChildEntry {
     name: String,
     location: ObjectLocation,
+    /// The link's stored creation order, when its group tracks it.
+    creation_order: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -354,6 +356,16 @@ impl Group {
                     }
                 }
             }
+
+            // Storage order is not creation order: libhdf5 places compact link
+            // messages wherever the object header has room, and dense links
+            // sit in name-hash order. When the group tracks creation order
+            // (every link carries one, as in all NetCDF-4 groups), list the
+            // children in it, as `H5Literate(H5_INDEX_CRT_ORDER)` and netcdf-c
+            // do. A stable sort keeps any equal values in storage order.
+            if children.iter().all(|child| child.creation_order.is_some()) {
+                children.sort_by_key(|child| child.creation_order);
+            }
         }
 
         Ok(children)
@@ -383,6 +395,7 @@ impl Group {
             LinkTarget::Hard { address } => Ok(Some(ChildEntry {
                 name: link.name.clone(),
                 location: self.local_location(*address),
+                creation_order: link.creation_order,
             })),
             LinkTarget::Soft { path } => Ok(self
                 .resolve_soft_link_depth(path, link_depth)
@@ -390,12 +403,14 @@ impl Group {
                 .map(|location| ChildEntry {
                     name: link.name.clone(),
                     location,
+                    creation_order: link.creation_order,
                 })),
             LinkTarget::External { filename, path } => Ok(self
                 .resolve_external_link_depth(filename, path, link_depth)?
                 .map(|location| ChildEntry {
                     name: link.name.clone(),
                     location,
+                    creation_order: link.creation_order,
                 })),
         }
     }
@@ -455,6 +470,7 @@ impl Group {
                 children.push(ChildEntry {
                     name,
                     location: self.local_location(entry.object_header_address),
+                    creation_order: None,
                 });
             }
         }
@@ -522,6 +538,7 @@ impl Group {
                     children.push(ChildEntry {
                         name: link_msg.name.clone(),
                         location: self.local_location(*address),
+                        creation_order: link_msg.creation_order,
                     });
                 }
                 LinkTarget::Soft { path } => {
@@ -529,6 +546,7 @@ impl Group {
                         children.push(ChildEntry {
                             name: link_msg.name.clone(),
                             location,
+                            creation_order: link_msg.creation_order,
                         });
                     }
                 }
@@ -539,6 +557,7 @@ impl Group {
                         children.push(ChildEntry {
                             name: link_msg.name.clone(),
                             location,
+                            creation_order: link_msg.creation_order,
                         });
                     }
                 }
