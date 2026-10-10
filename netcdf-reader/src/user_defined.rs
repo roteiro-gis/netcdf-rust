@@ -411,7 +411,7 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
             kind: VarLenKind::String,
             padding,
             ..
-        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) => {
+        } if base.is_vlen_string_base() => {
             let raw = dataset.resolve_vlen_reference_bytes(bytes, 1)?;
             Ok(NcValue::String(decode_string_bytes(&raw, *padding)?))
         }

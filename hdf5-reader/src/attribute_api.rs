@@ -665,7 +665,7 @@ pub(crate) fn decode_string(
 }
 
 fn is_byte_vlen(base: &Datatype) -> bool {
-    matches!(base, Datatype::FixedPoint { size: 1, .. })
+    base.is_vlen_string_base()
 }
 
 pub(crate) fn decode_varlen_byte_string(bytes: &[u8]) -> Result<String> {

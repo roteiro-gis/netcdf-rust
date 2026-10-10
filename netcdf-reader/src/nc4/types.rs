@@ -102,7 +102,7 @@ pub fn hdf5_to_nc_type(dtype: &Datatype) -> Result<NcType> {
             base,
             kind: VarLenKind::String,
             ..
-        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) => Ok(NcType::String),
+        } if base.is_vlen_string_base() => Ok(NcType::String),
         Datatype::VarLen { base, .. } => {
             let base_nc = hdf5_to_nc_type(base)?;
             Ok(NcType::VLen {

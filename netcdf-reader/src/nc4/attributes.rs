@@ -146,15 +146,7 @@ fn convert_attribute_value(
             base,
             kind: VarLenKind::String,
             ..
-        } if matches!(
-            base.as_ref(),
-            Datatype::FixedPoint {
-                size: 1,
-                signed: false,
-                ..
-            }
-        ) =>
-        {
+        } if base.is_vlen_string_base() => {
             if attr.shape.is_empty() {
                 read_attr(attr.read_string().map(NcAttrValue::Chars))
             } else {

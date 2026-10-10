@@ -281,6 +281,27 @@ pub enum Datatype {
     },
 }
 
+impl Datatype {
+    /// Whether this is an acceptable base type for a variable-length *string*.
+    ///
+    /// netcdf-c classifies a type as `NC_STRING` from `H5Tget_class == H5T_STRING`
+    /// and `H5Tis_variable_str` alone and never inspects the base type
+    /// (`libhdf5/hdf5open.c`). Writers differ in what they record there: libhdf5
+    /// uses a one-byte integer, rust-hdf5 a one-byte fixed string. Both store one
+    /// byte per character, which is how the readers decode the payload, so any
+    /// one-byte unit is accepted and wider ones are not.
+    pub fn is_vlen_string_base(&self) -> bool {
+        matches!(
+            self,
+            Datatype::FixedPoint { size: 1, .. }
+                | Datatype::String {
+                    size: StringSize::Fixed(1),
+                    ..
+                }
+        )
+    }
+}
+
 /// Datatype message payload plus element size from the message header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatatypeMessage {
@@ -444,6 +465,34 @@ pub struct LinkMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vlen_string_base_accepts_one_byte_units_only() {
+        let int8 = Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        };
+        let char1 = Datatype::String {
+            size: StringSize::Fixed(1),
+            encoding: StringEncoding::Utf8,
+            padding: StringPadding::NullTerminate,
+        };
+        let char2 = Datatype::String {
+            size: StringSize::Fixed(2),
+            encoding: StringEncoding::Utf8,
+            padding: StringPadding::NullTerminate,
+        };
+        let int16 = Datatype::FixedPoint {
+            size: 2,
+            signed: false,
+            byte_order: ByteOrder::LittleEndian,
+        };
+        assert!(int8.is_vlen_string_base());
+        assert!(char1.is_vlen_string_base());
+        assert!(!char2.is_vlen_string_base());
+        assert!(!int16.is_vlen_string_base());
+    }
 
     #[test]
     fn jenkins_lookup3_is_deterministic() {

@@ -215,10 +215,8 @@ impl Group {
                     base,
                     kind: VarLenKind::String,
                     ..
-                } if matches!(
-                    base.as_ref(),
-                    crate::messages::datatype::Datatype::FixedPoint { size: 1, .. }
-                ) && matches!(attr.dataspace.num_elements(), Ok(1)) =>
+                } if base.is_vlen_string_base()
+                    && matches!(attr.dataspace.num_elements(), Ok(1)) =>
                 {
                     resolve_vlen_bytes_storage(
                         &attr.raw_data,

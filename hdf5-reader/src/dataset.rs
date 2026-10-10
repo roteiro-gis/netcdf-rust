@@ -1051,7 +1051,7 @@ impl Dataset {
                 encoding,
                 padding,
             } => {
-                if !matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. }) {
+                if !base.is_vlen_string_base() {
                     return Err(Error::TypeMismatch {
                         expected: "String dataset".into(),
                         actual: format!("{:?}", self.datatype),
@@ -3351,9 +3351,7 @@ fn attribute_from_message_storage(message: &AttributeMessage, context: &FileCont
             base,
             kind: VarLenKind::String,
             ..
-        } if matches!(base.as_ref(), Datatype::FixedPoint { size: 1, .. })
-            && matches!(message.dataspace.num_elements(), Ok(1)) =>
-        {
+        } if base.is_vlen_string_base() && matches!(message.dataspace.num_elements(), Ok(1)) => {
             resolve_vlen_bytes_storage(
                 &message.raw_data,
                 context.storage.as_ref(),
