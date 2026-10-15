@@ -606,6 +606,37 @@ fn extensible_array_chunked() {
 }
 
 #[test]
+fn filtered_chunk_size_fields_of_three_and_five_bytes() {
+    // libhdf5 writes the chunk-size field of fixed array, extensible array and v2
+    // B-tree entries 1 + (log2(chunk bytes) + 8) / 8 bytes wide: 3 bytes for the
+    // 2 KiB gzip chunks, 5 bytes for the 16 MiB ones.
+    let path = skip_if_missing!("filtered_chunk_size_widths.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    for name in ["/fixed", "/extensible", "/btree_v2"] {
+        let ds = file.dataset(name).unwrap();
+        assert_eq!(ds.shape(), &[32, 48], "{name}");
+        let data: ndarray::ArrayD<f64> = ds.read_array().unwrap_or_else(|e| panic!("{name}: {e}"));
+        for (i, v) in data.iter().enumerate() {
+            assert_eq!(*v, i as f64, "{name} element {i}");
+        }
+
+        let large = format!("{name}_16mib");
+        let ds = file.dataset(&large).unwrap();
+        assert_eq!(ds.shape(), &[4096, 2048], "{large}");
+        let data: ndarray::ArrayD<f64> = ds.read_array().unwrap_or_else(|e| panic!("{large}: {e}"));
+        for (i, v) in data.iter().enumerate() {
+            let (r, c) = (i / 2048, i % 2048);
+            let expected = if r % 1021 == 0 && c % 509 == 0 {
+                i as f64
+            } else {
+                0.0
+            };
+            assert_eq!(*v, expected, "{large} element ({r}, {c})");
+        }
+    }
+}
+
+#[test]
 fn btree_v2_chunked() {
     let path = skip_if_missing!("btree_v2_chunked.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

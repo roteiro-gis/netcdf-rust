@@ -216,7 +216,8 @@ fn read_entries(
                 .checked_sub(offset_size)
                 .and_then(|remaining| remaining.checked_sub(4))
                 .ok_or_else(|| Error::InvalidData("invalid fixed array entry size".into()))?;
-            let cs = cursor.read_length(chunk_size_len)?;
+            // 1–8 bytes wide (sized to the chunk), not a "length" of the superblock size.
+            let cs = cursor.read_uvar(chunk_size_len as usize)?;
             let fm = cursor.read_u32_le()?;
             (cs, fm)
         } else {

@@ -380,7 +380,8 @@ fn parse_record(
                 )));
             }
             let address = cursor.read_offset(offset_size)?;
-            let chunk_size = cursor.read_length(chunk_size_len as u8)?;
+            // The chunk-size field is 1–8 bytes wide (sized to the chunk), not a "length".
+            let chunk_size = cursor.read_uvar(chunk_size_len)?;
             let filter_mask = cursor.read_u32_le()?;
             let offsets = read_scaled_chunk_offsets(cursor, ndims_val, ndims, chunk_dims)?;
             BTreeV2Record::ChunkedFiltered {
