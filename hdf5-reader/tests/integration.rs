@@ -350,6 +350,51 @@ fn old_format_v1() {
 }
 
 #[test]
+fn compound_v1_with_float_members() {
+    let path = skip_if_missing!("compound_v1_floats.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/table").unwrap();
+    assert_eq!(ds.shape(), &[3]);
+    match ds.dtype() {
+        hdf5_reader::messages::datatype::Datatype::Compound { size, fields } => {
+            assert_eq!(*size, 24);
+            let names: Vec<_> = fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.byte_offset))
+                .collect();
+            assert_eq!(names, [("x", 0), ("name", 4), ("count", 20)]);
+        }
+        other => panic!("expected a compound datatype, got {other:?}"),
+    }
+    let raw = ds.read_raw_bytes().unwrap();
+    let raw: &[u8] = &raw;
+    assert_eq!(raw.len(), 72);
+    let count =
+        |row: usize| i32::from_le_bytes(raw[row * 24 + 20..row * 24 + 24].try_into().unwrap());
+    assert_eq!((count(0), count(1), count(2)), (1, 2, 3));
+    assert_eq!(&raw[24 + 4..24 + 8], b"beta");
+}
+
+#[test]
+fn old_fill_value_message_fills_unwritten_chunks() {
+    let path = skip_if_missing!("fill_value_old_message.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+
+    let ds = file.dataset("/sparse").unwrap();
+    let data: ndarray::ArrayD<i32> = ds.read_array().unwrap();
+    assert_eq!(data.shape(), &[8, 2]);
+    assert_eq!(data[[3, 1]], 7);
+    for row in 4..8 {
+        assert_eq!(
+            (data[[row, 0]], data[[row, 1]]),
+            (i32::MIN, i32::MIN),
+            "row {row}"
+        );
+    }
+}
+
+#[test]
 fn fill_value() {
     let path = skip_if_missing!("fill_value.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();

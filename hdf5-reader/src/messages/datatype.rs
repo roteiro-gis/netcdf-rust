@@ -255,14 +255,17 @@ fn parse_compound(
     let mut fields = Vec::with_capacity(n_members);
 
     for _ in 0..n_members {
+        let name_start = cursor.position();
         let name = cursor.read_null_terminated_string()?;
 
         if version < 3 {
-            // V1/V2: name is padded to 8-byte boundary (relative to start of name)
-            // The null terminator is included in the count. We already read
-            // through the null terminator via read_null_terminated_string.
-            // Pad the position to 8-byte alignment.
-            cursor.align(8)?;
+            // V1/V2: the name, null terminator included, is padded to a multiple of
+            // eight bytes counted from the start of the name, not from the start of the
+            // buffer. A member whose datatype description is not a multiple of eight
+            // bytes long (a fixed-length string's is 8, a float's 20) leaves the next
+            // name off the buffer's 8-byte grid.
+            let used = (cursor.position() - name_start) as usize;
+            cursor.skip(used.next_multiple_of(8) - used)?;
         }
 
         let byte_offset = if version == 1 {
@@ -756,6 +759,72 @@ mod tests {
             }
             other => panic!("expected Reference, got {:?}", other),
         }
+    }
+
+    /// A version 1 compound member: its name padded to a multiple of eight bytes, the
+    /// byte offset, then dimensionality, reserved, permutation, reserved and four
+    /// dimension sizes, then the member's own datatype description.
+    fn compound_v1_member(data: &mut Vec<u8>, name: &str, offset: u32, member: &[u8]) {
+        let mut padded = name.as_bytes().to_vec();
+        padded.push(0);
+        padded.resize(padded.len().next_multiple_of(8), 0);
+        data.extend_from_slice(&padded);
+        data.extend_from_slice(&offset.to_le_bytes());
+        data.extend_from_slice(&[0u8; 28]);
+        data.extend_from_slice(member);
+    }
+
+    #[test]
+    fn parse_compound_v1_pads_names_relative_to_their_start() {
+        // A float description is 20 bytes and a fixed string's is 8, so after the first
+        // two members the third name starts four bytes off the buffer's 8-byte grid
+        // (as in HEC-RAS attribute tables). Its padding must still be counted from the
+        // start of the name.
+        let mut float = Vec::new();
+        float.extend_from_slice(&class_word(1, 1, 0x20).to_le_bytes());
+        float.extend_from_slice(&4u32.to_le_bytes());
+        float.extend_from_slice(&0u16.to_le_bytes());
+        float.extend_from_slice(&32u16.to_le_bytes());
+        float.extend_from_slice(&[23, 8, 0, 23]);
+        float.extend_from_slice(&127u32.to_le_bytes());
+        let mut string = Vec::new();
+        string.extend_from_slice(&class_word(3, 1, 0x00).to_le_bytes());
+        string.extend_from_slice(&16u32.to_le_bytes());
+        let mut int = Vec::new();
+        int.extend_from_slice(&class_word(0, 1, 0x08).to_le_bytes());
+        int.extend_from_slice(&4u32.to_le_bytes());
+        int.extend_from_slice(&0u16.to_le_bytes());
+        int.extend_from_slice(&32u16.to_le_bytes());
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&class_word(6, 1, 3).to_le_bytes());
+        data.extend_from_slice(&24u32.to_le_bytes());
+        compound_v1_member(&mut data, "x", 0, &float);
+        compound_v1_member(&mut data, "name", 4, &string);
+        compound_v1_member(&mut data, "count", 20, &int);
+
+        let mut cursor = Cursor::new(&data);
+        let msg = parse(&mut cursor, data.len()).unwrap();
+        match &msg.datatype {
+            Datatype::Compound { size, fields } => {
+                assert_eq!(*size, 24);
+                let names: Vec<_> = fields
+                    .iter()
+                    .map(|f| (f.name.as_str(), f.byte_offset))
+                    .collect();
+                assert_eq!(names, [("x", 0), ("name", 4), ("count", 20)]);
+                assert!(matches!(
+                    fields[2].datatype,
+                    Datatype::FixedPoint {
+                        size: 4,
+                        signed: true,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected Compound, got {:?}", other),
+        }
+        assert_eq!(cursor.position() as usize, data.len());
     }
 
     #[test]

@@ -10,16 +10,28 @@ pub use hdf5_core::{FillTime, FillValueMessage};
 
 /// Parse the old fill value message (type 0x0004).
 ///
-/// The entire message body is the raw fill value bytes.
+/// The body is a four-byte size followed by that many bytes of fill value. Any bytes
+/// after the value (alignment padding) are skipped.
 pub fn parse_old(
     cursor: &mut Cursor<'_>,
     _offset_size: u8,
     _length_size: u8,
     msg_size: usize,
 ) -> Result<FillValueMessage> {
-    let value = if msg_size > 0 {
-        Some(cursor.read_bytes(msg_size)?.to_vec())
+    let value = if msg_size >= 4 {
+        let size = cursor.read_u32_le()? as usize;
+        if size > msg_size - 4 {
+            return Err(Error::InvalidData(format!(
+                "old fill value message: value size {size} exceeds message size {msg_size}"
+            )));
+        }
+        let value = (size > 0)
+            .then(|| cursor.read_bytes(size).map(<[u8]>::to_vec))
+            .transpose()?;
+        cursor.skip(msg_size - 4 - size)?;
+        value
     } else {
+        cursor.skip(msg_size)?;
         None
     };
 
@@ -134,11 +146,22 @@ mod tests {
 
     #[test]
     fn parse_old_fill() {
-        let data = [0x01, 0x02, 0x03, 0x04];
+        // size = 4, then the value (0x80000000, i32::MIN), then padding to 8 bytes.
+        let data = [
+            0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xAA, 0xAA, 0xAA, 0xAA,
+        ];
         let mut cursor = Cursor::new(&data);
-        let msg = parse_old(&mut cursor, 8, 8, 4).unwrap();
+        let msg = parse_old(&mut cursor, 8, 8, data.len()).unwrap();
         assert!(msg.defined);
-        assert_eq!(msg.value.unwrap(), vec![0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(msg.value.unwrap(), vec![0x00, 0x00, 0x00, 0x80]);
+        assert_eq!(cursor.position() as usize, data.len());
+    }
+
+    #[test]
+    fn parse_old_fill_rejects_oversized_value() {
+        let data = [0x08, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04];
+        let mut cursor = Cursor::new(&data);
+        assert!(parse_old(&mut cursor, 8, 8, data.len()).is_err());
     }
 
     #[test]

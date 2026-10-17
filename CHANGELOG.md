@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- read version 1/2 compound datatypes whose member names start off the 8-byte grid:
+  a name is padded to a multiple of eight bytes from its own start, not from the
+  start of the buffer, so a member after a float (20-byte description) no longer
+  derails the parse (`unsupported datatype class`, `unexpected end of data`).
+  HEC-RAS geometry and plan files hit this in every attribute table
+- read the old fill value message (type 0x0004) as a size followed by the value;
+  the size was taken as part of the value, so unwritten chunks read back wrong
+
 ## 0.9.1 - 2026-07-28
 
 ### Fixed

@@ -146,6 +146,26 @@ def generate_hdf5_fixtures(base_dir):
         data = np.arange(20, dtype=np.float64).reshape(4, 5)
         f.create_dataset("data", data=data)
 
+    # ---- 10b. compound_v1_floats.h5 ----
+    # Tests: version 1 compound datatype (earliest format) whose member names start off
+    # the 8-byte grid: a float member (20-byte description) followed by a fixed-length
+    # string member. HEC-RAS geometry and plan files store their attribute tables so.
+    path = os.path.join(hdf5_dir, "compound_v1_floats.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        dt = np.dtype([("x", np.float32), ("name", "S16"), ("count", np.int32)])
+        data = np.array([(1.5, b"alpha", 1), (2.5, b"beta", 2), (3.5, b"gamma", 3)], dtype=dt)
+        f.create_dataset("table", data=data)
+
+    # ---- 10c. fill_value_old_message.h5 ----
+    # Tests: the old fill value message (size, then value) on a chunked dataset with an
+    # unwritten chunk (earliest format), which must read back as the fill value.
+    path = os.path.join(hdf5_dir, "fill_value_old_message.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="earliest", track_order=False) as f:
+        ds = f.create_dataset("sparse", shape=(8, 2), dtype=np.int32, chunks=(4, 2), fillvalue=-2147483648)
+        ds[0:4] = np.arange(8, dtype=np.int32).reshape(4, 2)
+
     # ---- 11. fill_value.h5 ----
     # Tests: explicit fill values and sparse writes where unwritten elements keep the fill value.
     path = os.path.join(hdf5_dir, "fill_value.h5")
