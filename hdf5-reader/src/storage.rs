@@ -10,10 +10,14 @@ use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
 
+/// Bytes owned by any value that can lend them, shared without copying.
+type SharedOwner = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
 #[derive(Clone)]
 enum StorageBacking {
     Bytes(Arc<[u8]>),
     Mmap(Arc<Mmap>),
+    Owned(SharedOwner),
 }
 
 /// An immutable byte range returned by a storage backend.
@@ -25,13 +29,38 @@ pub struct StorageBuffer {
 }
 
 impl StorageBuffer {
+    /// A buffer that owns `bytes`. The bytes are not copied.
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         let len = bytes.len();
         Self {
-            backing: StorageBacking::Bytes(Arc::<[u8]>::from(bytes)),
+            backing: StorageBacking::Owned(Arc::new(bytes)),
             start: 0,
             len,
         }
+    }
+
+    /// A buffer over `len` bytes at `start` of shared bytes, without copying them. Custom
+    /// [`Storage`] backends that already hold their data use it to serve ranges.
+    ///
+    /// Returns [`Error::UnexpectedEof`] when the range is not inside `bytes`.
+    pub fn from_shared(bytes: Arc<[u8]>, start: usize, len: usize) -> Result<Self> {
+        check_slice_range(bytes.len(), start, len)?;
+        Ok(Self::from_arc_bytes(bytes, start, len))
+    }
+
+    /// [`Self::from_shared`] for bytes lent by any owner (a `Vec<u8>`, a `bytes::Bytes`, a
+    /// memory map, ...), without copying them.
+    pub fn from_shared_owner(
+        owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        start: usize,
+        len: usize,
+    ) -> Result<Self> {
+        check_slice_range((*owner).as_ref().len(), start, len)?;
+        Ok(Self {
+            backing: StorageBacking::Owned(owner),
+            start,
+            len,
+        })
     }
 
     pub(crate) fn from_arc_bytes(bytes: Arc<[u8]>, start: usize, len: usize) -> Self {
@@ -72,6 +101,7 @@ impl Deref for StorageBuffer {
         match &self.backing {
             StorageBacking::Bytes(bytes) => &bytes[self.start..self.start + self.len],
             StorageBacking::Mmap(mmap) => &mmap[self.start..self.start + self.len],
+            StorageBacking::Owned(owner) => &(**owner).as_ref()[self.start..self.start + self.len],
         }
     }
 }
@@ -107,22 +137,61 @@ fn check_storage_range(total_len: u64, offset: u64, len: usize) -> Result<u64> {
     Ok(end)
 }
 
-/// In-memory storage backed by owned bytes.
+/// `start..start + len` must lie inside a slice of `total` bytes.
+fn check_slice_range(total: usize, start: usize, len: usize) -> Result<()> {
+    match start.checked_add(len) {
+        Some(end) if end <= total => Ok(()),
+        _ => Err(Error::UnexpectedEof {
+            offset: start as u64,
+            needed: len as u64,
+            available: total.saturating_sub(start) as u64,
+        }),
+    }
+}
+
+/// In-memory storage over bytes it owns or shares. No constructor copies the bytes, and
+/// reads return views of them.
 pub struct BytesStorage {
-    data: Arc<[u8]>,
+    data: StorageBacking,
 }
 
 impl BytesStorage {
+    /// Storage that owns `data`, without copying it.
     pub fn new(data: Vec<u8>) -> Self {
+        Self::from_owner(data)
+    }
+
+    /// Storage over shared bytes, without copying them: the caller can keep its own handle,
+    /// and the bytes are freed when the last handle is dropped.
+    pub fn from_shared(data: Arc<[u8]>) -> Self {
         Self {
-            data: Arc::<[u8]>::from(data),
+            data: StorageBacking::Bytes(data),
+        }
+    }
+
+    /// Storage over the bytes of any owner (a `Vec<u8>`, a `Box<[u8]>`, a `bytes::Bytes`,
+    /// a memory map, ...), without copying them.
+    pub fn from_owner<T>(owner: T) -> Self
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        Self {
+            data: StorageBacking::Owned(Arc::new(owner)),
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.data {
+            StorageBacking::Bytes(bytes) => bytes,
+            StorageBacking::Mmap(mmap) => mmap,
+            StorageBacking::Owned(owner) => (**owner).as_ref(),
         }
     }
 }
 
 impl Storage for BytesStorage {
     fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.bytes().len() as u64
     }
 
     fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
@@ -130,14 +199,18 @@ impl Storage for BytesStorage {
         let end = start
             .checked_add(len)
             .ok_or(Error::OffsetOutOfBounds(offset))?;
-        if end > self.data.len() {
+        if end > self.bytes().len() {
             return Err(Error::UnexpectedEof {
                 offset,
                 needed: len as u64,
                 available: self.len().saturating_sub(offset),
             });
         }
-        Ok(StorageBuffer::from_arc_bytes(self.data.clone(), start, len))
+        Ok(StorageBuffer {
+            backing: self.data.clone(),
+            start,
+            len,
+        })
     }
 }
 
@@ -478,6 +551,64 @@ mod tests {
     use super::*;
 
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn bytes_storage_reads_are_views_of_the_owned_vec() {
+        let data: Vec<u8> = (0..=255).collect();
+        let base = data.as_ptr();
+        let storage = BytesStorage::new(data);
+        let buffer = storage.read_range(16, 32).unwrap();
+        assert_eq!(buffer.as_ptr(), base.wrapping_add(16));
+        assert_eq!(&*buffer, &(16..48).collect::<Vec<u8>>()[..]);
+        assert_eq!(StorageBuffer::from_vec(vec![1, 2, 3]).len(), 3);
+    }
+
+    #[test]
+    fn shared_storage_keeps_the_callers_bytes() {
+        let data: Arc<[u8]> = (0..=255).collect::<Vec<u8>>().into();
+        let storage = BytesStorage::from_shared(Arc::clone(&data));
+        let buffer = storage.read_range(200, 56).unwrap();
+        assert_eq!(buffer.as_ptr(), data[200..].as_ptr());
+        // The caller's handle, the storage's, and the buffer's.
+        assert_eq!(Arc::strong_count(&data), 3);
+        drop((storage, buffer));
+        assert_eq!(Arc::strong_count(&data), 1);
+    }
+
+    #[test]
+    fn owner_storage_serves_ranges_of_any_owner() {
+        let boxed: Box<[u8]> = vec![7u8; 64].into_boxed_slice();
+        let base = boxed.as_ptr();
+        let storage = BytesStorage::from_owner(boxed);
+        assert_eq!(storage.len(), 64);
+        assert_eq!(
+            storage.read_range(63, 1).unwrap().as_ptr(),
+            base.wrapping_add(63)
+        );
+        assert_eq!(storage.read_range(64, 0).unwrap().len(), 0);
+        assert!(matches!(
+            storage.read_range(60, 5),
+            Err(Error::UnexpectedEof {
+                offset: 60,
+                needed: 5,
+                available: 4
+            })
+        ));
+        assert!(storage.read_range(u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn shared_buffers_check_their_range() {
+        let data: Arc<[u8]> = vec![1u8; 10].into();
+        let buffer = StorageBuffer::from_shared(Arc::clone(&data), 4, 6).unwrap();
+        assert_eq!(buffer.as_ptr(), data[4..].as_ptr());
+        assert!(StorageBuffer::from_shared(Arc::clone(&data), 5, 6).is_err());
+        assert!(StorageBuffer::from_shared(Arc::clone(&data), usize::MAX, 2).is_err());
+        let owner: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(vec![2u8; 10]);
+        let buffer = StorageBuffer::from_shared_owner(Arc::clone(&owner), 10, 0).unwrap();
+        assert!(buffer.is_empty());
+        assert!(StorageBuffer::from_shared_owner(owner, 11, 0).is_err());
+    }
 
     #[test]
     fn range_request_storage_reads_exact_ranges() {

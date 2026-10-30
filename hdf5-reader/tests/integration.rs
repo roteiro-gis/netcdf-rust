@@ -1784,3 +1784,42 @@ fn vlen_string_attributes_with_a_fixed_string_base_are_read() {
     );
     assert_eq!(temp.attribute("units").unwrap().read_string().unwrap(), "K");
 }
+
+/// Every dataset of the root group, as raw bytes, by name.
+fn root_raw_bytes(file: &hdf5_reader::Hdf5File) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<_> = file
+        .root_group()
+        .unwrap()
+        .datasets()
+        .unwrap()
+        .iter()
+        .map(|d| (d.name().to_owned(), d.read_raw_bytes().unwrap()))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn shared_and_owned_bytes_open_without_copying_and_read_as_a_path_open() {
+    use hdf5_reader::{Hdf5File, OpenOptions};
+    let path = skip_if_missing!("chunked_shuffle_deflate.h5");
+    let expected = root_raw_bytes(&Hdf5File::open(&path).unwrap());
+    assert!(!expected.is_empty());
+    let bytes = std::fs::read(&path).unwrap();
+
+    let shared: Arc<[u8]> = bytes.clone().into();
+    let file = Hdf5File::from_shared_bytes(Arc::clone(&shared)).unwrap();
+    assert_eq!(root_raw_bytes(&file), expected);
+    // The file reads the caller's bytes, not a copy of them.
+    let view = file.storage().read_range(0, 8).unwrap();
+    assert_eq!(view.as_ptr(), shared.as_ptr());
+    drop((file, view));
+    assert_eq!(Arc::strong_count(&shared), 1);
+
+    let base = bytes.as_ptr();
+    let file = Hdf5File::from_vec(bytes.clone()).unwrap();
+    assert_eq!(root_raw_bytes(&file), expected);
+    let file = Hdf5File::from_owner(bytes.into_boxed_slice(), OpenOptions::default()).unwrap();
+    assert_eq!(file.storage().read_range(0, 8).unwrap().as_ptr(), base);
+    assert_eq!(root_raw_bytes(&file), expected);
+}

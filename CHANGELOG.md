@@ -4,6 +4,17 @@
 
 ### Added
 
+- open HDF5 files from shared or borrowed-owner bytes without copying them:
+  `Hdf5File::from_shared_bytes` (`Arc<[u8]>`) and `Hdf5File::from_owner` (any
+  `AsRef<[u8]> + Send + Sync` owner), `BytesStorage::from_shared` and
+  `BytesStorage::from_owner`, and `StorageBuffer::from_shared` and
+  `StorageBuffer::from_shared_owner` for custom storage backends
+
+### Improved
+
+- `Hdf5File::from_vec`, `BytesStorage::new` and `StorageBuffer::from_vec` no
+  longer copy their bytes into a new `Arc<[u8]>`, so an in-memory open needs no
+  second buffer and each positional `FileStorage` read is copied once, not twice
 - add `OpenOptions::max_read_bytes`, a limit on the decoded bytes one dataset
   read may allocate, which is unlimited by default, and
   `OpenOptions::max_object_header_bytes`, a limit on the bytes of one object

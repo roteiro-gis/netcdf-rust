@@ -755,6 +755,26 @@ impl Hdf5File {
         Self::from_vec_with_options(data, OpenOptions::default())
     }
 
+    /// Open an HDF5 file from shared bytes without copying them. The caller can keep its own
+    /// handle, to open the same bytes again or read them otherwise.
+    pub fn from_shared_bytes(data: Arc<[u8]>) -> Result<Self> {
+        Self::from_shared_bytes_with_options(data, OpenOptions::default())
+    }
+
+    /// [`Self::from_shared_bytes`] with custom options.
+    pub fn from_shared_bytes_with_options(data: Arc<[u8]>, options: OpenOptions) -> Result<Self> {
+        Self::from_storage_with_options(Arc::new(BytesStorage::from_shared(data)), options)
+    }
+
+    /// Open an HDF5 file from the bytes of any owner (a `Box<[u8]>`, a `bytes::Bytes`, ...)
+    /// without copying them.
+    pub fn from_owner<T>(owner: T, options: OpenOptions) -> Result<Self>
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        Self::from_storage_with_options(Arc::new(BytesStorage::from_owner(owner)), options)
+    }
+
     /// Open an HDF5 file from an owned byte vector with custom options.
     pub fn from_vec_with_options(data: Vec<u8>, options: OpenOptions) -> Result<Self> {
         Self::from_storage_with_options(Arc::new(BytesStorage::new(data)), options)
