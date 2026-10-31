@@ -2,6 +2,77 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- replace `MaskParams::missing_value: Option<f64>` with
+  `MaskParams::missing_values: Vec<f64>` to support every sentinel in a CF
+  `missing_value` attribute. For manual construction, use `vec![value]` for
+  one sentinel or `Vec::new()` for none (#122)
+- add `NcOpenOptions::{max_chunk_bytes, max_read_bytes,
+  max_object_header_bytes}` when the `netcdf4` feature is enabled. Update
+  exhaustive struct literals or use `..NcOpenOptions::default()` (#124)
+- add a `dim_id_map: &HashMap<i64, NcDimension>` parameter before
+  `metadata_mode` to `nc4::variables::{extract_variable, extract_variables,
+  extract_variables_from_datasets}`. It maps `_Netcdf4Dimid` IDs to visible
+  dimensions so multi-dimensional coordinate variables can resolve their
+  `_Netcdf4Coordinates` metadata; include inherited dimensions when calling
+  these functions directly (#125)
+- add `NcAttrValue::UserDefined { dtype, values }` for decoded compound,
+  opaque, and non-string vlen attributes. Update exhaustive matches on
+  `NcAttrValue`; values use the existing `NcValue` representation
+
+### Added
+
+- decode SZIP-compressed HDF5 and NetCDF-4 datasets, including nearest-neighbor
+  and entropy-coding modes (#130)
+- open NetCDF files from owned or shared bytes without a second full-file
+  copy with `NcFile::{from_vec, from_shared_bytes}` or
+  `NcFile::from_owner(owner, options)`; these entry points require the
+  `netcdf4` feature and accept both NetCDF-4 and classic files. Classic
+  `from_storage` opens also remain range-backed instead of reading the
+  whole file into memory (#126)
+- expose HDF5 chunk, selection, and object-header allocation limits through
+  `NcOpenOptions`. Defaults are 256 MiB per chunk, unlimited per selection,
+  and 64 MiB per object header (#124)
+
+### Improved
+
+- replace quadratic duplicate checks when listing dense HDF5 groups with
+  a hash set, preserving aliases, external-file identities, and listing order
+- cache parsed global heap collections per file so repeated variable-length
+  string and dimension-reference reads reuse them (#117)
+
+### Fixed
+
+- split writer variable-length data across global heap collections after
+  65,535 objects instead of overflowing the 16-bit object index (#118)
+- read HDF5 and NetCDF-4 files behind a user block. `Superblock::base_address`
+  now reports the byte position where the superblock was found, which is the
+  effective base for file addresses, rather than the value recorded in the
+  superblock (#119)
+- return errors for non-null variable-length references to missing global
+  heap objects instead of substituting empty strings (#117)
+- report a NetCDF-4 unlimited dimension at the longest variable extent
+  across its defining group and descendant groups, including when its
+  dimension scale is shorter (#120). Shorter variables expose this logical
+  shape and pad unwritten records with fill values in full, sliced, buffer,
+  string, user-defined, and parallel reads; child dimensions that shadow
+  ancestor names remain independent
+- honor CF `_Unsigned` in masked and unpacked reads, mask every value in a
+  vector `missing_value` attribute, and compare masking attributes in the
+  variable's stored type before unpacking (#122)
+- decode compound, opaque, and non-string vlen attributes on NetCDF-4
+  groups and variables, including nested fields and heap-backed sequences.
+  Expose enum attributes as their underlying integer values (#123)
+- preserve every dimension of multi-dimensional coordinate variables using
+  `_Netcdf4Coordinates`, instead of reporting them as one-dimensional (#125)
+- accept absolute and slash-normalized variable paths in classic NetCDF
+  reads, matching the variable lookup API (#127)
+- bound fuzz-target reads before allocating so mutated sparse dataset
+  extents cannot trigger enormous allocations under ASan (#124, #128)
+- read v2 B-trees with nested internal nodes, including the dense link
+  indexes of groups with thousands of members (#129)
+
 ## 0.11.0 - 2026-10-30
 
 ### Added
