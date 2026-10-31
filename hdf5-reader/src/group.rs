@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::attribute_api::{
@@ -449,13 +450,18 @@ impl Group {
             // Dense-link storage can coexist with compact links, so merge both.
             if let Some(ref li) = link_info {
                 if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
+                    // Include the file context: external links can resolve to the
+                    // same address in different files. Preserve aliases by name.
+                    let identity = |child: &ChildEntry| {
+                        (
+                            child.name.clone(),
+                            child.location.address,
+                            Arc::as_ptr(&child.location.context),
+                        )
+                    };
+                    let mut seen: HashSet<_> = children.iter().map(identity).collect();
                     for child in self.resolve_dense_links_storage(li, walk)? {
-                        let is_duplicate = children.iter().any(|existing| {
-                            existing.name == child.name
-                                && existing.location.address == child.location.address
-                                && Arc::ptr_eq(&existing.location.context, &child.location.context)
-                        });
-                        if !is_duplicate {
+                        if seen.insert(identity(&child)) {
                             children.push(child);
                         }
                     }
@@ -948,5 +954,86 @@ fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildOb
         ChildObjectKind::Group
     } else {
         ChildObjectKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ExternalLinkResolver, Hdf5File, OpenOptions};
+
+    const DENSE_GROUP: &[u8] = include_bytes!("../../testdata/hdf5/dense_groups.h5");
+
+    #[test]
+    fn compact_and_dense_links_deduplicate_targets_and_preserve_aliases() {
+        let file = Hdf5File::from_bytes(DENSE_GROUP).unwrap();
+        let root = file.root_group().unwrap();
+        let expected = root.resolve_children().unwrap();
+        let original = &expected[0];
+        let mut header = (*root.cached_header(root.address).unwrap()).clone();
+        for name in [original.name.clone(), "alias".to_string()] {
+            header.messages.push(HdfMessage::Link(LinkMessage {
+                name,
+                target: LinkTarget::Hard {
+                    address: original.location.address,
+                },
+                creation_order: None,
+            }));
+        }
+        root.context
+            .header_cache
+            .lock()
+            .insert(root.address, Arc::new(header));
+
+        let children = root.resolve_children().unwrap();
+        assert_eq!(children.len(), expected.len() + 1);
+        assert_eq!(children[0].name, original.name);
+        assert_eq!(children[1].name, "alias");
+        assert_eq!(children[0].location.address, children[1].location.address);
+        let remaining: Vec<_> = children[2..].iter().map(|child| &child.name).collect();
+        let expected: Vec<_> = expected[1..].iter().map(|child| &child.name).collect();
+        assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn links_to_the_same_address_in_different_files_remain_distinct() {
+        struct Resolver(Hdf5File);
+        impl ExternalLinkResolver for Resolver {
+            fn resolve_external_link(&self, _: &str) -> Result<Option<Hdf5File>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let external = Hdf5File::from_bytes(DENSE_GROUP).unwrap();
+        let file = Hdf5File::from_bytes_with_options(
+            DENSE_GROUP,
+            OpenOptions::default().with_external_link_resolver(Arc::new(Resolver(external))),
+        )
+        .unwrap();
+        let root = file.root_group().unwrap();
+        let expected = root.resolve_children().unwrap();
+        let original = &expected[0];
+        let mut header = (*root.cached_header(root.address).unwrap()).clone();
+        header.messages.push(HdfMessage::Link(LinkMessage {
+            name: original.name.clone(),
+            target: LinkTarget::External {
+                filename: "external.h5".into(),
+                path: format!("/{}", original.name),
+            },
+            creation_order: None,
+        }));
+        root.context
+            .header_cache
+            .lock()
+            .insert(root.address, Arc::new(header));
+
+        let children = root.resolve_children().unwrap();
+        assert_eq!(children.len(), expected.len() + 1);
+        assert_eq!(children[0].name, original.name);
+        assert_eq!(children[1].name, original.name);
+        assert_eq!(children[0].location.address, children[1].location.address);
+        assert!(!Arc::ptr_eq(
+            &children[0].location.context,
+            &children[1].location.context
+        ));
     }
 }
