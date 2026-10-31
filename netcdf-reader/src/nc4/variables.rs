@@ -195,7 +195,7 @@ fn resolve_multidimensional_coordinate_dimensions(
             })?;
             Ok(NcDimension {
                 name: dim.name.clone(),
-                size,
+                size: if dim.is_unlimited { dim.size } else { size },
                 is_unlimited: max_dims.and_then(|max_dims| max_dims.get(axis)) == Some(&u64::MAX),
             })
         })
@@ -208,11 +208,7 @@ fn resolve_coordinate_variable_dimensions(
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcDimension>> {
     if let Some(dim) = dim_addr_map.get(&ds.address()) {
-        let size = ds.shape().first().copied().unwrap_or(dim.size);
-        Ok(vec![NcDimension {
-            size,
-            ..dim.clone()
-        }])
+        Ok(vec![dim.clone()])
     } else if metadata_mode == crate::NcMetadataMode::Lossy {
         Ok(vec![NcDimension {
             name: leaf_name(ds.name()).to_string(),
@@ -270,15 +266,12 @@ fn resolve_variable_dimensions_from_dimlist(
         }
     }
 
-    // Apply unlimited status from the dataset's max_dims. Variables sharing an unlimited
-    // dimension can differ in length, so such an axis takes the length this variable has.
+    // The shared dimension supplies the logical extent, including unwritten
+    // records of shorter variables. Its HDF5 dataset retains the physical extent.
     if let Some(max_dims) = ds.max_dims() {
         for (i, md) in max_dims.iter().enumerate() {
             if *md == u64::MAX && i < var_dims.len() {
                 var_dims[i].is_unlimited = true;
-                if let Some(&extent) = ds.shape().get(i) {
-                    var_dims[i].size = extent;
-                }
             }
         }
     }

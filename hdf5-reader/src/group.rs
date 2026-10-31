@@ -186,6 +186,17 @@ impl Group {
         self.context.superblock.length_size
     }
 
+    /// Resolve a file-local variable-length attribute reference. The payload
+    /// contains the declared element count times `base_element_size` bytes.
+    pub fn resolve_vlen_reference_bytes(
+        &self,
+        reference: &[u8],
+        base_element_size: usize,
+    ) -> Result<Vec<u8>> {
+        self.context
+            .resolve_vlen_reference_bytes(reference, base_element_size)
+    }
+
     /// Parse (or retrieve from cache) the object header at the given address.
     fn cached_header(&self, addr: u64) -> Result<Arc<crate::object_header::ObjectHeader>> {
         self.context.get_or_parse_header(addr)
@@ -956,5 +967,86 @@ fn classify_child_header(header: &crate::object_header::ObjectHeader) -> ChildOb
         ChildObjectKind::Group
     } else {
         ChildObjectKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ExternalLinkResolver, Hdf5File, OpenOptions};
+
+    const DENSE_GROUP: &[u8] = include_bytes!("../../testdata/hdf5/dense_groups.h5");
+
+    #[test]
+    fn compact_and_dense_links_deduplicate_targets_and_preserve_aliases() {
+        let file = Hdf5File::from_bytes(DENSE_GROUP).unwrap();
+        let root = file.root_group().unwrap();
+        let expected = root.resolve_children().unwrap();
+        let original = &expected[0];
+        let mut header = (*root.cached_header(root.address).unwrap()).clone();
+        for name in [original.name.clone(), "alias".to_string()] {
+            header.messages.push(HdfMessage::Link(LinkMessage {
+                name,
+                target: LinkTarget::Hard {
+                    address: original.location.address,
+                },
+                creation_order: None,
+            }));
+        }
+        root.context
+            .header_cache
+            .lock()
+            .insert(root.address, Arc::new(header));
+
+        let children = root.resolve_children().unwrap();
+        assert_eq!(children.len(), expected.len() + 1);
+        assert_eq!(children[0].name, original.name);
+        assert_eq!(children[1].name, "alias");
+        assert_eq!(children[0].location.address, children[1].location.address);
+        let remaining: Vec<_> = children[2..].iter().map(|child| &child.name).collect();
+        let expected: Vec<_> = expected[1..].iter().map(|child| &child.name).collect();
+        assert_eq!(remaining, expected);
+    }
+
+    #[test]
+    fn links_to_the_same_address_in_different_files_remain_distinct() {
+        struct Resolver(Hdf5File);
+        impl ExternalLinkResolver for Resolver {
+            fn resolve_external_link(&self, _: &str) -> Result<Option<Hdf5File>> {
+                Ok(Some(self.0.clone()))
+            }
+        }
+        let external = Hdf5File::from_bytes(DENSE_GROUP).unwrap();
+        let file = Hdf5File::from_bytes_with_options(
+            DENSE_GROUP,
+            OpenOptions::default().with_external_link_resolver(Arc::new(Resolver(external))),
+        )
+        .unwrap();
+        let root = file.root_group().unwrap();
+        let expected = root.resolve_children().unwrap();
+        let original = &expected[0];
+        let mut header = (*root.cached_header(root.address).unwrap()).clone();
+        header.messages.push(HdfMessage::Link(LinkMessage {
+            name: original.name.clone(),
+            target: LinkTarget::External {
+                filename: "external.h5".into(),
+                path: format!("/{}", original.name),
+            },
+            creation_order: None,
+        }));
+        root.context
+            .header_cache
+            .lock()
+            .insert(root.address, Arc::new(header));
+
+        let children = root.resolve_children().unwrap();
+        assert_eq!(children.len(), expected.len() + 1);
+        assert_eq!(children[0].name, original.name);
+        assert_eq!(children[1].name, original.name);
+        assert_eq!(children[0].location.address, children[1].location.address);
+        assert!(!Arc::ptr_eq(
+            &children[0].location.context,
+            &children[1].location.context
+        ));
     }
 }

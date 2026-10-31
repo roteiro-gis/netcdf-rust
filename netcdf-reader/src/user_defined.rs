@@ -6,49 +6,35 @@ use ndarray::{ArrayD, IxDyn};
 use crate::error::{Error, Result};
 use crate::types::{NcIntegerValue, NcType};
 
-/// A decoded NetCDF-4 enum value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NcEnumValue {
-    /// The stored integer value.
-    pub value: NcIntegerValue,
-    /// The matching enum member name, if the stored value is declared by the type.
-    pub member: Option<String>,
+pub use netcdf_core::{NcArrayValue, NcCompoundValueField, NcEnumValue, NcValue};
+
+#[derive(Clone, Copy)]
+pub(crate) enum ValueSource<'a> {
+    Dataset(&'a Dataset),
+    Group(&'a hdf5_reader::group::Group),
+    None,
 }
 
-/// A decoded field of a NetCDF-4 compound value.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NcCompoundValueField {
-    pub name: String,
-    pub value: NcValue,
-}
+impl ValueSource<'_> {
+    fn vlen_reference_size(self) -> Result<usize> {
+        match self {
+            Self::Dataset(dataset) => Ok(dataset.vlen_reference_size()),
+            Self::Group(group) => Ok(8 + usize::from(group.offset_size())),
+            Self::None => Err(Error::InvalidData(
+                "variable-length value requires file context".into(),
+            )),
+        }
+    }
 
-/// A decoded fixed-size NetCDF-4 array value.
-#[derive(Debug, Clone, PartialEq)]
-pub struct NcArrayValue {
-    pub dims: Vec<u64>,
-    pub values: Vec<NcValue>,
-}
-
-/// A decoded NetCDF-4 value.
-#[derive(Debug, Clone, PartialEq)]
-pub enum NcValue {
-    Byte(i8),
-    Char(u8),
-    Short(i16),
-    Int(i32),
-    Float(f32),
-    Double(f64),
-    UByte(u8),
-    UShort(u16),
-    UInt(u32),
-    Int64(i64),
-    UInt64(u64),
-    String(String),
-    Enum(NcEnumValue),
-    Opaque(Vec<u8>),
-    Compound(Vec<NcCompoundValueField>),
-    Array(NcArrayValue),
-    VLen(Vec<NcValue>),
+    fn resolve_vlen_reference_bytes(self, bytes: &[u8], size: usize) -> Result<Vec<u8>> {
+        match self {
+            Self::Dataset(dataset) => Ok(dataset.resolve_vlen_reference_bytes(bytes, size)?),
+            Self::Group(group) => Ok(group.resolve_vlen_reference_bytes(bytes, size)?),
+            Self::None => Err(Error::InvalidData(
+                "variable-length value requires file context".into(),
+            )),
+        }
+    }
 }
 
 /// A borrowed view of one logical NetCDF-4 value.
@@ -58,15 +44,22 @@ pub enum NcValue {
 /// the dynamic representation.
 #[derive(Clone, Copy)]
 pub struct NcValueView<'a> {
-    dataset: &'a Dataset,
+    source: ValueSource<'a>,
     dtype: &'a Datatype,
     bytes: &'a [u8],
 }
 
 impl<'a> NcValueView<'a> {
+    fn from_source(source: ValueSource<'a>, dtype: &'a Datatype, bytes: &'a [u8]) -> Self {
+        Self {
+            source,
+            dtype,
+            bytes,
+        }
+    }
     pub(crate) fn new(dataset: &'a Dataset, dtype: &'a Datatype, bytes: &'a [u8]) -> Self {
         Self {
-            dataset,
+            source: ValueSource::Dataset(dataset),
             dtype,
             bytes,
         }
@@ -79,7 +72,7 @@ impl<'a> NcValueView<'a> {
 
     /// Decode this value into the dynamic owned representation.
     pub fn to_owned_value(&self) -> Result<NcValue> {
-        decode_value(self.dataset, self.dtype, self.bytes)
+        decode_value(self.source, self.dtype, self.bytes)
     }
 
     /// Decode this value as a NetCDF integer or enum base integer.
@@ -187,11 +180,11 @@ impl<'a> NcValueView<'a> {
                         Error::InvalidData(format!("compound field not found: {name}"))
                     })?;
                 let start = checked_usize(field.byte_offset as u64, "compound field offset")?;
-                let len = value_size(self.dataset, &field.datatype)?;
+                let len = value_size(self.source, &field.datatype)?;
                 let end = checked_add_usize(start, len, "compound field end")?;
                 require_len(self.bytes, end, "compound value")?;
-                Ok(NcValueView::new(
-                    self.dataset,
+                Ok(NcValueView::from_source(
+                    self.source,
                     &field.datatype,
                     &self.bytes[start..end],
                 ))
@@ -210,13 +203,13 @@ impl<'a> NcValueView<'a> {
                 .iter()
                 .map(|field| {
                     let start = checked_usize(field.byte_offset as u64, "compound field offset")?;
-                    let len = value_size(self.dataset, &field.datatype)?;
+                    let len = value_size(self.source, &field.datatype)?;
                     let end = checked_add_usize(start, len, "compound field end")?;
                     require_len(self.bytes, end, "compound value")?;
                     Ok(NcCompoundFieldView {
                         name: &field.name,
-                        value: NcValueView::new(
-                            self.dataset,
+                        value: NcValueView::from_source(
+                            self.source,
                             &field.datatype,
                             &self.bytes[start..end],
                         ),
@@ -235,15 +228,15 @@ impl<'a> NcValueView<'a> {
         match self.dtype {
             Datatype::Array { base, dims } => {
                 let count = checked_product_u64(dims, "array element count")?;
-                let elem_size = value_size(self.dataset, base)?;
+                let elem_size = value_size(self.source, base)?;
                 let total = checked_mul_usize(count, elem_size, "array byte size")?;
                 require_len(self.bytes, total, "array value")?;
                 let mut values = Vec::with_capacity(count);
                 for index in 0..count {
                     let start = checked_mul_usize(index, elem_size, "array element offset")?;
                     let end = checked_add_usize(start, elem_size, "array element end")?;
-                    values.push(NcValueView::new(
-                        self.dataset,
+                    values.push(NcValueView::from_source(
+                        self.source,
                         base,
                         &self.bytes[start..end],
                     ));
@@ -267,7 +260,7 @@ impl<'a> NcValueView<'a> {
                 expected: "non-string vlen value".to_string(),
                 actual: format!("{:?}", self.dtype),
             }),
-            Datatype::VarLen { base, .. } => decode_vlen_values(self.dataset, base, self.bytes),
+            Datatype::VarLen { base, .. } => decode_vlen_values(self.source, base, self.bytes),
             other => Err(Error::TypeMismatch {
                 expected: "vlen value".to_string(),
                 actual: format!("{other:?}"),
@@ -292,7 +285,7 @@ where
 {
     let raw = dataset.read_raw_bytes()?;
     let count = checked_usize(dataset.num_elements()?, "NetCDF-4 variable element count")?;
-    let elem_size = value_size(dataset, dataset.dtype())?;
+    let elem_size = value_size(ValueSource::Dataset(dataset), dataset.dtype())?;
     let total = checked_mul_usize(count, elem_size, "NetCDF-4 variable byte size")?;
     require_len(&raw, total, "NetCDF-4 variable data")?;
 
@@ -320,7 +313,26 @@ pub(crate) fn read_dataset_values(dataset: &Dataset) -> Result<ArrayD<NcValue>> 
     read_dataset_with_decoder(dataset, |value| value.to_owned_value())
 }
 
-fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcValue> {
+pub(crate) fn read_attribute_values(
+    source: ValueSource<'_>,
+    attribute: &hdf5_reader::Attribute,
+) -> Result<Vec<NcValue>> {
+    let count = checked_usize(attribute.num_elements()?, "attribute element count")?;
+    let size = value_size(source, &attribute.datatype)?;
+    let total = checked_mul_usize(count, size, "attribute byte size")?;
+    require_len(&attribute.raw_data, total, "attribute value")?;
+    if size == 0 {
+        return Err(Error::InvalidData(
+            "attribute element has zero byte size".into(),
+        ));
+    }
+    attribute.raw_data[..total]
+        .chunks_exact(size)
+        .map(|bytes| decode_value(source, &attribute.datatype, bytes))
+        .collect()
+}
+
+fn decode_value(source: ValueSource<'_>, dtype: &Datatype, bytes: &[u8]) -> Result<NcValue> {
     match dtype {
         Datatype::FixedPoint {
             size,
@@ -365,11 +377,11 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
             padding,
             ..
         } => {
-            let raw = dataset.resolve_vlen_reference_bytes(bytes, 1)?;
+            let raw = source.resolve_vlen_reference_bytes(bytes, 1)?;
             Ok(NcValue::String(decode_string_bytes(&raw, *padding)?))
         }
         Datatype::Enum { .. } => Ok(NcValue::Enum(
-            NcValueView::new(dataset, dtype, bytes).enum_value()?,
+            NcValueView::from_source(source, dtype, bytes).enum_value()?,
         )),
         Datatype::Opaque { size, .. } => {
             let size = checked_usize(*size as u64, "opaque byte size")?;
@@ -380,26 +392,26 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
             let mut decoded = Vec::with_capacity(fields.len());
             for field in fields {
                 let start = checked_usize(field.byte_offset as u64, "compound field offset")?;
-                let len = value_size(dataset, &field.datatype)?;
+                let len = value_size(source, &field.datatype)?;
                 let end = checked_add_usize(start, len, "compound field end")?;
                 require_len(bytes, end, "compound value")?;
                 decoded.push(NcCompoundValueField {
                     name: field.name.clone(),
-                    value: decode_value(dataset, &field.datatype, &bytes[start..end])?,
+                    value: decode_value(source, &field.datatype, &bytes[start..end])?,
                 });
             }
             Ok(NcValue::Compound(decoded))
         }
         Datatype::Array { base, dims } => {
             let count = checked_product_u64(dims, "array element count")?;
-            let elem_size = value_size(dataset, base)?;
+            let elem_size = value_size(source, base)?;
             let total = checked_mul_usize(count, elem_size, "array byte size")?;
             require_len(bytes, total, "array value")?;
             let mut values = Vec::with_capacity(count);
             for index in 0..count {
                 let start = checked_mul_usize(index, elem_size, "array element offset")?;
                 let end = checked_add_usize(start, elem_size, "array element end")?;
-                values.push(decode_value(dataset, base, &bytes[start..end])?);
+                values.push(decode_value(source, base, &bytes[start..end])?);
             }
             Ok(NcValue::Array(NcArrayValue {
                 dims: dims.clone(),
@@ -412,11 +424,11 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
             padding,
             ..
         } if base.is_vlen_string_base() => {
-            let raw = dataset.resolve_vlen_reference_bytes(bytes, 1)?;
+            let raw = source.resolve_vlen_reference_bytes(bytes, 1)?;
             Ok(NcValue::String(decode_string_bytes(&raw, *padding)?))
         }
         Datatype::VarLen { base, .. } => {
-            Ok(NcValue::VLen(decode_vlen_values(dataset, base, bytes)?))
+            Ok(NcValue::VLen(decode_vlen_values(source, base, bytes)?))
         }
         other => Err(Error::InvalidData(format!(
             "unsupported NetCDF-4 user-defined datatype: {other:?}"
@@ -425,12 +437,12 @@ fn decode_value(dataset: &Dataset, dtype: &Datatype, bytes: &[u8]) -> Result<NcV
 }
 
 fn decode_vlen_values(
-    dataset: &Dataset,
+    source: ValueSource<'_>,
     base: &Datatype,
     reference: &[u8],
 ) -> Result<Vec<NcValue>> {
-    let elem_size = value_size(dataset, base)?;
-    let raw = dataset.resolve_vlen_reference_bytes(reference, elem_size)?;
+    let elem_size = value_size(source, base)?;
+    let raw = source.resolve_vlen_reference_bytes(reference, elem_size)?;
     if elem_size == 0 {
         return Err(Error::InvalidData(
             "vlen base type has zero byte size".to_string(),
@@ -449,7 +461,7 @@ fn decode_vlen_values(
     for index in 0..count {
         let start = checked_mul_usize(index, elem_size, "vlen element offset")?;
         let end = checked_add_usize(start, elem_size, "vlen element end")?;
-        values.push(decode_value(dataset, base, &raw[start..end])?);
+        values.push(decode_value(source, base, &raw[start..end])?);
     }
     Ok(values)
 }
@@ -467,19 +479,19 @@ fn integer_to_value(value: NcIntegerValue) -> Result<NcValue> {
     })
 }
 
-fn value_size(dataset: &Dataset, dtype: &Datatype) -> Result<usize> {
+fn value_size(source: ValueSource<'_>, dtype: &Datatype) -> Result<usize> {
     match dtype {
         Datatype::String {
             size: StringSize::Variable,
             ..
         }
-        | Datatype::VarLen { .. } => Ok(dataset.vlen_reference_size()),
+        | Datatype::VarLen { .. } => source.vlen_reference_size(),
         Datatype::Array { base, dims } => {
             let count = checked_product_u64(dims, "array element count")?;
-            let elem_size = value_size(dataset, base)?;
+            let elem_size = value_size(source, base)?;
             checked_mul_usize(count, elem_size, "array byte size")
         }
-        Datatype::Enum { base, .. } => value_size(dataset, base),
+        Datatype::Enum { base, .. } => value_size(source, base),
         Datatype::FixedPoint { size, .. }
         | Datatype::FloatingPoint { size, .. }
         | Datatype::Bitfield { size, .. }

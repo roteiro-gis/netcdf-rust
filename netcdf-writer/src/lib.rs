@@ -2349,6 +2349,11 @@ fn encode_attr_value(value: &NcAttrValue) -> Result<(NcType, u64, Vec<u8>)> {
                 "NC_STRING attributes require NetCDF-4".into(),
             ));
         }
+        NcAttrValue::UserDefined { .. } => {
+            return Err(Error::UnsupportedFeature(
+                "user-defined attributes require NetCDF-4".into(),
+            ));
+        }
     };
     Ok((dtype, count, out))
 }
@@ -2553,6 +2558,9 @@ fn nc_attr_to_hdf5(attribute: &NcAttribute) -> Result<H5AttributeBuilder> {
         NcAttrValue::Doubles(values) => hdf5_numeric_attr(&attribute.name, NcType::Double, values),
         NcAttrValue::Strings(values) => H5AttributeBuilder::vlen_strings(&attribute.name, values)
             .map_err(hdf5_error_to_unsupported),
+        NcAttrValue::UserDefined { .. } => Err(Error::UnsupportedFeature(
+            "writing decoded user-defined attributes is not supported".into(),
+        )),
     }
 }
 
