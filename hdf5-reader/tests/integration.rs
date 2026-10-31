@@ -1823,3 +1823,31 @@ fn shared_and_owned_bytes_open_without_copying_and_read_as_a_path_open() {
     assert_eq!(file.storage().read_range(0, 8).unwrap().as_ptr(), base);
     assert_eq!(root_raw_bytes(&file), expected);
 }
+
+#[test]
+fn reads_a_file_behind_a_user_block() {
+    let path = skip_if_missing!("user_block.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    assert_eq!(file.superblock().base_address, 1024);
+
+    let title = file.root_group().unwrap().attribute("title").unwrap();
+    assert_eq!(title.read_string().unwrap(), "behind a user block");
+
+    let data = file.dataset("group/data").unwrap();
+    let values: ndarray::ArrayD<f64> = data.read_array().unwrap();
+    assert_eq!(values.shape(), &[2, 3]);
+    assert_eq!(
+        values.iter().copied().collect::<Vec<_>>(),
+        [0., 1., 2., 3., 4., 5.]
+    );
+
+    let chunked: ndarray::ArrayD<i32> =
+        file.dataset("group/chunked").unwrap().read_array().unwrap();
+    assert_eq!(
+        chunked.iter().copied().collect::<Vec<_>>(),
+        (0..100).collect::<Vec<_>>()
+    );
+
+    let in_memory = hdf5_reader::Hdf5File::from_vec(std::fs::read(&path).unwrap()).unwrap();
+    assert!(in_memory.dataset("group/data").is_ok());
+}

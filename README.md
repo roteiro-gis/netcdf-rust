@@ -167,7 +167,7 @@ let (_format, nc4_bytes) =
 ## Features
 
 **HDF5**
-- Superblock v0-v3 and object header v1/v2 with checksum verification
+- Superblock v0-v3, including files behind a user block, and object header v1/v2 with checksum verification
 - Compact, contiguous, and chunked layouts
 - All chunk index types: v1/v2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
 - Deflate, shuffle, Fletcher-32, N-Bit, ScaleOffset, and optional LZ4 filters
