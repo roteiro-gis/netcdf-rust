@@ -1305,3 +1305,73 @@ fn binary_emission_requires_data() {
 
     assert!(err.to_string().contains("has no raw data"));
 }
+
+fn count_signature(bytes: &[u8], signature: &[u8; 4]) -> usize {
+    bytes
+        .windows(4)
+        .filter(|window| window == signature)
+        .count()
+}
+
+/// Strings written across a global heap collection boundary, read back by reference.
+fn assert_vlen_strings_span_collections(count: usize, collections: usize) {
+    let strings: Vec<String> = (0..count).map(|i| format!("s{i}")).collect();
+    let bytes = Hdf5Builder::new()
+        .dataset(DatasetBuilder::vlen_string_data("s", vec![count as u64], &strings).unwrap())
+        .into_plan()
+        .unwrap()
+        .encode(WriteOptions::default())
+        .unwrap();
+    assert_eq!(count_signature(&bytes, b"GCOL"), collections);
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("s").unwrap();
+    let raw = dataset.read_raw_bytes().unwrap();
+    let reference_size = dataset.vlen_reference_size();
+    for element in [0, 65_533, 65_534, count - 1] {
+        let reference = &raw[element * reference_size..][..reference_size];
+        let value = dataset.resolve_vlen_reference_bytes(reference, 1).unwrap();
+        assert_eq!(value, format!("s{element}\0").into_bytes());
+    }
+}
+
+#[test]
+fn a_full_global_heap_collection_needs_no_second() {
+    assert_vlen_strings_span_collections(65_535, 1);
+}
+
+#[test]
+fn vlen_objects_past_a_collection_start_another() {
+    assert_vlen_strings_span_collections(65_536, 2);
+    assert_vlen_strings_span_collections(70_000, 2);
+}
+
+#[test]
+fn attributes_and_datasets_share_the_split_global_heap() {
+    let dataset_strings: Vec<String> = (0..65_535).map(|i| format!("d{i}")).collect();
+    let bytes = Hdf5Builder::new()
+        .dataset(
+            DatasetBuilder::vlen_string_data("s", vec![65_535], &dataset_strings)
+                .unwrap()
+                .attribute(AttributeBuilder::vlen_strings("note", &["over the edge"]).unwrap()),
+        )
+        .into_plan()
+        .unwrap()
+        .encode(WriteOptions::default())
+        .unwrap();
+    assert_eq!(count_signature(&bytes, b"GCOL"), 2);
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let dataset = file.dataset("s").unwrap();
+    let raw = dataset.read_raw_bytes().unwrap();
+    let reference_size = dataset.vlen_reference_size();
+    let last = &raw[65_534 * reference_size..][..reference_size];
+    assert_eq!(
+        dataset.resolve_vlen_reference_bytes(last, 1).unwrap(),
+        b"d65534\0"
+    );
+    assert_eq!(
+        dataset.attribute("note").unwrap().read_strings().unwrap(),
+        ["over the edge"]
+    );
+}
