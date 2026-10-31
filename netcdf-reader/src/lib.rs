@@ -170,6 +170,19 @@ fn parent_group_path(path: &str) -> &str {
 }
 
 impl NcFile {
+    #[cfg(feature = "netcdf4")]
+    fn from_nc4(nc4: nc4::Nc4File) -> Self {
+        let format = if nc4.is_classic_model() {
+            NcFormat::Nc4Classic
+        } else {
+            NcFormat::Nc4
+        };
+        NcFile {
+            format,
+            inner: NcFileInner::Nc4(Box::new(nc4)),
+        }
+    }
+
     /// Open a NetCDF file from a path.
     ///
     /// The format is auto-detected from the file's magic bytes.
@@ -236,15 +249,7 @@ impl NcFile {
             }
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 let nc4 = nc4::Nc4File::from_storage_with_options(storage, options)?;
-                let actual_format = if nc4.is_classic_model() {
-                    NcFormat::Nc4Classic
-                } else {
-                    NcFormat::Nc4
-                };
-                Ok(NcFile {
-                    format: actual_format,
-                    inner: NcFileInner::Nc4(Box::new(nc4)),
-                })
+                Ok(NcFile::from_nc4(nc4))
             }
         }
     }
@@ -269,15 +274,7 @@ impl NcFile {
                 #[cfg(feature = "netcdf4")]
                 {
                     let nc4 = nc4::Nc4File::from_bytes_with_options(data, options)?;
-                    let actual_format = if nc4.is_classic_model() {
-                        NcFormat::Nc4Classic
-                    } else {
-                        NcFormat::Nc4
-                    };
-                    Ok(NcFile {
-                        format: actual_format,
-                        inner: NcFileInner::Nc4(Box::new(nc4)),
-                    })
+                    Ok(NcFile::from_nc4(nc4))
                 }
                 #[cfg(not(feature = "netcdf4"))]
                 {
@@ -895,15 +892,7 @@ impl NcFile {
                 #[cfg(feature = "netcdf4")]
                 {
                     let nc4 = nc4::Nc4File::open_with_options(path, options)?;
-                    let actual_format = if nc4.is_classic_model() {
-                        NcFormat::Nc4Classic
-                    } else {
-                        NcFormat::Nc4
-                    };
-                    Ok(NcFile {
-                        format: actual_format,
-                        inner: NcFileInner::Nc4(Box::new(nc4)),
-                    })
+                    Ok(NcFile::from_nc4(nc4))
                 }
                 #[cfg(not(feature = "netcdf4"))]
                 {

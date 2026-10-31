@@ -24,8 +24,9 @@ use ndarray::ArrayD;
 #[cfg(feature = "rayon")]
 use rayon::ThreadPool;
 
+use crate::classic::variable::decode_char_variable_strings;
 use crate::error::{Error, Result};
-use crate::types::{checked_shape_elements, checked_usize_from_u64, NcGroup, NcType};
+use crate::types::{NcGroup, NcType};
 
 /// Dispatch on `NcType` to read data and promote to `f64`.
 ///
@@ -90,14 +91,6 @@ macro_rules! dispatch_read_as_f64 {
                 let arr = $read_expr?;
                 Ok(arr.mapv(|v| v as f64))
             }
-            NcType::Char => Err(Error::TypeMismatch {
-                expected: "numeric type".to_string(),
-                actual: "Char".to_string(),
-            }),
-            NcType::String => Err(Error::TypeMismatch {
-                expected: "numeric type".to_string(),
-                actual: "String".to_string(),
-            }),
             other => Err(Error::TypeMismatch {
                 expected: "numeric type".to_string(),
                 actual: format!("{:?}", other),
@@ -231,7 +224,7 @@ impl Nc4File {
     }
 
     pub fn group(&self, path: &str) -> Result<&NcGroup> {
-        let normalized = normalize_group_path(path)?;
+        let normalized = normalize_group_path(path);
         let root = self.root_group()?;
         if normalized.is_empty() {
             return Ok(root);
@@ -389,52 +382,6 @@ impl Nc4File {
     }
 }
 
-fn decode_char_variable_strings(
-    variable: &crate::types::NcVariable,
-    bytes: &[u8],
-) -> Result<Vec<String>> {
-    let shape = variable.shape();
-    if shape.len() <= 1 {
-        return Ok(vec![decode_char_string(bytes)]);
-    }
-
-    let string_len = checked_usize_from_u64(
-        *shape
-            .last()
-            .ok_or_else(|| Error::InvalidData("char variable missing string axis".into()))?,
-        "char string length",
-    )?;
-    let string_count_u64 = checked_shape_elements(&shape[..shape.len() - 1], "char string count")?;
-    let string_count = checked_usize_from_u64(string_count_u64, "char string count")?;
-    let expected_bytes = string_count.checked_mul(string_len).ok_or_else(|| {
-        Error::InvalidData("char string byte count exceeds platform usize".to_string())
-    })?;
-
-    if bytes.len() < expected_bytes {
-        return Err(Error::InvalidData(format!(
-            "char variable '{}' data too short: need {} bytes, have {}",
-            variable.name,
-            expected_bytes,
-            bytes.len()
-        )));
-    }
-
-    if string_len == 0 {
-        return Ok(vec![String::new(); string_count]);
-    }
-
-    Ok(bytes[..expected_bytes]
-        .chunks_exact(string_len)
-        .map(decode_char_string)
-        .collect())
-}
-
-fn decode_char_string(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .trim_end_matches('\0')
-        .to_string()
-}
-
 impl Nc4File {
     fn root_metadata(&self) -> Result<&NcGroup> {
         if let Some(group) = self.root_metadata.get() {
@@ -531,8 +478,13 @@ fn normalize_dataset_path(path: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
-fn normalize_group_path(path: &str) -> Result<&str> {
-    Ok(path.trim_matches('/'))
+pub(crate) fn normalize_group_path(path: &str) -> &str {
+    path.trim_matches('/')
+}
+
+/// The last component of an HDF5 object path.
+pub(crate) fn leaf_name(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
 }
 
 fn dataset_nc_type(dataset: &hdf5_reader::Dataset) -> Result<NcType> {

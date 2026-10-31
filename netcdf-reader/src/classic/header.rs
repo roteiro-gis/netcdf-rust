@@ -60,14 +60,6 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    #[allow(dead_code)]
-    fn read_u8(&mut self) -> Result<u8> {
-        self.ensure(1)?;
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-
     fn read_u16_be(&mut self) -> Result<u16> {
         self.ensure(2)?;
         let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
@@ -325,7 +317,7 @@ fn parse_att_list(cur: &mut Cursor<'_>, format: NcFormat) -> Result<Vec<NcAttrib
         let name = cur.read_name(format)?;
         let nc_type = cur.read_u32_be()?;
         let nvalues = checked_usize_from_u64(cur.read_count(format)?, "attribute value count")?;
-        let value = read_attr_values(cur, nc_type, nvalues, format)?;
+        let value = read_attr_values(cur, nc_type, nvalues)?;
 
         attrs.push(NcAttribute { name, value });
     }
@@ -335,12 +327,7 @@ fn parse_att_list(cur: &mut Cursor<'_>, format: NcFormat) -> Result<Vec<NcAttrib
 
 /// Read attribute values of the given type and count.
 /// Values are padded to a 4-byte boundary in the file.
-fn read_attr_values(
-    cur: &mut Cursor<'_>,
-    nc_type: u32,
-    nvalues: usize,
-    _format: NcFormat,
-) -> Result<NcAttrValue> {
+fn read_attr_values(cur: &mut Cursor<'_>, nc_type: u32, nvalues: usize) -> Result<NcAttrValue> {
     let typ = nc_type_from_code(nc_type)?;
     let elem_size = typ.size()?;
     let raw_bytes = nvalues.checked_mul(elem_size).ok_or_else(|| {

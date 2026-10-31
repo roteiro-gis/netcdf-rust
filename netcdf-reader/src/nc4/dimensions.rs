@@ -14,12 +14,9 @@ use std::collections::HashMap;
 
 use hdf5_reader::group::Group;
 
+use super::leaf_name;
 use crate::error::{Error, Result};
 use crate::types::NcDimension;
-
-fn leaf_name(name: &str) -> &str {
-    name.rsplit('/').next().unwrap_or(name)
-}
 
 pub(crate) fn is_dimension_without_variable_name(name: &str) -> bool {
     name.starts_with("This is a netCDF dimension but not a netCDF variable")
