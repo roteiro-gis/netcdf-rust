@@ -1,6 +1,8 @@
 use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use hdf5_reader::{Hdf5File, SliceInfo, SliceInfoElem};
+use hdf5_reader::{BytesStorage, Hdf5File, SliceInfo, SliceInfoElem, Storage, StorageBuffer};
 use hdf5_writer::{
     AttributeBuilder, ByteOrder, CompoundField, DatasetBuilder, Datatype, EnumMember,
     FilterDescription, Hdf5Builder, Hdf5Writer, StringEncoding, StringPadding, VarLenKind,
@@ -1304,4 +1306,65 @@ fn binary_emission_requires_data() {
         .unwrap_err();
 
     assert!(err.to_string().contains("has no raw data"));
+}
+
+/// Counts the reads that reach the file so tests can assert on I/O, not on timing.
+struct CountingStorage {
+    inner: BytesStorage,
+    reads: AtomicUsize,
+}
+
+impl Storage for CountingStorage {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> hdf5_reader::error::Result<StorageBuffer> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_range(offset, len)
+    }
+}
+
+fn vlen_string_file(strings: &[String]) -> Vec<u8> {
+    let dataset =
+        DatasetBuilder::vlen_string_data("s", vec![strings.len() as u64], strings).unwrap();
+    Hdf5Builder::new()
+        .dataset(dataset)
+        .into_plan()
+        .unwrap()
+        .encode(WriteOptions::default())
+        .unwrap()
+}
+
+#[test]
+fn vlen_strings_read_the_global_heap_once() {
+    let strings: Vec<String> = (0..2_000).map(|i| format!("station-{i}")).collect();
+    let storage = Arc::new(CountingStorage {
+        inner: BytesStorage::new(vlen_string_file(&strings)),
+        reads: AtomicUsize::new(0),
+    });
+    let file = Hdf5File::from_storage(storage.clone()).unwrap();
+    let dataset = file.dataset("s").unwrap();
+
+    let reads_before = storage.reads.load(Ordering::Relaxed);
+    assert_eq!(dataset.read_strings().unwrap(), strings);
+    let reads = storage.reads.load(Ordering::Relaxed) - reads_before;
+    assert!(reads < 16, "read_strings issued {reads} storage reads");
+}
+
+#[test]
+fn dangling_vlen_string_references_are_errors() {
+    let strings = vec!["a".to_string(), "b".to_string()];
+    let mut bytes = vlen_string_file(&strings);
+    let heap = bytes
+        .windows(4)
+        .position(|window| window == b"GCOL")
+        .unwrap();
+    // Renumber the second object: 16-byte collection header, then object 1's 16-byte header
+    // and 8 padded data bytes.
+    bytes[heap + 16 + 16 + 8..][..2].copy_from_slice(&9u16.to_le_bytes());
+
+    let file = Hdf5File::from_vec(bytes).unwrap();
+    let err = file.dataset("s").unwrap().read_strings().unwrap_err();
+    assert!(err.to_string().contains("missing object 2"), "{err}");
 }

@@ -309,9 +309,7 @@ impl Group {
                 decoded_vlen_strings_storage(
                     &attr.datatype,
                     &attr.raw_data,
-                    self.context.storage.as_ref(),
-                    self.offset_size(),
-                    self.length_size(),
+                    self.context.as_ref(),
                     element_count,
                 )
             });
@@ -323,13 +321,8 @@ impl Group {
                 } if base.is_vlen_string_base()
                     && matches!(attr.dataspace.num_elements(), Ok(1)) =>
                 {
-                    resolve_vlen_bytes_storage(
-                        &attr.raw_data,
-                        self.context.storage.as_ref(),
-                        self.offset_size(),
-                        self.length_size(),
-                    )
-                    .unwrap_or_else(|| attr.raw_data.clone())
+                    resolve_vlen_bytes_storage(&attr.raw_data, self.context.as_ref())
+                        .unwrap_or_else(|_| attr.raw_data.clone())
                 }
                 _ => attr.raw_data.clone(),
             };

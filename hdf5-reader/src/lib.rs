@@ -52,6 +52,7 @@ use memmap2::Mmap;
 
 use cache::ChunkCache;
 use error::{Error, Result};
+use global_heap::{GlobalHeapCache, GlobalHeapCollection};
 use group::Group;
 use messages::HdfMessage;
 use object_header::ObjectHeader;
@@ -529,6 +530,7 @@ pub(crate) struct FileContext {
     pub(crate) chunk_cache: Arc<ChunkCache>,
     pub(crate) header_cache: HeaderCache,
     pub(crate) old_groups: parking_lot::Mutex<HashMap<u64, Arc<group::OldGroupEntries>>>,
+    pub(crate) global_heaps: parking_lot::Mutex<GlobalHeapCache>,
     pub(crate) dataset_path_cache: Arc<parking_lot::Mutex<HashMap<String, Arc<DatasetTemplate>>>>,
     pub(crate) filter_registry: Arc<FilterRegistry>,
     pub(crate) external_file_resolver: Option<Arc<dyn ExternalFileResolver>>,
@@ -561,6 +563,22 @@ impl FileContext {
             .get()
             .expect("full-file buffer must exist after successful initialization")
             .clone())
+    }
+
+    /// The global heap collection at `address`, parsed at most once while it stays cached.
+    pub(crate) fn global_heap(&self, address: u64) -> Result<Arc<GlobalHeapCollection>> {
+        if let Some(collection) = self.global_heaps.lock().get(address) {
+            return Ok(collection);
+        }
+
+        let collection = Arc::new(GlobalHeapCollection::parse_at_storage(
+            self.storage.as_ref(),
+            address,
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )?);
+        self.global_heaps.lock().insert(address, collection.clone());
+        Ok(collection)
     }
 
     pub(crate) fn get_or_parse_header(&self, addr: u64) -> Result<Arc<ObjectHeader>> {
@@ -711,6 +729,7 @@ impl Hdf5File {
                 chunk_cache: cache,
                 header_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 old_groups: Default::default(),
+                global_heaps: Default::default(),
                 dataset_path_cache: Arc::new(parking_lot::Mutex::new(HashMap::new())),
                 filter_registry: Arc::new(registry),
                 external_file_resolver,
