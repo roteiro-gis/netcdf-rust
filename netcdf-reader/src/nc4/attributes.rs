@@ -13,6 +13,7 @@
 use hdf5_reader::group::Group;
 use hdf5_reader::messages::datatype::{Datatype, VarLenKind};
 
+use super::types::hdf5_to_nc_type;
 use crate::error::{Error, Result};
 use crate::types::{NcAttrValue, NcAttribute};
 
@@ -94,6 +95,10 @@ fn convert_attribute(
 }
 
 /// Convert an HDF5 attribute's value to an NcAttrValue.
+///
+/// Enum attributes become their integer values. `NcAttrValue` can't hold the other user-defined
+/// types, which are valid NetCDF-4, so those attributes are left out rather than failing the
+/// whole file's metadata. Strict mode still rejects types NetCDF-4 doesn't have.
 fn convert_attribute_value(
     attr: &hdf5_reader::Attribute,
     metadata_mode: crate::NcMetadataMode,
@@ -153,6 +158,14 @@ fn convert_attribute_value(
                 read_attr(attr.read_strings().map(NcAttrValue::Strings))
             }
         }
+        Datatype::Enum { base, .. } => {
+            let integers = hdf5_reader::Attribute {
+                datatype: (**base).clone(),
+                ..attr.clone()
+            };
+            convert_attribute_value(&integers, metadata_mode)
+        }
+        datatype if hdf5_to_nc_type(datatype).is_ok() => Ok(None),
         _ if strict => Err(unsupported()),
         _ => Ok(None),
     }
@@ -166,7 +179,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strict_mode_rejects_unsupported_attribute_types() {
+    fn strict_mode_rejects_attribute_types_netcdf4_does_not_have() {
+        let attr = Attribute {
+            name: "bitfield_attr".to_string(),
+            datatype: Datatype::Bitfield {
+                size: 4,
+                byte_order: ByteOrder::LittleEndian,
+            },
+            shape: vec![1],
+            raw_data: vec![0, 0, 0, 0],
+            decoded_strings: None,
+        };
+
+        let err = convert_attribute_value(&attr, crate::NcMetadataMode::Strict).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)));
+    }
+
+    #[test]
+    fn user_defined_attribute_types_are_left_out_in_both_modes() {
         let attr = Attribute {
             name: "opaque_attr".to_string(),
             datatype: Datatype::Opaque {
@@ -178,8 +208,32 @@ mod tests {
             decoded_strings: None,
         };
 
-        let err = convert_attribute_value(&attr, crate::NcMetadataMode::Strict).unwrap_err();
-        assert!(matches!(err, Error::InvalidData(_)));
+        for mode in [crate::NcMetadataMode::Strict, crate::NcMetadataMode::Lossy] {
+            assert!(convert_attribute_value(&attr, mode).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn enum_attributes_read_as_their_integers() {
+        let attr = Attribute {
+            name: "_FillValue".to_string(),
+            datatype: Datatype::Enum {
+                base: Box::new(Datatype::FixedPoint {
+                    size: 2,
+                    signed: true,
+                    byte_order: ByteOrder::LittleEndian,
+                }),
+                members: Vec::new(),
+            },
+            shape: vec![2],
+            raw_data: vec![1, 0, 0xff, 0xff],
+            decoded_strings: None,
+        };
+
+        assert_eq!(
+            convert_attribute_value(&attr, crate::NcMetadataMode::Strict).unwrap(),
+            Some(NcAttrValue::Shorts(vec![1, -1]))
+        );
     }
 
     #[test]

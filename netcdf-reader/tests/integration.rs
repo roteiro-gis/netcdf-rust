@@ -1340,6 +1340,24 @@ fn classic_selection_larger_than_the_file_is_an_error() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn user_typed_attributes_do_not_fail_the_file() {
+    let path = required_fixture("netcdf4", "nc4_user_typed_attributes.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let quality = file.variable("quality").unwrap();
+    assert_eq!(
+        quality.attribute("_FillValue").unwrap().value,
+        netcdf_reader::NcAttrValue::Bytes(vec![1])
+    );
+
+    let plain = file.variable("plain").unwrap();
+    assert!(plain.attribute("compound").is_none());
+    let data = file.read_variable::<f32>("plain").unwrap();
+    assert_eq!(data.iter().copied().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn variables_on_one_unlimited_dimension_keep_their_own_lengths() {
     let path = required_fixture("netcdf4", "nc4_uneven_unlimited.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
