@@ -228,10 +228,13 @@ fn strings(dir: &Path) -> Value {
         ]
         .concat(),
     ];
+    // More objects than one global heap collection can number.
+    let many: Vec<String> = (0..70_000).map(|i| format!("s{i}")).collect();
     let builder = Hdf5Builder::new()
         .dataset(
             DatasetBuilder::fixed_string_data("fixed", vec![3], &["north", "south", "up"]).unwrap(),
         )
+        .dataset(DatasetBuilder::vlen_string_data("many_vlen", vec![70_000], &many).unwrap())
         .dataset(
             DatasetBuilder::vlen_string_data("vlen_str", vec![2, 2], &["a", "bb", "ccc", ""])
                 .unwrap(),
@@ -247,6 +250,7 @@ fn strings(dir: &Path) -> Value {
         "datasets": [
             {"name": "fixed", "shape": [3], "strings": ["north", "south", "up"]},
             {"name": "vlen_str", "dtype": "str", "shape": [2, 2], "strings": ["a", "bb", "ccc", ""]},
+            {"name": "many_vlen", "dtype": "str", "shape": [70_000], "strings": many},
             {"name": "ragged", "shape": [2, 2], "vlen": [[1, 2], [3], [], [10, 11, 12]]}
         ]
     })
