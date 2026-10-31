@@ -24,7 +24,8 @@ pub struct Superblock {
     pub indexed_storage_k: u16,
     /// File consistency flags.
     pub consistency_flags: u32,
-    /// Base address for offsets (usually 0).
+    /// Byte position in the file that every other address is relative to: where the superblock
+    /// was found, as in libhdf5, whatever the file recorded. Non-zero behind a user block.
     pub base_address: u64,
     /// Address of the file free-space info (undefined = not present).
     pub free_space_address: u64,
@@ -51,11 +52,15 @@ impl Superblock {
         cursor.set_position(magic_offset + 8);
 
         let version = cursor.read_u8()?;
-        match version {
+        let superblock = match version {
             0 | 1 => Self::parse_v0_v1(cursor, version),
             2 | 3 => Self::parse_v2_v3(cursor, version, magic_offset),
             v => Err(Error::UnsupportedSuperblockVersion(v)),
-        }
+        }?;
+        Ok(Superblock {
+            base_address: magic_offset,
+            ..superblock
+        })
     }
 
     /// Parse the superblock from random-access storage.
@@ -68,11 +73,15 @@ impl Superblock {
         cursor.set_position(8);
 
         let version = cursor.read_u8()?;
-        match version {
+        let superblock = match version {
             0 | 1 => Self::parse_v0_v1(&mut cursor, version),
             2 | 3 => Self::parse_v2_v3(&mut cursor, version, 0),
             v => Err(Error::UnsupportedSuperblockVersion(v)),
-        }
+        }?;
+        Ok(Superblock {
+            base_address: magic_offset,
+            ..superblock
+        })
     }
 
     fn parse_v0_v1(cursor: &mut Cursor<'_>, version: u8) -> Result<Self> {

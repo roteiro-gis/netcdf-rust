@@ -692,6 +692,20 @@ def generate_hdf5_fixtures(base_dir):
             ds.attrs[f"small_{i:02d}"] = np.int32(i)
         ds.attrs["huge"] = np.arange(50_000, dtype=np.float32)
 
+    # ---- user_block.h5 ----
+    # Tests: addresses relative to a superblock moved 1024 bytes in by a user block.
+    path = os.path.join(hdf5_dir, "user_block.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", userblock_size=1024, libver="earliest") as f:
+        f.attrs["title"] = "behind a user block"
+        grp = f.create_group("group")
+        grp.create_dataset("data", data=np.arange(6, dtype="f8").reshape(2, 3))
+        grp.create_dataset(
+            "chunked", data=np.arange(100, dtype="i4"), chunks=(10,), compression="gzip"
+        )
+    with open(path, "r+b") as f:
+        f.write(b"application data, not HDF5")
+
 
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
