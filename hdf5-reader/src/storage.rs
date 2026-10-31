@@ -122,6 +122,32 @@ pub trait Storage: Send + Sync {
 
 pub type DynStorage = Arc<dyn Storage>;
 
+/// The part of a storage past `base`, addressed from 0. HDF5 addresses are relative to the
+/// superblock, which a user block moves away from the start of the file.
+pub(crate) struct OffsetStorage {
+    inner: DynStorage,
+    base: u64,
+}
+
+impl OffsetStorage {
+    pub(crate) fn new(inner: DynStorage, base: u64) -> Self {
+        Self { inner, base }
+    }
+}
+
+impl Storage for OffsetStorage {
+    fn len(&self) -> u64 {
+        self.inner.len().saturating_sub(self.base)
+    }
+
+    fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
+        let position = offset
+            .checked_add(self.base)
+            .ok_or(Error::OffsetOutOfBounds(offset))?;
+        self.inner.read_range(position, len)
+    }
+}
+
 fn check_storage_range(total_len: u64, offset: u64, len: usize) -> Result<u64> {
     let needed = u64::try_from(len).map_err(|_| Error::OffsetOutOfBounds(offset))?;
     let end = offset

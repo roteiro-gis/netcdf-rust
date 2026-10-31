@@ -696,6 +696,10 @@ impl FileContext {
 impl Hdf5File {
     fn from_storage_impl(storage: DynStorage, options: OpenOptions) -> Result<Self> {
         let superblock = Superblock::parse_from_storage(storage.as_ref())?;
+        let storage: DynStorage = match superblock.base_address {
+            0 => storage,
+            base => Arc::new(storage::OffsetStorage::new(storage, base)),
+        };
         let cache = Arc::new(ChunkCache::new(
             options.chunk_cache_bytes,
             options.chunk_cache_slots,
