@@ -1851,3 +1851,23 @@ fn reads_a_file_behind_a_user_block() {
     let in_memory = hdf5_reader::Hdf5File::from_vec(std::fs::read(&path).unwrap()).unwrap();
     assert!(in_memory.dataset("group/data").is_ok());
 }
+
+#[test]
+fn reads_v2_btrees_with_nested_internal_nodes() {
+    let path = skip_if_missing!("deep_btree_v2.h5");
+    let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+    let root = file.root_group().unwrap();
+
+    let (_, datasets) = root.member_names().unwrap();
+    assert_eq!(datasets.len(), 2001);
+    for name in ["link_0000", "link_1000", "link_1999"] {
+        assert!(datasets.iter().any(|member| member == name), "{name}");
+        let values: ndarray::ArrayD<i32> = file.dataset(name).unwrap().read_array().unwrap();
+        assert_eq!(values.iter().copied().collect::<Vec<_>>(), [0, 1, 2, 3]);
+    }
+
+    let target = file.dataset("target").unwrap();
+    assert_eq!(target.attributes().len(), 2000);
+    let attribute = target.attribute("attr_1999").unwrap();
+    assert_eq!(attribute.read_scalar::<i32>().unwrap(), 1999);
+}

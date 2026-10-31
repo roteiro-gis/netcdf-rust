@@ -566,17 +566,10 @@ fn enter_btree_v2_node(visited: &mut HashSet<u64>, address: u64) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Compute the number of bytes needed to represent `max_records` as an
-/// unsigned integer (used for child-node record counts in internal nodes).
+/// unsigned integer (used for the record counts in internal nodes). Any byte
+/// width is possible, as in libhdf5's `H5VM_limit_enc_size`.
 fn num_records_size(max_records: u64) -> usize {
-    if max_records <= 0xFF {
-        1
-    } else if max_records <= 0xFFFF {
-        2
-    } else if max_records <= 0xFFFF_FFFF {
-        4
-    } else {
-        8
-    }
+    (max_records.max(1).ilog2() / 8 + 1) as usize
 }
 
 /// Compute the maximum number of records that fit in a leaf node.
@@ -589,33 +582,40 @@ fn max_leaf_records(node_size: u32, record_size: u16) -> u64 {
     ((node_size - overhead) / record_size as u32) as u64
 }
 
-/// Compute the maximum number of records that fit in an internal node.
-/// This depends on the pointer size (offset_size) and the number-of-records
-/// encoding for child nodes, which makes it recursive in principle. We use
-/// an iterative approach.
-fn max_internal_records(
-    node_size: u32,
-    record_size: u16,
-    offset_size: u8,
-    max_child_records: u64,
-) -> u64 {
+/// Compute the maximum number of records that fit in an internal node whose
+/// child pointers take `pointer_size` bytes each.
+fn max_internal_records(node_size: u32, record_size: u16, pointer_size: u64) -> u64 {
     // Internal node overhead: signature(4) + version(1) + type(1) + checksum(4) = 10
-    let overhead = 10u32;
-    if node_size <= overhead || record_size == 0 {
+    // n * record_size + (n + 1) * pointer_size + overhead <= node_size
+    let reserved = 10 + pointer_size;
+    if u64::from(node_size) <= reserved || record_size == 0 {
         return 0;
     }
-    let available = (node_size - overhead) as u64;
-    // Each entry in an internal node is: record(record_size) + child_pointer(offset_size) + num_records(var)
-    let nrec_size = num_records_size(max_child_records) as u64;
-    let entry_size = record_size as u64 + offset_size as u64 + nrec_size;
-    // There is one more child pointer + num_records than records.
-    // So: n * record_size + (n+1) * (offset_size + nrec_size) <= available
-    // => n * (record_size + offset_size + nrec_size) + offset_size + nrec_size <= available
-    let extra = offset_size as u64 + nrec_size;
-    if available <= extra {
-        return 0;
+    (u64::from(node_size) - reserved) / (u64::from(record_size) + pointer_size)
+}
+
+/// Widths of the two record counts stored beside each child pointer of an
+/// internal node at `depth`: the records in the child, and, above depth 1, the
+/// records in the child and everything below it.
+///
+/// As in libhdf5's `H5B2__hdr_init`, the first is sized for a full leaf at every
+/// depth, because a leaf holds the most records, and the second for the most
+/// records a subtree of that height can hold.
+fn child_count_sizes(header: &BTreeV2Header, offset_size: u8, depth: u16) -> (usize, usize) {
+    let leaf_records = max_leaf_records(header.node_size, header.record_size);
+    let child_size = num_records_size(leaf_records);
+
+    let mut subtree_records = leaf_records;
+    let mut total_size = 0;
+    for _ in 1..depth {
+        let pointer_size = u64::from(offset_size) + (child_size + total_size) as u64;
+        let records = max_internal_records(header.node_size, header.record_size, pointer_size);
+        subtree_records = (records + 1)
+            .saturating_mul(subtree_records)
+            .saturating_add(records);
+        total_size = num_records_size(subtree_records);
     }
-    (available - extra) / entry_size
+    (child_size, total_size)
 }
 
 fn node_checksum_bounds(
@@ -799,21 +799,7 @@ fn parse_internal_node(
         )));
     }
 
-    // Compute max records for children to know the encoding size for
-    // child record counts.
-    let max_child_records = if depth == 1 {
-        max_leaf_records(header.node_size, header.record_size)
-    } else {
-        // For deeper trees, compute iteratively.
-        let leaf_max = max_leaf_records(header.node_size, header.record_size);
-        let mut prev_max = leaf_max;
-        for _ in 1..depth {
-            prev_max =
-                max_internal_records(header.node_size, header.record_size, offset_size, prev_max);
-        }
-        prev_max
-    };
-    let nrec_bytes = num_records_size(max_child_records);
+    let (nrec_bytes, total_nrec_bytes) = child_count_sizes(header, offset_size, depth);
 
     // Read records and child pointers interleaved:
     // child[0], record[0], child[1], record[1], ..., record[n-1], child[n]
@@ -847,14 +833,6 @@ fn parse_internal_node(
     // Whether to include a "total records" field for each child.
     // This is present when depth > 1.
     let has_total_records = depth > 1;
-    // total_records encoding size for deeper nodes
-    let total_nrec_bytes = if has_total_records {
-        // Total records in a sub-tree — need enough bytes to hold the
-        // maximum total records. We use length_size as an upper bound.
-        length_size as usize
-    } else {
-        0
-    };
 
     let mut child_addresses = Vec::with_capacity(num_children);
     let mut child_nrecords = Vec::with_capacity(num_children);
@@ -1314,18 +1292,7 @@ fn parse_internal_node_storage(
         )));
     }
 
-    let max_child_records = if depth == 1 {
-        max_leaf_records(header.node_size, header.record_size)
-    } else {
-        let leaf_max = max_leaf_records(header.node_size, header.record_size);
-        let mut prev_max = leaf_max;
-        for _ in 1..depth {
-            prev_max =
-                max_internal_records(header.node_size, header.record_size, offset_size, prev_max);
-        }
-        prev_max
-    };
-    let nrec_bytes = num_records_size(max_child_records);
+    let (nrec_bytes, total_nrec_bytes) = child_count_sizes(header, offset_size, depth);
 
     let mut node_records = Vec::with_capacity(num_records as usize);
     for _ in 0..num_records {
@@ -1344,11 +1311,6 @@ fn parse_internal_node_storage(
 
     let num_children = usize::from(num_records) + 1;
     let has_total_records = depth > 1;
-    let total_nrec_bytes = if has_total_records {
-        usize::from(length_size)
-    } else {
-        0
-    };
 
     let mut child_addresses = Vec::with_capacity(num_children);
     let mut child_nrecords = Vec::with_capacity(num_children);
@@ -1674,7 +1636,33 @@ mod tests {
         assert_eq!(num_records_size(255), 1);
         assert_eq!(num_records_size(256), 2);
         assert_eq!(num_records_size(65535), 2);
-        assert_eq!(num_records_size(65536), 4);
+        assert_eq!(num_records_size(65536), 3);
+        assert_eq!(num_records_size(0xFF_FFFF), 3);
+        assert_eq!(num_records_size(0x100_0000), 4);
+        assert_eq!(num_records_size(u64::MAX), 8);
+    }
+
+    #[test]
+    fn child_count_sizes_match_libhdf5() {
+        // A dense link name index: 512-byte nodes of 11-byte records, so 45 to a leaf.
+        let header = BTreeV2Header {
+            btree_type: 5,
+            node_size: 512,
+            record_size: 11,
+            depth: 0,
+            split_percent: 100,
+            merge_percent: 40,
+            root_node_address: 0,
+            num_records_in_root: 0,
+            total_records: 0,
+        };
+        assert_eq!(child_count_sizes(&header, 8, 1), (1, 0));
+        // 24 records and 25 leaves hold 1149 records.
+        assert_eq!(child_count_sizes(&header, 8, 2), (1, 2));
+        // 22 records and 23 of those subtrees hold 26449.
+        assert_eq!(child_count_sizes(&header, 8, 3), (1, 2));
+        // And 23 of those hold 608349.
+        assert_eq!(child_count_sizes(&header, 8, 4), (1, 3));
     }
 
     #[test]

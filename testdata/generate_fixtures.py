@@ -706,6 +706,18 @@ def generate_hdf5_fixtures(base_dir):
     with open(path, "r+b") as f:
         f.write(b"application data, not HDF5")
 
+    # ---- deep_btree_v2.h5 ----
+    # Tests: v2 B-trees deep enough for internal nodes above other internal nodes, which store
+    # a second, narrower record count per child. Hard links give the group 2000 members and
+    # keep the file small. netCDF-C groups reach this depth at around a thousand variables.
+    path = os.path.join(hdf5_dir, "deep_btree_v2.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", libver="latest", track_order=True) as f:
+        target = f.create_dataset("target", data=np.arange(4, dtype=np.int32))
+        for i in range(2000):
+            f[f"link_{i:04d}"] = target
+            target.attrs[f"attr_{i:04d}"] = np.int32(i)
+
 
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
