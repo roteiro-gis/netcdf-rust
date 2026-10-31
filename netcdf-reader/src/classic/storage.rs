@@ -11,7 +11,7 @@ const INITIAL_HEADER_READ: usize = 64 * 1024;
 
 #[derive(Clone)]
 enum ClassicStorageBacking {
-    Bytes(Arc<[u8]>),
+    Bytes(Arc<Vec<u8>>),
     Mmap(Arc<Mmap>),
     #[cfg(feature = "netcdf4")]
     Range(hdf5_reader::storage::DynStorage),
@@ -68,7 +68,7 @@ impl ClassicParallelReadPolicy {
 #[derive(Clone)]
 pub(crate) enum ClassicBuffer {
     Bytes {
-        data: Arc<[u8]>,
+        data: Arc<Vec<u8>>,
         start: usize,
         len: usize,
     },
@@ -85,7 +85,7 @@ impl ClassicStorage {
     pub(crate) fn from_bytes(bytes: Vec<u8>) -> Self {
         let len = bytes.len() as u64;
         Self {
-            backing: ClassicStorageBacking::Bytes(Arc::<[u8]>::from(bytes)),
+            backing: ClassicStorageBacking::Bytes(Arc::new(bytes)),
             len,
         }
     }
@@ -207,5 +207,18 @@ impl Deref for ClassicBuffer {
             #[cfg(feature = "netcdf4")]
             ClassicBuffer::Range(buffer) => buffer.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_bytes_are_served_in_place() {
+        let bytes = vec![1, 2, 3, 4];
+        let start = bytes.as_ptr();
+        let storage = ClassicStorage::from_bytes(bytes);
+        assert_eq!(storage.read_range(0, 4).unwrap().as_ptr(), start);
     }
 }

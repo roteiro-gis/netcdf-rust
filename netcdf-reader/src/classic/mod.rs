@@ -62,6 +62,21 @@ impl ClassicFile {
         })
     }
 
+    /// Open a classic NetCDF file from an owned byte vector without copying it.
+    pub fn from_vec(bytes: Vec<u8>, format: NcFormat) -> Result<Self> {
+        let is_streaming = header::has_streaming_numrecs(&bytes, format);
+        let header = header::parse_header(&bytes, format)?;
+        let storage = ClassicStorage::from_bytes(bytes);
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
+
+        Ok(ClassicFile {
+            format,
+            root_group,
+            storage,
+            numrecs,
+        })
+    }
+
     /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
     pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
         let is_streaming = header::has_streaming_numrecs(&mmap, format);
