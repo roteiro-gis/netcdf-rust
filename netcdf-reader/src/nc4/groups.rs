@@ -53,6 +53,46 @@ fn visible_dim_addr_map(
     visible_dim_addr_map
 }
 
+/// Grow unlimited dimensions to the longest variable in `datasets` that uses them.
+///
+/// netCDF-C extends only the datasets it writes to, so a dimension's own scale can be shorter
+/// than a variable on it, and `nc_inq_dimlen` reports the longest. Variables whose dimension
+/// list can't be resolved are skipped here and reported when the variable itself is built.
+fn widen_unlimited_dimensions(
+    datasets: &[hdf5_reader::Dataset],
+    group: &hdf5_reader::group::Group,
+    visible_dimensions: &mut [NcDimension],
+    visible_dim_addr_map: &mut HashMap<u64, NcDimension>,
+) {
+    for dataset in datasets {
+        let Some(max_dims) = dataset.max_dims() else {
+            continue;
+        };
+        if !max_dims.contains(&u64::MAX) {
+            continue;
+        }
+        let Ok(addresses) = variables::resolve_dimension_scale_addresses(dataset, group) else {
+            continue;
+        };
+
+        for ((address, &extent), &max_dim) in addresses.iter().zip(dataset.shape()).zip(max_dims) {
+            let Some(dimension) = visible_dim_addr_map.get_mut(address) else {
+                continue;
+            };
+            if max_dim != u64::MAX || extent <= dimension.size {
+                continue;
+            }
+            dimension.size = extent;
+            if let Some(visible) = visible_dimensions
+                .iter_mut()
+                .find(|visible| visible.is_unlimited && visible.name == dimension.name)
+            {
+                visible.size = extent;
+            }
+        }
+    }
+}
+
 /// Build the root NcGroup from an HDF5 file.
 pub fn build_root_group(hdf5: &Hdf5File, metadata_mode: crate::NcMetadataMode) -> Result<NcGroup> {
     build_group_at_path(hdf5, "/", metadata_mode, true)
@@ -166,8 +206,14 @@ fn build_group_recursive(
     // reconstruction.
     let (local_dimensions, local_dim_addr_map) =
         dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
-    let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
-    let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    let mut visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
+    let mut visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    widen_unlimited_dimensions(
+        &datasets,
+        hdf5_group,
+        &mut visible_dimensions,
+        &mut visible_dim_addr_map,
+    );
 
     // Extract variables (non-dimension-scale datasets).
     let variables = variables::extract_variables_from_datasets(
@@ -214,8 +260,14 @@ fn build_group_metadata(
     let datasets = hdf5_group.datasets()?;
     let (local_dimensions, local_dim_addr_map) =
         dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
-    let visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
-    let visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    let mut visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
+    let mut visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    widen_unlimited_dimensions(
+        &datasets,
+        hdf5_group,
+        &mut visible_dimensions,
+        &mut visible_dim_addr_map,
+    );
     let variables = variables::extract_variables_from_datasets(
         &datasets,
         hdf5_group,

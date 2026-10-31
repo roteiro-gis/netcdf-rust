@@ -1337,3 +1337,51 @@ fn classic_selection_larger_than_the_file_is_an_error() {
     assert!(file.read_variable_slice::<f64>("v", &all).is_err());
     assert!(file.read_variable_slice_as_f64("v", &all).is_err());
 }
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn variables_on_one_unlimited_dimension_keep_their_own_lengths() {
+    let path = required_fixture("netcdf4", "nc4_uneven_unlimited.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    // netCDF-C reports the longest variable, not the coordinate's own extent.
+    assert_eq!(file.dimension("time").unwrap().size, 6);
+    assert_eq!(
+        file.root_group().unwrap().dimension("time").unwrap().size,
+        6
+    );
+
+    for (name, shape) in [
+        ("time", vec![3]),
+        ("longest", vec![6, 2]),
+        ("shortest", vec![2, 2]),
+    ] {
+        let variable = file.variable(name).unwrap();
+        assert_eq!(variable.shape(), shape, "{name}");
+
+        let data = file.read_variable_as_f64(name).unwrap();
+        let read_shape: Vec<u64> = data.shape().iter().map(|&len| len as u64).collect();
+        assert_eq!(read_shape, shape, "{name}");
+    }
+
+    let records: Vec<_> = file
+        .iter_slices::<f32>("shortest", 0)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1].iter().copied().collect::<Vec<_>>(), [2.0, 3.0]);
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn lossy_metadata_reports_the_same_unlimited_lengths() {
+    let path = required_fixture("netcdf4", "nc4_uneven_unlimited.nc");
+    let options = netcdf_reader::NcOpenOptions {
+        metadata_mode: netcdf_reader::NcMetadataMode::Lossy,
+        ..Default::default()
+    };
+    let file = netcdf_reader::NcFile::open_with_options(&path, options).unwrap();
+    assert_eq!(file.dimension("time").unwrap().size, 6);
+    assert_eq!(file.variable("shortest").unwrap().shape(), [2, 2]);
+}

@@ -1853,3 +1853,35 @@ fn rejects_nc4_dimension_scale_name_conflict() {
 
     assert!(err.to_string().contains("hidden dimension-scale"));
 }
+
+#[test]
+fn reads_nc4_behind_a_user_block() {
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 3).unwrap();
+    let values = builder.add_variable::<f32>("values", &[x]).unwrap();
+    builder
+        .write_variable(values, &[1.0_f32, 2.0, 3.0])
+        .unwrap();
+    let (_, nc4) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+    let mut bytes = vec![0_u8; 1024];
+    bytes.extend_from_slice(&nc4);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("user_block.nc");
+    std::fs::write(&path, &bytes).unwrap();
+    let storage = std::sync::Arc::new(netcdf_reader::BytesStorage::new(bytes.clone()));
+
+    for file in [
+        NcFile::from_bytes(&bytes).unwrap(),
+        NcFile::open(&path).unwrap(),
+        NcFile::from_storage(storage).unwrap(),
+    ] {
+        assert_eq!(file.format(), NcFormat::Nc4);
+        let read = file.read_variable::<f32>("values").unwrap();
+        assert_eq!(read.iter().copied().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+    }
+}

@@ -692,6 +692,20 @@ def generate_hdf5_fixtures(base_dir):
             ds.attrs[f"small_{i:02d}"] = np.int32(i)
         ds.attrs["huge"] = np.arange(50_000, dtype=np.float32)
 
+    # ---- user_block.h5 ----
+    # Tests: addresses relative to a superblock moved 1024 bytes in by a user block.
+    path = os.path.join(hdf5_dir, "user_block.h5")
+    print(f"  Generating {path}")
+    with h5py.File(path, "w", userblock_size=1024, libver="earliest") as f:
+        f.attrs["title"] = "behind a user block"
+        grp = f.create_group("group")
+        grp.create_dataset("data", data=np.arange(6, dtype="f8").reshape(2, 3))
+        grp.create_dataset(
+            "chunked", data=np.arange(100, dtype="i4"), chunks=(10,), compression="gzip"
+        )
+    with open(path, "r+b") as f:
+        f.write(b"application data, not HDF5")
+
 
 def generate_netcdf3_fixtures(base_dir):
     """Generate all NetCDF-3 (classic, 64-bit offset, 64-bit data) test fixtures."""
@@ -1225,6 +1239,21 @@ def generate_netcdf4_fixtures(base_dir):
     stored = _link_order(h5py.h5.INDEX_NAME, h5py.h5.ITER_NATIVE)
     assert created == ["y", "x", "time", "Hs", "Tp", "Dir", "Te"], created
     assert stored != created, "fixture no longer exercises storage != creation order"
+
+    # ---- nc4_uneven_unlimited.nc ----
+    # Tests: variables that share an unlimited dimension but hold different record counts.
+    # Only the datasets written to are extended, so the coordinate is shorter than `longest`.
+    path = os.path.join(nc4_dir, "nc4_uneven_unlimited.nc")
+    print(f"  Generating {path}")
+    with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
+        ds.createDimension("time", None)
+        ds.createDimension("x", 2)
+        time = ds.createVariable("time", "f8", ("time",))
+        longest = ds.createVariable("longest", "f4", ("time", "x"))
+        shortest = ds.createVariable("shortest", "f4", ("time", "x"))
+        time[:3] = [0.0, 1.0, 2.0]
+        longest[:6] = np.arange(12, dtype="f4").reshape(6, 2)
+        shortest[:2] = np.arange(4, dtype="f4").reshape(2, 2)
 
 
 SECTION_GENERATORS = {
