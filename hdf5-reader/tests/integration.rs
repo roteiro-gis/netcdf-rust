@@ -1882,3 +1882,51 @@ fn reads_v2_btrees_with_nested_internal_nodes() {
     let attribute = target.attribute("attr_1999").unwrap();
     assert_eq!(attribute.read_scalar::<i32>().unwrap(), 1999);
 }
+
+#[test]
+fn hard_link_aliases_reuse_dense_attribute_metadata() {
+    let path = skip_if_missing!("deep_btree_v2.h5");
+    let storage = Arc::new(CountingStorage::new(std::fs::read(path).unwrap()));
+    let file = hdf5_reader::Hdf5File::from_storage(storage.clone()).unwrap();
+    let root = file.root_group().unwrap();
+    let target = root.dataset("target").unwrap();
+    assert_eq!(target.attributes().len(), 2000);
+
+    storage.clear_ranges();
+    let alias = root.dataset("link_0000").unwrap();
+    assert_eq!(alias.name(), "link_0000");
+    assert_eq!(target.name(), "target");
+    assert_eq!(alias.address(), target.address());
+    assert_eq!(alias.attributes().len(), 2000);
+    assert_eq!(
+        alias
+            .attribute("attr_1999")
+            .unwrap()
+            .read_scalar::<i32>()
+            .unwrap(),
+        1999
+    );
+    assert!(
+        storage.ranges().len() < 64,
+        "opening a hard-link alias reread dense attributes: {} storage reads",
+        storage.ranges().len()
+    );
+
+    storage.clear_ranges();
+    let (_, names) = root.member_names().unwrap();
+    let name_listing_reads = storage.ranges().len();
+    storage.clear_ranges();
+    let aliases = root.datasets().unwrap();
+    assert_eq!(aliases.len(), 2001);
+    assert_eq!(aliases.len(), names.len());
+    assert!(aliases
+        .iter()
+        .all(|dataset| dataset.address() == target.address()));
+    assert!(aliases.iter().any(|dataset| dataset.name() == "target"));
+    assert!(aliases.iter().any(|dataset| dataset.name() == "link_1999"));
+    assert_eq!(
+        storage.ranges().len(),
+        name_listing_reads,
+        "opening aliases must not reread attributes beyond the link listing"
+    );
+}

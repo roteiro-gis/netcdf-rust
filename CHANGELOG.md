@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Improved
+
+- reuse parsed dataset metadata and attribute storage across hard-link aliases,
+  so listing a group with many aliases does not reread its dense attribute
+  tables for every link
+
 ## 0.12.0 - 2026-10-31
 
 ### Breaking changes
