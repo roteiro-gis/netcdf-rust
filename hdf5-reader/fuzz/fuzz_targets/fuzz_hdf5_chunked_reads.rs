@@ -1,7 +1,11 @@
 #![no_main]
 
-use hdf5_reader::{Dataset, Hdf5File, SliceInfo, SliceInfoElem};
+use hdf5_reader::{Dataset, Hdf5File, OpenOptions, SliceInfo, SliceInfoElem};
 use libfuzzer_sys::fuzz_target;
+
+/// A mutated dataspace can declare a sparse dataset of any size, whose read is a legitimate
+/// allocation. ASan aborts on a request that large rather than letting it fail, so refuse it first.
+const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
 
 const SIMPLE_CHUNKED: &[u8] = include_bytes!("../../../testdata/hdf5/simple_chunked_deflate.h5");
 const FIXED_ARRAY_CHUNKED: &[u8] = include_bytes!("../../../testdata/hdf5/fixed_array_chunked.h5");
@@ -69,7 +73,8 @@ fn exercise_dataset(dataset: &Dataset) {
 
 fuzz_target!(|data: &[u8]| {
     let bytes = mutated_fixture(data);
-    if let Ok(file) = Hdf5File::from_bytes(&bytes) {
+    let options = OpenOptions::default().with_max_read_bytes(MAX_READ_BYTES);
+    if let Ok(file) = Hdf5File::from_bytes_with_options(&bytes, options) {
         for path in ["/temperature", "/data"] {
             if let Ok(dataset) = file.dataset(path) {
                 exercise_dataset(&dataset);
