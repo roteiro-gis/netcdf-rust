@@ -162,19 +162,7 @@ impl Nc4File {
     /// Open a NetCDF-4 file from disk with custom options.
     pub fn open_with_options(path: &Path, options: crate::NcOpenOptions) -> Result<Self> {
         let metadata_mode = options.metadata_mode;
-        let hdf5 = Hdf5File::open_with_options(
-            path,
-            hdf5_reader::OpenOptions {
-                chunk_cache_bytes: options.chunk_cache_bytes,
-                chunk_cache_slots: options.chunk_cache_slots,
-                filter_registry: options.filter_registry,
-                external_file_resolver: options.external_file_resolver,
-                external_link_resolver: options.external_link_resolver,
-                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
-                max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
-                max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
-            },
-        )?;
+        let hdf5 = Hdf5File::open_with_options(path, options.into())?;
         Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
@@ -186,19 +174,7 @@ impl Nc4File {
     /// Open a NetCDF-4 file from in-memory bytes with custom options.
     pub fn from_bytes_with_options(data: &[u8], options: crate::NcOpenOptions) -> Result<Self> {
         let metadata_mode = options.metadata_mode;
-        let hdf5 = Hdf5File::from_bytes_with_options(
-            data,
-            hdf5_reader::OpenOptions {
-                chunk_cache_bytes: options.chunk_cache_bytes,
-                chunk_cache_slots: options.chunk_cache_slots,
-                filter_registry: options.filter_registry,
-                external_file_resolver: options.external_file_resolver,
-                external_link_resolver: options.external_link_resolver,
-                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
-                max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
-                max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
-            },
-        )?;
+        let hdf5 = Hdf5File::from_bytes_with_options(data, options.into())?;
         Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
@@ -213,19 +189,7 @@ impl Nc4File {
         options: crate::NcOpenOptions,
     ) -> Result<Self> {
         let metadata_mode = options.metadata_mode;
-        let hdf5 = Hdf5File::from_storage_with_options(
-            storage,
-            hdf5_reader::OpenOptions {
-                chunk_cache_bytes: options.chunk_cache_bytes,
-                chunk_cache_slots: options.chunk_cache_slots,
-                filter_registry: options.filter_registry,
-                external_file_resolver: options.external_file_resolver,
-                external_link_resolver: options.external_link_resolver,
-                max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
-                max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
-                max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
-            },
-        )?;
+        let hdf5 = Hdf5File::from_storage_with_options(storage, options.into())?;
         Nc4File::from_hdf5(hdf5, metadata_mode)
     }
 
