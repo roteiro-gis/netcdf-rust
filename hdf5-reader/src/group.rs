@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::attribute_api::{
@@ -50,6 +51,17 @@ struct ChildEntry {
     location: ObjectLocation,
     /// The link's stored creation order, when its group tracks it.
     creation_order: Option<u64>,
+}
+
+impl ChildEntry {
+    /// Links with the same identity are one child, whichever storage holds them.
+    fn identity(&self) -> (String, u64, *const FileContext) {
+        (
+            self.name.clone(),
+            self.location.address,
+            Arc::as_ptr(&self.location.context),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -449,13 +461,9 @@ impl Group {
             // Dense-link storage can coexist with compact links, so merge both.
             if let Some(ref li) = link_info {
                 if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
+                    let mut seen: HashSet<_> = children.iter().map(ChildEntry::identity).collect();
                     for child in self.resolve_dense_links_storage(li, walk)? {
-                        let is_duplicate = children.iter().any(|existing| {
-                            existing.name == child.name
-                                && existing.location.address == child.location.address
-                                && Arc::ptr_eq(&existing.location.context, &child.location.context)
-                        });
-                        if !is_duplicate {
+                        if seen.insert(child.identity()) {
                             children.push(child);
                         }
                     }
