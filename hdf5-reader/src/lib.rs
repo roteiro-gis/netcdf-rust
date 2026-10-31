@@ -544,6 +544,33 @@ pub(crate) struct FileContext {
 }
 
 impl FileContext {
+    pub(crate) fn resolve_vlen_reference_bytes(
+        &self,
+        reference: &[u8],
+        base_element_size: usize,
+    ) -> Result<Vec<u8>> {
+        let mut cursor = io::Cursor::new(reference);
+        let count = cursor.read_u32_le()? as usize;
+        let address = cursor.read_offset(self.superblock.offset_size)?;
+        let index = cursor.read_u32_le()?;
+        if io::Cursor::is_undefined_offset(address, self.superblock.offset_size) || index == 0 {
+            return Ok(Vec::new());
+        }
+        let index = u16::try_from(index)
+            .map_err(|_| Error::InvalidData("vlen heap object index exceeds u16".into()))?;
+        let bytes = count
+            .checked_mul(base_element_size)
+            .ok_or_else(|| Error::InvalidData("vlen sequence byte size overflows".into()))?;
+        let heap = self.global_heap(address)?;
+        let object = heap.get_object(index).ok_or_else(|| {
+            Error::InvalidData(format!("missing vlen heap object {index} at {address:#x}"))
+        })?;
+        let data = object.data.get(..bytes).ok_or_else(|| {
+            Error::InvalidData("vlen heap object is shorter than its reference".into())
+        })?;
+        Ok(data.to_vec())
+    }
+
     pub(crate) fn read_range(&self, offset: u64, len: usize) -> Result<StorageBuffer> {
         self.storage.read_range(offset, len)
     }

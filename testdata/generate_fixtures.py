@@ -1285,8 +1285,8 @@ def generate_netcdf4_fixtures(base_dir):
             variable[...] = values
 
     # ---- nc4_user_typed_attributes.nc ----
-    # Tests: attributes of user-defined types. An enum variable's _FillValue has the enum type,
-    # and NcAttrValue has no form for the compound attribute h5py adds alongside it.
+    # Tests: an enum variable's _FillValue has the enum type, and a compound
+    # attribute added through HDF5 must remain visible on an ordinary variable.
     path = os.path.join(nc4_dir, "nc4_user_typed_attributes.nc")
     print(f"  Generating {path}")
     with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
@@ -1331,6 +1331,10 @@ def generate_netcdf4_fixtures(base_dir):
         group.createDimension("y", 2)
         y = group.createVariable("y", "f4", ("y", "x"))
         y[:] = np.arange(6, dtype="f4").reshape(2, 3)
+
+
+    from generate_release_parity_fixtures import generate
+    generate(nc4_dir)
 
 
 SECTION_GENERATORS = {

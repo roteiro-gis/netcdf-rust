@@ -241,6 +241,51 @@ impl NcType {
     }
 }
 
+/// A decoded NetCDF-4 enum value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NcEnumValue {
+    /// The stored integer value.
+    pub value: NcIntegerValue,
+    /// The matching enum member name, if the stored value is declared by the type.
+    pub member: Option<String>,
+}
+
+/// A decoded field of a NetCDF-4 compound value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NcCompoundValueField {
+    pub name: String,
+    pub value: NcValue,
+}
+
+/// A decoded fixed-size NetCDF-4 array value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NcArrayValue {
+    pub dims: Vec<u64>,
+    pub values: Vec<NcValue>,
+}
+
+/// A decoded NetCDF-4 value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NcValue {
+    Byte(i8),
+    Char(u8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    Double(f64),
+    UByte(u8),
+    UShort(u16),
+    UInt(u32),
+    Int64(i64),
+    UInt64(u64),
+    String(String),
+    Enum(NcEnumValue),
+    Opaque(Vec<u8>),
+    Compound(Vec<NcCompoundValueField>),
+    Array(NcArrayValue),
+    VLen(Vec<NcValue>),
+}
+
 /// A NetCDF attribute value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NcAttrValue {
@@ -256,6 +301,11 @@ pub enum NcAttrValue {
     Int64s(Vec<i64>),
     UInt64s(Vec<u64>),
     Strings(Vec<String>),
+    /// Decoded compound, opaque, or non-string variable-length attribute values.
+    UserDefined {
+        dtype: NcType,
+        values: Vec<NcValue>,
+    },
 }
 
 impl NcAttrValue {
@@ -279,7 +329,9 @@ impl NcAttrValue {
             NcAttrValue::UInts(v) => v.first().map(|&x| x as f64),
             NcAttrValue::Int64s(v) => v.first().map(|&x| x as f64),
             NcAttrValue::UInt64s(v) => v.first().map(|&x| x as f64),
-            NcAttrValue::Chars(_) | NcAttrValue::Strings(_) => None,
+            NcAttrValue::Chars(_) | NcAttrValue::Strings(_) | NcAttrValue::UserDefined { .. } => {
+                None
+            }
         }
     }
 
@@ -295,7 +347,9 @@ impl NcAttrValue {
             NcAttrValue::UInts(v) => Some(v.iter().map(|&x| x as f64).collect()),
             NcAttrValue::Int64s(v) => Some(v.iter().map(|&x| x as f64).collect()),
             NcAttrValue::UInt64s(v) => Some(v.iter().map(|&x| x as f64).collect()),
-            NcAttrValue::Chars(_) | NcAttrValue::Strings(_) => None,
+            NcAttrValue::Chars(_) | NcAttrValue::Strings(_) | NcAttrValue::UserDefined { .. } => {
+                None
+            }
         }
     }
 }

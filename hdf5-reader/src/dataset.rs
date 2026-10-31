@@ -711,6 +711,8 @@ pub struct Dataset {
     pub(crate) name: String,
     pub(crate) data_address: u64,
     pub(crate) dataspace: DataspaceMessage,
+    /// Physical extent when this handle exposes a larger, fill-padded shape.
+    storage_dims: Option<Vec<u64>>,
     pub(crate) datatype: Datatype,
     pub(crate) layout: DataLayout,
     pub(crate) fill_value: Option<FillValueMessage>,
@@ -790,6 +792,7 @@ pub(crate) struct DatasetTemplate {
     name: String,
     data_address: u64,
     dataspace: DataspaceMessage,
+    storage_dims: Option<Vec<u64>>,
     datatype: Datatype,
     layout: DataLayout,
     fill_value: Option<FillValueMessage>,
@@ -812,6 +815,7 @@ impl Dataset {
             name: template.name.clone(),
             data_address: template.data_address,
             dataspace: template.dataspace.clone(),
+            storage_dims: template.storage_dims.clone(),
             datatype: template.datatype.clone(),
             layout: template.layout.clone(),
             fill_value: template.fill_value.clone(),
@@ -831,6 +835,7 @@ impl Dataset {
             name: self.name.clone(),
             data_address: self.data_address,
             dataspace: self.dataspace.clone(),
+            storage_dims: self.storage_dims.clone(),
             datatype: self.datatype.clone(),
             layout: self.layout.clone(),
             fill_value: self.fill_value.clone(),
@@ -903,6 +908,7 @@ impl Dataset {
             name,
             data_address: address,
             dataspace,
+            storage_dims: None,
             datatype: dt,
             layout,
             fill_value,
@@ -933,6 +939,41 @@ impl Dataset {
     /// Shape of the dataset (dimensions).
     pub fn shape(&self) -> &[u64] {
         &self.dataspace.dims
+    }
+
+    /// Expose a larger logical extent, filling elements outside the stored
+    /// extent with the dataset's fill value. Only unlimited axes of chunked
+    /// datasets may grow. The file and other handles remain unchanged.
+    ///
+    /// This supports NetCDF dimensions shared by datasets of different lengths.
+    /// Read limits apply to the padded selection, including slice reads.
+    pub fn with_padded_shape(mut self, shape: &[u64]) -> Result<Self> {
+        if shape == self.shape() {
+            return Ok(self);
+        }
+        let valid = shape.len() == self.ndim()
+            && shape.iter().enumerate().all(|(axis, &extent)| {
+                let stored = self.dataspace.dims[axis];
+                extent == stored
+                    || (extent > stored
+                        && self.max_dims().and_then(|dims| dims.get(axis)) == Some(&u64::MAX))
+            });
+        if !valid || !matches!(self.layout, DataLayout::Chunked { .. }) {
+            return Err(Error::InvalidData(
+                "padded shape may only extend unlimited axes of a chunked dataset".into(),
+            ));
+        }
+        if self.storage_dims.is_none() {
+            self.storage_dims = Some(self.dataspace.dims.clone());
+        }
+        self.dataspace.dims = shape.to_vec();
+        // These caches describe the logical extent; decoded chunk bytes remain
+        // shared and are padded only after loading from the physical chunk cache.
+        self.chunk_entry_cache =
+            Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(32).unwrap())));
+        self.full_chunk_entries = Arc::new(OnceLock::new());
+        self.full_dataset_bytes = Arc::new(OnceLock::new());
+        Ok(self)
     }
 
     /// Datatype of the dataset.
@@ -1503,43 +1544,9 @@ impl Dataset {
         reference: &[u8],
         base_element_size: usize,
     ) -> Result<Vec<u8>> {
-        if reference.len() < self.vlen_reference_size() {
-            return Err(Error::InvalidData(format!(
-                "dataset '{}' vlen reference too short: need {} bytes, have {}",
-                self.name,
-                self.vlen_reference_size(),
-                reference.len()
-            )));
-        }
-
-        let mut cursor = Cursor::new(reference);
-        let seq_len = cursor.read_u32_le()? as usize;
-        let heap_addr = cursor.read_offset(self.offset_size())?;
-        let obj_index = cursor.read_u32_le()? as u16;
-
-        if Cursor::is_undefined_offset(heap_addr, self.offset_size()) || obj_index == 0 {
-            return Ok(Vec::new());
-        }
-
-        let expected_bytes =
-            checked_mul_usize(seq_len, base_element_size, "vlen sequence byte size")?;
-        let collection = self.context.global_heap(heap_addr)?;
-        let object = collection.get_object(obj_index).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "dataset '{}' references missing vlen heap object {}",
-                self.name, obj_index
-            ))
-        })?;
-        if object.data.len() < expected_bytes {
-            return Err(Error::InvalidData(format!(
-                "dataset '{}' vlen heap object too short: need {} bytes, have {}",
-                self.name,
-                expected_bytes,
-                object.data.len()
-            )));
-        }
-
-        Ok(object.data[..expected_bytes].to_vec())
+        self.context
+            .resolve_vlen_reference_bytes(reference, base_element_size)
+            .map_err(|err| err.with_context(&self.name))
     }
 
     fn read_contiguous<T: H5Type>(&self, address: u64, size: u64) -> Result<ArrayD<T>> {
@@ -2202,6 +2209,7 @@ impl Dataset {
             }
         }
 
+        let storage_shape = self.storage_dims.as_deref().unwrap_or(selection.shape);
         let mut entries = match chunk_indexing {
             None => {
                 // V1-V3: B-tree v1 chunk indexing
@@ -2232,7 +2240,7 @@ impl Dataset {
             ),
             Some(ChunkIndexing::Implicit) => chunk_index::collect_implicit_chunk_entries(
                 index_address,
-                selection.shape,
+                storage_shape,
                 chunk_dims,
                 selection.elem_size,
                 selection.chunk_bounds,
@@ -2244,7 +2252,7 @@ impl Dataset {
                     index_address,
                     self.offset_size(),
                     self.length_size(),
-                    selection.shape,
+                    storage_shape,
                     chunk_dims,
                     selection.chunk_bounds,
                 )
@@ -2255,7 +2263,7 @@ impl Dataset {
                     index_address,
                     self.offset_size(),
                     self.length_size(),
-                    selection.shape,
+                    storage_shape,
                     self.dataspace.max_dims.as_deref(),
                     chunk_dims,
                     selection.chunk_bounds,
@@ -2263,7 +2271,7 @@ impl Dataset {
             }
         }?;
 
-        clip_stale_chunks(&mut entries, selection.shape, chunk_dims);
+        clip_stale_chunks(&mut entries, storage_shape, chunk_dims);
 
         if let Some(key) = cache_key {
             let mut cache = self.chunk_entry_cache.lock();
@@ -2311,6 +2319,7 @@ impl Dataset {
     ) -> Result<Vec<chunk_index::ChunkEntry>> {
         let storage = self.context.storage.as_ref();
         let ndim = shape.len();
+        let storage_shape = self.storage_dims.as_deref().unwrap_or(shape);
         let mut entries = match chunk_indexing {
             None => btree_v1_chunk_entries(
                 &crate::btree_v1::collect_btree_v1_chunk_leaves_in_set_storage(
@@ -2344,7 +2353,7 @@ impl Dataset {
             ),
             Some(ChunkIndexing::Implicit) => chunk_index::collect_implicit_chunk_entries_in_set(
                 index_address,
-                shape,
+                storage_shape,
                 chunk_dims,
                 elem_size,
                 set,
@@ -2355,7 +2364,7 @@ impl Dataset {
                     index_address,
                     self.offset_size(),
                     self.length_size(),
-                    shape,
+                    storage_shape,
                     chunk_dims,
                     set,
                 )
@@ -2366,14 +2375,14 @@ impl Dataset {
                     index_address,
                     self.offset_size(),
                     self.length_size(),
-                    shape,
+                    storage_shape,
                     self.dataspace.max_dims.as_deref(),
                     chunk_dims,
                     set,
                 )
             }
         }?;
-        clip_stale_chunks(&mut entries, shape, chunk_dims);
+        clip_stale_chunks(&mut entries, storage_shape, chunk_dims);
         entries.retain(|entry| set.contains_offsets(&entry.offsets, chunk_dims));
         Ok(entries)
     }
@@ -2688,7 +2697,38 @@ impl Dataset {
     ) -> Result<Arc<Vec<u8>>> {
         let data = self.load_chunk_data(entry, dataset_addr, chunk_shape, elem_size)?;
         validate_decoded_chunk_len(entry, chunk_shape, elem_size, data.len())?;
-        Ok(data)
+        let Some(stored) = self.storage_dims.as_deref() else {
+            return Ok(data);
+        };
+        if stored
+            .iter()
+            .enumerate()
+            .all(|(axis, &extent)| entry.offsets[axis].saturating_add(chunk_shape[axis]) <= extent)
+        {
+            return Ok(data);
+        }
+        // A physical edge chunk can contain old bytes beyond its dataspace.
+        // Never expose those bytes when the logical extent grows.
+        let mut padded = data.as_ref().clone();
+        let fill = self.make_output_buffer(elem_size)?;
+        let mut indices = vec![0u64; stored.len()];
+        for element in padded.chunks_exact_mut(elem_size) {
+            if stored
+                .iter()
+                .enumerate()
+                .any(|(axis, &extent)| entry.offsets[axis].saturating_add(indices[axis]) >= extent)
+            {
+                element.copy_from_slice(&fill);
+            }
+            for axis in (0..indices.len()).rev() {
+                indices[axis] += 1;
+                if indices[axis] < chunk_shape[axis] {
+                    break;
+                }
+                indices[axis] = 0;
+            }
+        }
+        Ok(Arc::new(padded))
     }
 
     /// Chunked slice: only read chunks that overlap the selection.
@@ -4612,6 +4652,7 @@ mod tests {
             context: context.clone(),
             name: "short".to_string(),
             data_address: 0,
+            storage_dims: None,
             dataspace: DataspaceMessage {
                 rank: 1,
                 dims: vec![3],
@@ -4649,6 +4690,7 @@ mod tests {
             context: context.clone(),
             name: "vlen".to_string(),
             data_address: 0,
+            storage_dims: None,
             dataspace: DataspaceMessage {
                 rank: 1,
                 dims: vec![2],
@@ -4843,6 +4885,43 @@ mod tests {
 
         let err = raw_element_size_for_datatype(&dtype, 12).unwrap_err();
         assert!(err.to_string().contains("array datatype"));
+    }
+
+    #[test]
+    fn padded_views_hide_stale_edge_bytes_and_do_not_reuse_physical_extent_caches() {
+        let mut dataset = fixed_u16_dataset(
+            DataLayout::Chunked {
+                address: 0,
+                dims: vec![4],
+                element_size: 2,
+                chunk_indexing: Some(ChunkIndexing::SingleChunk {
+                    filtered_size: 8,
+                    filters: 0,
+                }),
+            },
+            vec![1, 0, 2, 0, 3, 0, 99, 0],
+        );
+        dataset.dataspace.max_dims = Some(vec![u64::MAX]);
+        dataset.fill_value = Some(FillValueMessage {
+            defined: true,
+            fill_time: FillTime::IfSet,
+            value: Some(vec![9, 0]),
+        });
+        assert_eq!(
+            dataset.read_array::<u16>().unwrap().as_slice().unwrap(),
+            [1, 2, 3]
+        );
+        let padded = dataset.clone().with_padded_shape(&[8]).unwrap();
+        assert_eq!(
+            padded.read_array::<u16>().unwrap().as_slice().unwrap(),
+            [1, 2, 3, 9, 9, 9, 9, 9]
+        );
+        assert_eq!(
+            dataset.read_array::<u16>().unwrap().as_slice().unwrap(),
+            [1, 2, 3]
+        );
+        assert!(dataset.clone().with_padded_shape(&[2]).is_err());
+        assert!(dataset.with_padded_shape(&[3, 4]).is_err());
     }
 
     #[test]
