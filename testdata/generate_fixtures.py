@@ -1226,6 +1226,23 @@ def generate_netcdf4_fixtures(base_dir):
     assert created == ["y", "x", "time", "Hs", "Tp", "Dir", "Te"], created
     assert stored != created, "fixture no longer exercises storage != creation order"
 
+    # ---- nc4_user_typed_attributes.nc ----
+    # Tests: attributes of user-defined types. An enum variable's _FillValue has the enum type,
+    # and NcAttrValue has no form for the compound attribute h5py adds alongside it.
+    path = os.path.join(nc4_dir, "nc4_user_typed_attributes.nc")
+    print(f"  Generating {path}")
+    with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
+        quality = ds.createEnumType("i1", "quality_t", {"good": 0, "bad": 1})
+        ds.createDimension("x", 3)
+        ds.createVariable("quality", quality, ("x",), fill_value=1)[:] = np.array(
+            [0, 1, 0], dtype="i1"
+        )
+        ds.createVariable("plain", "f4", ("x",))[:] = [1.0, 2.0, 3.0]
+    import h5py
+
+    with h5py.File(path, "a") as f:
+        f["plain"].attrs["compound"] = np.array((1, 2.0), dtype=[("a", "i4"), ("b", "f8")])
+
 
 SECTION_GENERATORS = {
     "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),
