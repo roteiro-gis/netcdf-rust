@@ -469,3 +469,73 @@ fn read_variable_unpacked_masked_no_attrs_returns_raw() {
     assert_eq!(arr3[[0]], 1.0);
     assert_eq!(arr3[[3]], 4.0);
 }
+
+/// Build an NC_CHAR attribute.
+fn char_attr(name: &'static str, value: &str) -> AttrSpec {
+    let mut payload = value.as_bytes().to_vec();
+    payload.resize(value.len().div_ceil(4) * 4, 0);
+    AttrSpec {
+        name,
+        nc_type: 2,
+        payload,
+        nelems: value.len() as u32,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// _Unsigned: netCDF4-python decodes these values to [16385.0, 3.5, masked].
+// ---------------------------------------------------------------------------
+
+fn unsigned_packed_file() -> Vec<u8> {
+    build_cdf1_short_var(
+        "v",
+        &[-32768, 5, -1],
+        vec![
+            char_attr("_Unsigned", "true"),
+            short_attr("_FillValue", -1),
+            double_attr("scale_factor", 0.5),
+            double_attr("add_offset", 1.0),
+        ],
+    )
+}
+
+#[test]
+fn unsigned_attribute_applies_before_masking_and_unpacking() {
+    let file = NcFile::from_bytes(&unsigned_packed_file()).unwrap();
+    let data = file.read_variable_unpacked_masked("v").unwrap();
+    assert_eq!(data[[0]], 16385.0);
+    assert_eq!(data[[1]], 3.5);
+    assert!(data[[2]].is_nan());
+}
+
+#[test]
+fn unsigned_attribute_applies_to_every_cf_read() {
+    let file = NcFile::from_bytes(&unsigned_packed_file()).unwrap();
+
+    let unpacked = file.read_variable_unpacked("v").unwrap();
+    assert_eq!(unpacked[[0]], 16385.0);
+    assert_eq!(unpacked[[2]], 32768.5);
+
+    let masked = file.read_variable_masked("v").unwrap();
+    assert_eq!(masked[[0]], 32768.0);
+    assert!(masked[[2]].is_nan());
+
+    let selection = NcSliceInfo {
+        selections: vec![NcSliceInfoElem::Slice {
+            start: 0,
+            end: 2,
+            step: 1,
+        }],
+    };
+    let slice = file
+        .read_variable_slice_unpacked_masked("v", &selection)
+        .unwrap();
+    assert_eq!(slice[[0]], 16385.0);
+    assert_eq!(slice[[1]], 3.5);
+}
+
+#[test]
+fn promoted_reads_keep_the_stored_values() {
+    let file = NcFile::from_bytes(&unsigned_packed_file()).unwrap();
+    assert_eq!(file.read_variable_as_f64("v").unwrap()[[0]], -32768.0);
+}

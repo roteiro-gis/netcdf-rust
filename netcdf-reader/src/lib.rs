@@ -571,46 +571,32 @@ impl NcFile {
     ///
     /// Returns `actual = stored * scale_factor + add_offset`.
     /// If neither attribute is present, returns the raw data as f64.
+    /// Integers take any signedness declared by `_Unsigned`.
     /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_unpacked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable_as_f64(name)?;
-        if let Some(p) = params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_as_f64(name)?;
+        Ok(CfDecode::Unpack.apply(var, data))
     }
 
     /// Read a variable, replace `_FillValue`/`missing_value` with NaN,
     /// and mask values outside `valid_min`/`valid_max`/`valid_range`.
+    /// Integers take any signedness declared by `_Unsigned`.
     /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_masked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let params = masked::MaskParams::from_variable(var);
-        let mut data = self.read_variable_as_f64(name)?;
-        if let Some(p) = params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_as_f64(name)?;
+        Ok(CfDecode::Mask.apply(var, data))
     }
 
     /// Read a variable with both masking and unpacking (CF spec order).
     ///
-    /// Order: read → mask fill/missing → unpack (scale+offset).
+    /// Order: read → apply `_Unsigned` → mask fill/missing → unpack (scale+offset).
     /// Uses type-promoting read so it works with any numeric storage type.
     pub fn read_variable_unpacked_masked(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let mask_params = masked::MaskParams::from_variable(var);
-        let unpack_params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable_as_f64(name)?;
-        if let Some(p) = mask_params {
-            p.apply(&mut data);
-        }
-        if let Some(p) = unpack_params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_as_f64(name)?;
+        Ok(CfDecode::MaskAndUnpack.apply(var, data))
     }
 
     // ----- Slice API -----
@@ -665,12 +651,8 @@ impl NcFile {
         selection: &NcSliceInfo,
     ) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable_slice_as_f64(name, selection)?;
-        if let Some(p) = params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_slice_as_f64(name, selection)?;
+        Ok(CfDecode::Unpack.apply(var, data))
     }
 
     /// Read a slice with fill/missing value masking.
@@ -680,12 +662,8 @@ impl NcFile {
         selection: &NcSliceInfo,
     ) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let params = masked::MaskParams::from_variable(var);
-        let mut data = self.read_variable_slice_as_f64(name, selection)?;
-        if let Some(p) = params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_slice_as_f64(name, selection)?;
+        Ok(CfDecode::Mask.apply(var, data))
     }
 
     /// Read a slice with both masking and unpacking (CF spec order).
@@ -695,16 +673,8 @@ impl NcFile {
         selection: &NcSliceInfo,
     ) -> Result<ArrayD<f64>> {
         let var = self.variable(name)?;
-        let mask_params = masked::MaskParams::from_variable(var);
-        let unpack_params = unpack::UnpackParams::from_variable(var);
-        let mut data = self.read_variable_slice_as_f64(name, selection)?;
-        if let Some(p) = mask_params {
-            p.apply(&mut data);
-        }
-        if let Some(p) = unpack_params {
-            p.apply(&mut data);
-        }
-        Ok(data)
+        let data = self.read_variable_slice_as_f64(name, selection)?;
+        Ok(CfDecode::MaskAndUnpack.apply(var, data))
     }
 
     // ----- Lazy Slice Iterator -----
@@ -737,6 +707,33 @@ impl NcFile {
             ndim,
             _marker: std::marker::PhantomData,
         })
+    }
+}
+
+/// Which CF decoding steps a read applies to its promoted values.
+#[derive(Clone, Copy, PartialEq)]
+enum CfDecode {
+    Unpack,
+    Mask,
+    MaskAndUnpack,
+}
+
+impl CfDecode {
+    fn apply(self, var: &NcVariable, mut data: ArrayD<f64>) -> ArrayD<f64> {
+        if let Some(sign) = unpack::SignParams::from_variable(var) {
+            sign.apply(&mut data);
+        }
+        if self != CfDecode::Unpack {
+            if let Some(mask) = masked::MaskParams::from_variable(var) {
+                mask.apply(&mut data);
+            }
+        }
+        if self != CfDecode::Mask {
+            if let Some(unpack) = unpack::UnpackParams::from_variable(var) {
+                unpack.apply(&mut data);
+            }
+        }
+        data
     }
 }
 
