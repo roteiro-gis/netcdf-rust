@@ -8,12 +8,19 @@
 //! An object with index 0 marks the free space sentinel and terminates
 //! parsing of the collection.
 
+use std::sync::Arc;
+
+use lru::LruCache;
+
 use crate::error::{Error, Result};
 use crate::io::Cursor;
 use crate::storage::Storage;
 
 /// Signature bytes for a Global Heap Collection: ASCII `GCOL`.
 const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
+
+/// Bytes of object data a [`GlobalHeapCache`] holds before it evicts.
+const GLOBAL_HEAP_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// A single object within a global heap collection.
 #[derive(Debug, Clone)]
@@ -158,7 +165,59 @@ impl GlobalHeapCollection {
 
     /// Look up an object by its index within this collection.
     pub fn get_object(&self, index: u16) -> Option<&GlobalHeapObject> {
-        self.objects.iter().find(|o| o.index == index)
+        // Writers number objects from 1 in order, so the position is usually the index.
+        usize::from(index)
+            .checked_sub(1)
+            .and_then(|position| self.objects.get(position))
+            .filter(|object| object.index == index)
+            .or_else(|| self.objects.iter().find(|object| object.index == index))
+    }
+
+    fn data_bytes(&self) -> usize {
+        self.objects.iter().map(|object| object.data.len()).sum()
+    }
+}
+
+/// Recently parsed collections by address, so that reading the elements of a
+/// variable-length dataset parses each collection once rather than once per element.
+pub(crate) struct GlobalHeapCache {
+    collections: LruCache<u64, Arc<GlobalHeapCollection>>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl Default for GlobalHeapCache {
+    fn default() -> Self {
+        Self::with_max_bytes(GLOBAL_HEAP_CACHE_MAX_BYTES)
+    }
+}
+
+impl GlobalHeapCache {
+    fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            collections: LruCache::unbounded(),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn get(&mut self, address: u64) -> Option<Arc<GlobalHeapCollection>> {
+        self.collections.get(&address).cloned()
+    }
+
+    /// Cache `collection`, evicting the least recently used others once over budget. The
+    /// newest collection always stays, however large, because the next element of the read
+    /// that loaded it most likely needs it again.
+    pub(crate) fn insert(&mut self, address: u64, collection: Arc<GlobalHeapCollection>) {
+        self.bytes += collection.data_bytes();
+        if let Some(replaced) = self.collections.put(address, collection) {
+            self.bytes -= replaced.data_bytes();
+        }
+        while self.bytes > self.max_bytes && self.collections.len() > 1 {
+            if let Some((_, evicted)) = self.collections.pop_lru() {
+                self.bytes -= evicted.data_bytes();
+            }
+        }
     }
 }
 
@@ -202,6 +261,61 @@ mod tests {
         }
         buf.extend(body);
         buf
+    }
+
+    fn collection(objects: &[(u16, &[u8])]) -> Arc<GlobalHeapCollection> {
+        Arc::new(GlobalHeapCollection {
+            objects: objects
+                .iter()
+                .map(|&(index, data)| GlobalHeapObject {
+                    index,
+                    reference_count: 1,
+                    data: data.to_vec(),
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn get_object_finds_objects_stored_out_of_order() {
+        let collection = collection(&[(2, b"b"), (1, b"a"), (9, b"z")]);
+        assert_eq!(collection.get_object(1).unwrap().data, b"a");
+        assert_eq!(collection.get_object(2).unwrap().data, b"b");
+        assert_eq!(collection.get_object(9).unwrap().data, b"z");
+        assert!(collection.get_object(0).is_none());
+        assert!(collection.get_object(3).is_none());
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used_collections_over_budget() {
+        let mut cache = GlobalHeapCache::with_max_bytes(10);
+        cache.insert(1, collection(&[(1, &[0; 4])]));
+        cache.insert(2, collection(&[(1, &[0; 4])]));
+        assert!(cache.get(1).is_some());
+
+        cache.insert(3, collection(&[(1, &[0; 4])]));
+        assert!(cache.get(2).is_none());
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(3).is_some());
+    }
+
+    #[test]
+    fn cache_keeps_a_collection_larger_than_its_budget() {
+        let mut cache = GlobalHeapCache::with_max_bytes(10);
+        cache.insert(1, collection(&[(1, &[0; 4])]));
+        cache.insert(2, collection(&[(1, &[0; 64])]));
+        assert!(cache.get(1).is_none());
+        assert!(cache.get(2).is_some());
+    }
+
+    #[test]
+    fn replacing_a_cached_collection_does_not_leak_its_bytes() {
+        let mut cache = GlobalHeapCache::with_max_bytes(10);
+        cache.insert(1, collection(&[(1, &[0; 8])]));
+        cache.insert(1, collection(&[(1, &[0; 8])]));
+        cache.insert(2, collection(&[(1, &[0; 2])]));
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(2).is_some());
     }
 
     #[test]

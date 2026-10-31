@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::filters::FilterRegistry;
 use crate::fractal_heap::FractalHeap;
-use crate::global_heap::GlobalHeapCollection;
+use crate::global_heap::{GlobalHeapCollection, GlobalHeapObject};
 use crate::io::Cursor;
 use crate::messages::attribute::AttributeMessage;
 use crate::messages::attribute_info::AttributeInfoMessage;
@@ -10,7 +10,7 @@ use crate::messages::datatype::{Datatype, StringEncoding, StringPadding, StringS
 use crate::messages::HdfMessage;
 use crate::object_header::ObjectHeader;
 use crate::storage::Storage;
-use crate::{btree_v2, messages};
+use crate::{btree_v2, messages, FileContext};
 
 fn checked_usize(value: u64, context: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| {
@@ -638,39 +638,49 @@ pub(crate) fn read_one_vlen_string(
 pub(crate) fn read_one_vlen_string_storage(
     raw_data: &[u8],
     offset: usize,
-    storage: &dyn Storage,
-    offset_size: u8,
-    length_size: u8,
+    context: &FileContext,
     padding: StringPadding,
     encoding: StringEncoding,
 ) -> Result<String> {
+    let offset_size = context.superblock.offset_size;
     let mut cursor = Cursor::new(&raw_data[offset..]);
     let _seq_len = cursor.read_u32_le()?;
     let heap_addr = cursor.read_offset(offset_size)?;
-    let obj_index = cursor.read_u32_le()?;
+    let obj_index = cursor.read_u32_le()? as u16;
 
     if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
         return Ok(String::new());
     }
 
-    let collection =
-        GlobalHeapCollection::parse_at_storage(storage, heap_addr, offset_size, length_size)?;
-    match collection.get_object(obj_index as u16) {
-        Some(obj) => decode_string(&obj.data, padding, encoding),
-        None => Ok(String::new()),
-    }
+    let collection = context.global_heap(heap_addr)?;
+    decode_string(
+        &heap_object(&collection, heap_addr, obj_index)?.data,
+        padding,
+        encoding,
+    )
+}
+
+fn heap_object(
+    collection: &GlobalHeapCollection,
+    heap_addr: u64,
+    obj_index: u16,
+) -> Result<&GlobalHeapObject> {
+    collection.get_object(obj_index).ok_or_else(|| {
+        Error::InvalidData(format!(
+            "variable-length data references missing object {obj_index} of the global heap \
+             collection at {heap_addr:#x}"
+        ))
+    })
 }
 
 pub(crate) fn decoded_vlen_strings_storage(
     datatype: &Datatype,
     raw_data: &[u8],
-    storage: &dyn Storage,
-    offset_size: u8,
-    length_size: u8,
+    context: &FileContext,
     element_count: u64,
 ) -> Option<Vec<String>> {
     let (padding, encoding) = vlen_string_format(datatype)?;
-    let ref_size = 4 + offset_size as usize + 4;
+    let ref_size = 4 + context.superblock.offset_size as usize + 4;
     let n = checked_usize(element_count, "attribute string element count").ok()?;
     if raw_data.len() < n.checked_mul(ref_size)? {
         return None;
@@ -678,16 +688,8 @@ pub(crate) fn decoded_vlen_strings_storage(
     let mut result = Vec::with_capacity(n);
     for i in 0..n {
         result.push(
-            read_one_vlen_string_storage(
-                raw_data,
-                i * ref_size,
-                storage,
-                offset_size,
-                length_size,
-                padding,
-                encoding,
-            )
-            .ok()?,
+            read_one_vlen_string_storage(raw_data, i * ref_size, context, padding, encoding)
+                .ok()?,
         );
     }
     Some(result)
@@ -806,28 +808,21 @@ pub(crate) fn resolve_vlen_bytes(
 
 pub(crate) fn resolve_vlen_bytes_storage(
     raw_data: &[u8],
-    storage: &dyn Storage,
-    offset_size: u8,
-    length_size: u8,
-) -> Option<Vec<u8>> {
-    if raw_data.len() < 4 + offset_size as usize + 4 {
-        return None;
-    }
-
+    context: &FileContext,
+) -> Result<Vec<u8>> {
+    let offset_size = context.superblock.offset_size;
     let mut cursor = Cursor::new(raw_data);
-    let seq_len = cursor.read_u32_le().ok()? as usize;
-    let heap_addr = cursor.read_offset(offset_size).ok()?;
-    let obj_index = cursor.read_u32_le().ok()? as u16;
+    let seq_len = cursor.read_u32_le()? as usize;
+    let heap_addr = cursor.read_offset(offset_size)?;
+    let obj_index = cursor.read_u32_le()? as u16;
 
     if Cursor::is_undefined_offset(heap_addr, offset_size) || obj_index == 0 {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
 
-    let collection =
-        GlobalHeapCollection::parse_at_storage(storage, heap_addr, offset_size, length_size)
-            .ok()?;
-    let object = collection.get_object(obj_index)?;
-    Some(object.data[..object.data.len().min(seq_len)].to_vec())
+    let collection = context.global_heap(heap_addr)?;
+    let object = heap_object(&collection, heap_addr, obj_index)?;
+    Ok(object.data[..object.data.len().min(seq_len)].to_vec())
 }
 
 #[cfg(test)]

@@ -256,57 +256,18 @@ pub(crate) fn resolve_dimension_scale_addresses(
     }
 
     let mut dim_addrs = Vec::with_capacity(ndim);
-    let mut cursor = hdf5_reader::io::Cursor::new(raw_data);
 
-    for _ in 0..ndim {
-        let seq_len = cursor.read_u32_le().map_err(|err| {
-            Error::InvalidData(format!(
-                "dataset '{}' has invalid DIMENSION_LIST entry count: {err}",
-                ds.name()
-            ))
-        })? as usize;
-        let heap_addr = cursor.read_offset(offset_size).map_err(|err| {
-            Error::InvalidData(format!(
-                "dataset '{}' has invalid DIMENSION_LIST heap address: {err}",
-                ds.name()
-            ))
-        })?;
-        let heap_idx = cursor.read_u32_le().map_err(|err| {
-            Error::InvalidData(format!(
-                "dataset '{}' has invalid DIMENSION_LIST heap index: {err}",
-                ds.name()
-            ))
-        })? as u16;
+    for entry in raw_data.chunks_exact(entry_size).take(ndim) {
+        let heap_data = ds
+            .resolve_vlen_reference_bytes(entry, usize::from(offset_size))
+            .map_err(|err| {
+                Error::InvalidData(format!(
+                    "dataset '{}' has unreadable DIMENSION_LIST heap object: {err}",
+                    ds.name()
+                ))
+            })?;
 
-        if seq_len == 0 || hdf5_reader::io::Cursor::is_undefined_offset(heap_addr, offset_size) {
-            return Err(Error::InvalidData(format!(
-                "dataset '{}' has an unresolved DIMENSION_LIST reference",
-                ds.name()
-            )));
-        }
-
-        let collection = hdf5_reader::global_heap::GlobalHeapCollection::parse_at_storage(
-            group.storage(),
-            heap_addr,
-            offset_size,
-            group.length_size(),
-        )
-        .map_err(|err| {
-            Error::InvalidData(format!(
-                "dataset '{}' has unreadable DIMENSION_LIST heap object: {err}",
-                ds.name()
-            ))
-        })?;
-
-        let heap_obj = collection.get_object(heap_idx).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "dataset '{}' references missing DIMENSION_LIST heap object {}",
-                ds.name(),
-                heap_idx
-            ))
-        })?;
-
-        let refs = hdf5_reader::reference::read_object_references(&heap_obj.data, offset_size)
+        let refs = hdf5_reader::reference::read_object_references(&heap_data, offset_size)
             .map_err(|err| {
                 Error::InvalidData(format!(
                     "dataset '{}' has invalid DIMENSION_LIST references: {err}",
