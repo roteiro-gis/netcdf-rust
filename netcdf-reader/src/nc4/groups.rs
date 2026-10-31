@@ -4,7 +4,7 @@
 //! contain `_NCProperties` and other internal attributes that should be filtered.
 //! Sub-groups are traversed recursively.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use hdf5_reader::Hdf5File;
 
@@ -53,44 +53,120 @@ fn visible_dim_addr_map(
     visible_dim_addr_map
 }
 
-/// Grow unlimited dimensions to the longest variable in `datasets` that uses them.
-///
-/// netCDF-C extends only the datasets it writes to, so a dimension's own scale can be shorter
-/// than a variable on it, and `nc_inq_dimlen` reports the longest. Variables whose dimension
-/// list can't be resolved are skipped here and reported when the variable itself is built.
-fn widen_unlimited_dimensions(
-    datasets: &[hdf5_reader::Dataset],
+pub(crate) type DimensionExtents = HashMap<usize, HashMap<u64, u64>>;
+
+fn storage_id(group: &hdf5_reader::group::Group) -> usize {
+    std::ptr::from_ref(group.storage()) as *const () as usize
+}
+
+/// Extents are indexed by scale address, so a child dimension that shadows an
+/// ancestor's name remains independent. Descendant variables can extend an
+/// ancestor dimension before any group's metadata is exposed.
+pub(crate) fn collect_dimension_extents(hdf5: &Hdf5File) -> Result<DimensionExtents> {
+    let mut extents = HashMap::new();
+    collect_group_extents(
+        &hdf5.root_group()?,
+        &HashMap::new(),
+        &mut extents,
+        &mut HashSet::new(),
+        0,
+    )?;
+    Ok(extents)
+}
+
+fn collect_group_extents(
     group: &hdf5_reader::group::Group,
-    visible_dimensions: &mut [NcDimension],
-    visible_dim_addr_map: &mut HashMap<u64, NcDimension>,
-) {
-    for dataset in datasets {
+    inherited_ids: &HashMap<i64, u64>,
+    extents: &mut DimensionExtents,
+    visited: &mut HashSet<(usize, u64)>,
+    depth: usize,
+) -> Result<()> {
+    if depth > 64 {
+        return Err(Error::InvalidData("NetCDF group nesting exceeds 64".into()));
+    }
+    if !visited.insert((storage_id(group), group.address())) {
+        return Ok(());
+    }
+    let (children, datasets) = group.members()?;
+    if children.is_empty()
+        && !datasets.iter().any(|dataset| {
+            dataset
+                .max_dims()
+                .is_some_and(|dims| dims.contains(&u64::MAX))
+        })
+    {
+        return Ok(());
+    }
+    let mut ids = inherited_ids.clone();
+    let is_scale = |dataset: &hdf5_reader::Dataset| {
+        dataset
+            .attribute("CLASS")
+            .ok()
+            .and_then(|attr| attr.read_string().ok())
+            .is_some_and(|class| class == "DIMENSION_SCALE")
+    };
+    for dataset in &datasets {
+        if is_scale(dataset) {
+            if let Ok(id) = dataset
+                .attribute("_Netcdf4Dimid")
+                .and_then(|attr| attr.read_scalar::<i32>())
+            {
+                ids.insert(i64::from(id), dataset.address());
+            }
+        }
+    }
+    for dataset in &datasets {
         let Some(max_dims) = dataset.max_dims() else {
             continue;
         };
         if !max_dims.contains(&u64::MAX) {
             continue;
         }
-        let Ok(addresses) = variables::resolve_dimension_scale_addresses(dataset, group) else {
-            continue;
-        };
-
-        for ((address, &extent), &max_dim) in addresses.iter().zip(dataset.shape()).zip(max_dims) {
-            let Some(dimension) = visible_dim_addr_map.get_mut(address) else {
+        let addresses = if is_scale(dataset) {
+            if dataset.ndim() == 1 {
+                vec![dataset.address()]
+            } else {
+                let Ok(coordinates) = dataset
+                    .attribute("_Netcdf4Coordinates")
+                    .and_then(|attr| attr.read_1d::<i32>())
+                else {
+                    continue;
+                };
+                let Some(addresses) = coordinates
+                    .iter()
+                    .map(|id| ids.get(&i64::from(*id)).copied())
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                addresses
+            }
+        } else {
+            let Ok(addresses) = variables::resolve_dimension_scale_addresses(dataset, group) else {
                 continue;
             };
-            if max_dim != u64::MAX || extent <= dimension.size {
-                continue;
-            }
-            dimension.size = extent;
-            if let Some(visible) = visible_dimensions
-                .iter_mut()
-                .find(|visible| visible.is_unlimited && visible.name == dimension.name)
-            {
-                visible.size = extent;
+            addresses
+        };
+        for ((address, &extent), &max_dim) in addresses.iter().zip(dataset.shape()).zip(max_dims) {
+            if max_dim == u64::MAX {
+                let current = extents
+                    .entry(storage_id(group))
+                    .or_default()
+                    .entry(*address)
+                    .or_default();
+                *current = (*current).max(extent);
             }
         }
     }
+    for child in children {
+        let inherited = if storage_id(&child) == storage_id(group) {
+            &ids
+        } else {
+            &HashMap::new()
+        };
+        collect_group_extents(&child, inherited, extents, visited, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// Build the root NcGroup from an HDF5 file.
@@ -113,6 +189,17 @@ pub fn build_group_at_path(
     metadata_mode: crate::NcMetadataMode,
     recursive: bool,
 ) -> Result<NcGroup> {
+    let extents = collect_dimension_extents(hdf5)?;
+    build_group_at_path_with_extents(hdf5, path, metadata_mode, recursive, &extents)
+}
+
+pub(crate) fn build_group_at_path_with_extents(
+    hdf5: &Hdf5File,
+    path: &str,
+    metadata_mode: crate::NcMetadataMode,
+    recursive: bool,
+    extents: &DimensionExtents,
+) -> Result<NcGroup> {
     let normalized = normalize_group_path(path);
     let root = hdf5.root_group()?;
     let mut group = root;
@@ -122,7 +209,11 @@ pub fn build_group_at_path(
 
     for component in normalized.split('/').filter(|part| !part.is_empty()) {
         let datasets = group.datasets()?;
-        let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
+        let index = dimensions::index_dimensions_with_extents(
+            &datasets,
+            metadata_mode,
+            extents.get(&storage_id(&group)).unwrap_or(&HashMap::new()),
+        )?;
         inherited_dimensions = visible_dimensions(&index.dimensions, &inherited_dimensions);
         inherited_dim_addr_map = visible_dim_addr_map(index.by_address, &inherited_dim_addr_map);
         inherited_dim_id_map.extend(index.by_id);
@@ -145,6 +236,7 @@ pub fn build_group_at_path(
             &inherited_dim_addr_map,
             &inherited_dim_id_map,
             metadata_mode,
+            extents,
         )
     } else {
         build_group_metadata(
@@ -154,6 +246,7 @@ pub fn build_group_at_path(
             &inherited_dim_addr_map,
             &inherited_dim_id_map,
             metadata_mode,
+            extents,
         )
     }
 }
@@ -202,23 +295,24 @@ fn build_group_recursive(
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
     inherited_dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
+    extents: &DimensionExtents,
 ) -> Result<NcGroup> {
     let (hdf5_children, datasets) = hdf5_group.members()?;
 
     // Extract dimensions declared locally in this group, then combine them
     // with dimensions inherited from ancestor groups for lookups and variable
     // reconstruction.
-    let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
-    let mut visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
-    let mut visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
+    let index = dimensions::index_dimensions_with_extents(
+        &datasets,
+        metadata_mode,
+        extents
+            .get(&storage_id(hdf5_group))
+            .unwrap_or(&HashMap::new()),
+    )?;
+    let visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
+    let visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
     let mut visible_dim_id_map = inherited_dim_id_map.clone();
     visible_dim_id_map.extend(index.by_id);
-    widen_unlimited_dimensions(
-        &datasets,
-        hdf5_group,
-        &mut visible_dimensions,
-        &mut visible_dim_addr_map,
-    );
 
     // Extract variables (non-dimension-scale datasets).
     let variables = variables::extract_variables_from_datasets(
@@ -244,6 +338,7 @@ fn build_group_recursive(
             &visible_dim_addr_map,
             &visible_dim_id_map,
             metadata_mode,
+            extents,
         )?;
         child_groups.push(nc_child);
     }
@@ -264,19 +359,20 @@ fn build_group_metadata(
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
     inherited_dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
+    extents: &DimensionExtents,
 ) -> Result<NcGroup> {
     let datasets = hdf5_group.datasets()?;
-    let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
-    let mut visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
-    let mut visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
+    let index = dimensions::index_dimensions_with_extents(
+        &datasets,
+        metadata_mode,
+        extents
+            .get(&storage_id(hdf5_group))
+            .unwrap_or(&HashMap::new()),
+    )?;
+    let visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
+    let visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
     let mut visible_dim_id_map = inherited_dim_id_map.clone();
     visible_dim_id_map.extend(index.by_id);
-    widen_unlimited_dimensions(
-        &datasets,
-        hdf5_group,
-        &mut visible_dimensions,
-        &mut visible_dim_addr_map,
-    );
     let variables = variables::extract_variables_from_datasets(
         &datasets,
         hdf5_group,

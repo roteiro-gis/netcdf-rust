@@ -63,10 +63,21 @@ pub(crate) fn index_dimensions(
     datasets: &[hdf5_reader::Dataset],
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<DimensionIndex> {
+    index_dimensions_with_extents(datasets, metadata_mode, &HashMap::new())
+}
+
+pub(crate) fn index_dimensions_with_extents(
+    datasets: &[hdf5_reader::Dataset],
+    metadata_mode: crate::NcMetadataMode,
+    extents: &HashMap<u64, u64>,
+) -> Result<DimensionIndex> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
 
     for ds in datasets {
-        if let Some((dimid, dim, address)) = extract_dimension_entry(ds, metadata_mode)? {
+        if let Some((dimid, mut dim, address)) = extract_dimension_entry(ds, metadata_mode)? {
+            if dim.is_unlimited {
+                dim.size = dim.size.max(extents.get(&address).copied().unwrap_or(0));
+            }
             dims.push((dimid, dim, address));
         }
     }

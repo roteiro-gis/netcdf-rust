@@ -132,6 +132,7 @@ pub struct Nc4File {
     metadata_mode: crate::NcMetadataMode,
     root_metadata: OnceLock<NcGroup>,
     metadata_tree: OnceLock<NcGroup>,
+    dimension_extents: OnceLock<groups::DimensionExtents>,
 }
 
 impl Nc4File {
@@ -151,6 +152,7 @@ impl Nc4File {
             metadata_mode,
             root_metadata: OnceLock::new(),
             metadata_tree: OnceLock::new(),
+            dimension_extents: OnceLock::new(),
         })
     }
 
@@ -198,7 +200,13 @@ impl Nc4File {
         if let Some(group) = self.metadata_tree.get() {
             return Ok(group);
         }
-        let metadata_tree = groups::build_root_group(&self.hdf5, self.metadata_mode)?;
+        let metadata_tree = groups::build_group_at_path_with_extents(
+            &self.hdf5,
+            "/",
+            self.metadata_mode,
+            true,
+            self.dimension_extents()?,
+        )?;
         let _ = self.metadata_tree.set(metadata_tree);
         Ok(self
             .metadata_tree
@@ -263,50 +271,43 @@ impl Nc4File {
     /// Looks up the variable by path relative to the root group, then opens the
     /// matching HDF5 dataset and reads the data.
     pub fn read_variable<T: H5Type>(&self, path: &str) -> Result<ArrayD<T>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_array::<T>()?)
     }
 
     /// Read a variable into a caller-provided typed buffer.
     pub fn read_variable_into<T: H5Type>(&self, path: &str, dst: &mut [T]) -> Result<()> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_into::<T>(dst)?)
     }
 
     /// Read a variable as logical raw bytes in HDF5 datatype byte order.
     pub fn read_variable_raw_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_raw_bytes()?)
     }
 
     /// Read logical raw bytes into a caller-provided buffer.
     pub fn read_variable_raw_bytes_into(&self, path: &str, dst: &mut [u8]) -> Result<()> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_raw_bytes_into(dst)?)
     }
 
     /// Read a variable as logical raw bytes with numeric fields in native endian.
     pub fn read_variable_native_bytes(&self, path: &str) -> Result<Vec<u8>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_native_bytes()?)
     }
 
     /// Read native-endian logical raw bytes into a caller-provided buffer.
     pub fn read_variable_native_bytes_into(&self, path: &str, dst: &mut [u8]) -> Result<()> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_native_bytes_into(dst)?)
     }
 
     /// Iterate decoded HDF5 chunks for a chunked variable.
     pub fn iter_variable_chunks(&self, path: &str) -> Result<hdf5_reader::DatasetChunkIterator> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.iter_chunks()?)
     }
 
@@ -333,8 +334,7 @@ impl Nc4File {
 
     /// Read a string variable as a flat vector of strings.
     pub fn read_variable_as_strings(&self, path: &str) -> Result<Vec<String>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         let dtype = dataset_nc_type(&dataset)?;
         match dtype {
             NcType::String => Ok(dataset.read_strings()?),
@@ -355,8 +355,7 @@ impl Nc4File {
         &self,
         path: &str,
     ) -> Result<ArrayD<crate::user_defined::NcValue>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         crate::user_defined::read_dataset_values(&dataset)
     }
 
@@ -365,15 +364,13 @@ impl Nc4File {
     where
         F: FnMut(crate::user_defined::NcValueView<'_>) -> Result<T>,
     {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         crate::user_defined::read_dataset_with_decoder(&dataset, decoder)
     }
 
     #[cfg(feature = "rayon")]
     pub fn read_variable_parallel<T: H5Type>(&self, path: &str) -> Result<ArrayD<T>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_array_parallel::<T>()?)
     }
 
@@ -383,8 +380,7 @@ impl Nc4File {
         path: &str,
         pool: &ThreadPool,
     ) -> Result<ArrayD<T>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         Ok(dataset.read_array_in_pool::<T>(pool)?)
     }
 }
@@ -436,11 +432,43 @@ fn decode_char_string(bytes: &[u8]) -> String {
 }
 
 impl Nc4File {
+    fn dimension_extents(&self) -> Result<&groups::DimensionExtents> {
+        if let Some(extents) = self.dimension_extents.get() {
+            return Ok(extents);
+        }
+        let extents = groups::collect_dimension_extents(&self.hdf5)?;
+        let _ = self.dimension_extents.set(extents);
+        Ok(self
+            .dimension_extents
+            .get()
+            .expect("dimension extents initialized"))
+    }
+
+    fn dataset(&self, path: &str) -> Result<hdf5_reader::Dataset> {
+        let normalized = normalize_dataset_path(path)?;
+        let dataset = self.hdf5.dataset(normalized)?;
+        if dataset
+            .max_dims()
+            .is_some_and(|dims| dims.contains(&u64::MAX))
+        {
+            let shape = self.variable(normalized)?.shape();
+            Ok(dataset.with_padded_shape(&shape)?)
+        } else {
+            Ok(dataset)
+        }
+    }
+
     fn root_metadata(&self) -> Result<&NcGroup> {
         if let Some(group) = self.root_metadata.get() {
             return Ok(group);
         }
-        let root_metadata = groups::build_root_group_metadata(&self.hdf5, self.metadata_mode)?;
+        let root_metadata = groups::build_group_at_path_with_extents(
+            &self.hdf5,
+            "/",
+            self.metadata_mode,
+            false,
+            self.dimension_extents()?,
+        )?;
         let _ = self.root_metadata.set(root_metadata);
         Ok(self
             .root_metadata
@@ -454,8 +482,7 @@ impl Nc4File {
     ///
     /// Reads in the native HDF5 type and promotes to f64 via `mapv`.
     pub fn read_variable_as_f64(&self, path: &str) -> Result<ArrayD<f64>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         let dtype = dataset_nc_type(&dataset)?;
         dispatch_read_as_f64!(&dtype, |T| dataset.read_array::<T>())
     }
@@ -466,8 +493,7 @@ impl Nc4File {
         path: &str,
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<f64>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         let hdf5_sel = to_hdf5_slice_info(selection);
         let dtype = dataset_nc_type(&dataset)?;
         dispatch_read_as_f64!(&dtype, |T| dataset.read_slice::<T>(&hdf5_sel))
@@ -479,8 +505,7 @@ impl Nc4File {
         path: &str,
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<T>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         let hdf5_sel = to_hdf5_slice_info(selection);
         Ok(dataset.read_slice::<T>(&hdf5_sel)?)
     }
@@ -495,8 +520,7 @@ impl Nc4File {
         path: &str,
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<T>> {
-        let normalized = normalize_dataset_path(path)?;
-        let dataset = self.hdf5.dataset(normalized)?;
+        let dataset = self.dataset(path)?;
         let hdf5_sel = to_hdf5_slice_info(selection);
         Ok(dataset.read_slice_parallel::<T>(&hdf5_sel)?)
     }

@@ -16,6 +16,7 @@ use hdf5_reader::messages::datatype::{Datatype, VarLenKind};
 use super::types::hdf5_to_nc_type;
 use crate::error::{Error, Result};
 use crate::types::{NcAttrValue, NcAttribute};
+use crate::user_defined::{read_attribute_values, ValueSource};
 
 /// Internal attribute names that should be hidden from the NetCDF user API.
 const INTERNAL_ATTRIBUTES: &[&str] = &[
@@ -41,7 +42,11 @@ pub fn extract_group_attributes(
     group: &Group,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcAttribute>> {
-    collect_visible_attributes(&group.attributes()?, metadata_mode)
+    collect_visible_attributes(
+        &group.attributes()?,
+        metadata_mode,
+        ValueSource::Group(group),
+    )
 }
 
 /// Extract user-visible attributes from an HDF5 dataset, filtering out
@@ -50,19 +55,24 @@ pub fn extract_variable_attributes(
     dataset: &hdf5_reader::Dataset,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcAttribute>> {
-    collect_visible_attributes(&dataset.attributes(), metadata_mode)
+    collect_visible_attributes(
+        &dataset.attributes(),
+        metadata_mode,
+        ValueSource::Dataset(dataset),
+    )
 }
 
 fn collect_visible_attributes(
     attrs: &[hdf5_reader::Attribute],
     metadata_mode: crate::NcMetadataMode,
+    source: ValueSource<'_>,
 ) -> Result<Vec<NcAttribute>> {
     let mut nc_attrs = Vec::new();
     for attr in attrs {
         if is_internal_attribute(&attr.name) {
             continue;
         }
-        if let Some(nc_attr) = convert_attribute(attr, metadata_mode)? {
+        if let Some(nc_attr) = convert_attribute(attr, metadata_mode, source)? {
             nc_attrs.push(nc_attr);
         }
     }
@@ -76,15 +86,16 @@ pub fn convert_visible_attribute(
     if is_internal_attribute(&attr.name) {
         return Ok(None);
     }
-    convert_attribute(attr, metadata_mode)
+    convert_attribute(attr, metadata_mode, ValueSource::None)
 }
 
 /// Convert an HDF5 attribute to a NetCDF attribute.
 fn convert_attribute(
     attr: &hdf5_reader::Attribute,
     metadata_mode: crate::NcMetadataMode,
+    source: ValueSource<'_>,
 ) -> Result<Option<NcAttribute>> {
-    let Some(value) = convert_attribute_value(attr, metadata_mode)? else {
+    let Some(value) = convert_attribute_value_with_source(attr, metadata_mode, source)? else {
         return Ok(None);
     };
 
@@ -96,12 +107,20 @@ fn convert_attribute(
 
 /// Convert an HDF5 attribute's value to an NcAttrValue.
 ///
-/// Enum attributes become their integer values. `NcAttrValue` can't hold the other user-defined
-/// types, which are valid NetCDF-4, so those attributes are left out rather than failing the
-/// whole file's metadata. Strict mode still rejects types NetCDF-4 doesn't have.
+/// Enum attributes become their integer values; other user-defined types
+/// retain their type and decoded values. Strict mode rejects invalid payloads.
+#[cfg(test)]
 fn convert_attribute_value(
     attr: &hdf5_reader::Attribute,
     metadata_mode: crate::NcMetadataMode,
+) -> Result<Option<NcAttrValue>> {
+    convert_attribute_value_with_source(attr, metadata_mode, ValueSource::None)
+}
+
+fn convert_attribute_value_with_source(
+    attr: &hdf5_reader::Attribute,
+    metadata_mode: crate::NcMetadataMode,
+    source: ValueSource<'_>,
 ) -> Result<Option<NcAttrValue>> {
     let strict = metadata_mode == crate::NcMetadataMode::Strict;
 
@@ -163,9 +182,14 @@ fn convert_attribute_value(
                 datatype: (**base).clone(),
                 ..attr.clone()
             };
-            convert_attribute_value(&integers, metadata_mode)
+            convert_attribute_value_with_source(&integers, metadata_mode, source)
         }
-        datatype if hdf5_to_nc_type(datatype).is_ok() => Ok(None),
+        datatype if hdf5_to_nc_type(datatype).is_ok() => {
+            let dtype = hdf5_to_nc_type(datatype)?;
+            read_attribute_values(source, attr)
+                .map(|values| Some(NcAttrValue::UserDefined { dtype, values }))
+                .or_else(|err| if strict { Err(err) } else { Ok(None) })
+        }
         _ if strict => Err(unsupported()),
         _ => Ok(None),
     }
@@ -196,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn user_defined_attribute_types_are_left_out_in_both_modes() {
+    fn user_defined_attribute_types_are_preserved_in_both_modes() {
         let attr = Attribute {
             name: "opaque_attr".to_string(),
             datatype: Datatype::Opaque {
@@ -209,7 +233,10 @@ mod tests {
         };
 
         for mode in [crate::NcMetadataMode::Strict, crate::NcMetadataMode::Lossy] {
-            assert!(convert_attribute_value(&attr, mode).unwrap().is_none());
+            assert!(matches!(convert_attribute_value(&attr, mode).unwrap(),
+                Some(NcAttrValue::UserDefined { values, .. })
+                    if values == vec![crate::NcValue::Opaque(vec![0; 4])]
+            ));
         }
     }
 
@@ -234,6 +261,31 @@ mod tests {
             convert_attribute_value(&attr, crate::NcMetadataMode::Strict).unwrap(),
             Some(NcAttrValue::Shorts(vec![1, -1]))
         );
+    }
+
+    #[test]
+    fn dangling_vlen_attribute_references_error_in_strict_mode() {
+        let file = hdf5_reader::Hdf5File::from_bytes(include_bytes!(
+            "../../../testdata/netcdf4/nc4_user_attribute_values.nc"
+        ))
+        .unwrap();
+        let group = file.root_group().unwrap();
+        let mut attr = group.attribute("sequences").unwrap();
+        let index = 4 + usize::from(group.offset_size());
+        attr.raw_data[index..index + 4].copy_from_slice(&65535u32.to_le_bytes());
+        assert!(convert_attribute_value_with_source(
+            &attr,
+            crate::NcMetadataMode::Strict,
+            ValueSource::Group(&group)
+        )
+        .is_err());
+        assert!(convert_attribute_value_with_source(
+            &attr,
+            crate::NcMetadataMode::Lossy,
+            ValueSource::Group(&group)
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

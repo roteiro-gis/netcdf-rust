@@ -1433,14 +1433,17 @@ fn user_typed_attributes_do_not_fail_the_file() {
     );
 
     let plain = file.variable("plain").unwrap();
-    assert!(plain.attribute("compound").is_none());
+    assert!(matches!(
+        &plain.attribute("compound").unwrap().value,
+        netcdf_reader::NcAttrValue::UserDefined { .. }
+    ));
     let data = file.read_variable::<f32>("plain").unwrap();
     assert_eq!(data.iter().copied().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
 }
 
 #[cfg(feature = "netcdf4")]
 #[test]
-fn variables_on_one_unlimited_dimension_keep_their_own_lengths() {
+fn variables_on_one_unlimited_dimension_are_padded_to_its_length() {
     let path = required_fixture("netcdf4", "nc4_uneven_unlimited.nc");
     let file = netcdf_reader::NcFile::open(&path).unwrap();
 
@@ -1452,9 +1455,9 @@ fn variables_on_one_unlimited_dimension_keep_their_own_lengths() {
     );
 
     for (name, shape) in [
-        ("time", vec![3]),
+        ("time", vec![6]),
         ("longest", vec![6, 2]),
-        ("shortest", vec![2, 2]),
+        ("shortest", vec![6, 2]),
     ] {
         let variable = file.variable(name).unwrap();
         assert_eq!(variable.shape(), shape, "{name}");
@@ -1469,7 +1472,7 @@ fn variables_on_one_unlimited_dimension_keep_their_own_lengths() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(records.len(), 2);
+    assert_eq!(records.len(), 6);
     assert_eq!(records[1].iter().copied().collect::<Vec<_>>(), [2.0, 3.0]);
 }
 
@@ -1483,7 +1486,7 @@ fn lossy_metadata_reports_the_same_unlimited_lengths() {
     };
     let file = netcdf_reader::NcFile::open_with_options(&path, options).unwrap();
     assert_eq!(file.dimension("time").unwrap().size, 6);
-    assert_eq!(file.variable("shortest").unwrap().shape(), [2, 2]);
+    assert_eq!(file.variable("shortest").unwrap().shape(), [6, 2]);
 }
 
 #[cfg(feature = "netcdf4")]

@@ -175,6 +175,17 @@ impl Group {
         self.context.superblock.length_size
     }
 
+    /// Resolve a file-local variable-length attribute reference. The payload
+    /// contains the declared element count times `base_element_size` bytes.
+    pub fn resolve_vlen_reference_bytes(
+        &self,
+        reference: &[u8],
+        base_element_size: usize,
+    ) -> Result<Vec<u8>> {
+        self.context
+            .resolve_vlen_reference_bytes(reference, base_element_size)
+    }
+
     /// Parse (or retrieve from cache) the object header at the given address.
     fn cached_header(&self, addr: u64) -> Result<Arc<crate::object_header::ObjectHeader>> {
         self.context.get_or_parse_header(addr)
