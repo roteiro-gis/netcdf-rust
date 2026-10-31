@@ -181,6 +181,7 @@ let (_format, nc4_bytes) =
 **NetCDF**
 - CDF-1, CDF-2, CDF-5, and NetCDF-4
 - Automatic format detection
+- In-memory opens that don't copy owned or shared bytes (`NcFile::from_vec`, `from_shared_bytes`, `from_owner`)
 - Unified typed reads across formats
 - Unified string reads for classic char arrays and NetCDF-4 string variables
 - NetCDF-4 user-defined reads for enum, opaque, compound, fixed-size array,

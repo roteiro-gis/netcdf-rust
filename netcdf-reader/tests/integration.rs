@@ -612,6 +612,31 @@ fn nc4_from_bytes_with_options() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn shared_bytes_open_without_copying_them() {
+    use netcdf_reader::NcFile;
+    use std::sync::Arc;
+
+    for (subdir, fixture) in [
+        ("netcdf4", "nc4_basic.nc"),
+        ("pnetcdf", "pnetcdf_cdf1_fixed.nc"),
+    ] {
+        let bytes = std::fs::read(required_fixture(subdir, fixture)).unwrap();
+        let copied = NcFile::from_bytes(&bytes).unwrap();
+        let variable = copied.variables().unwrap()[0].name();
+        let expected = copied.read_variable_as_f64(variable).unwrap();
+
+        let shared: Arc<[u8]> = bytes.clone().into();
+        let file = NcFile::from_shared_bytes(shared.clone()).unwrap();
+        assert!(Arc::strong_count(&shared) > 1, "{fixture} holds the bytes");
+        assert_eq!(file.read_variable_as_f64(variable).unwrap(), expected);
+
+        let file = NcFile::from_vec(bytes).unwrap();
+        assert_eq!(file.read_variable_as_f64(variable).unwrap(), expected);
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn nc4_from_storage_with_options() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let bytes = std::fs::read(&path).unwrap();

@@ -179,9 +179,33 @@ impl NcFile {
 
     /// Open a NetCDF file from in-memory bytes.
     ///
-    /// The format is auto-detected from the magic bytes.
+    /// The format is auto-detected from the magic bytes. The data is copied into an owned
+    /// buffer; [`NcFile::from_vec`] and [`NcFile::from_shared_bytes`] avoid that.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         Self::from_bytes_with_options(data, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from an owned byte vector without copying it.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_vec(data: Vec<u8>) -> Result<Self> {
+        Self::from_owner(data, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from shared bytes without copying them. The caller can keep its own
+    /// handle, to open the same bytes again or read them otherwise.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_shared_bytes(data: Arc<[u8]>) -> Result<Self> {
+        Self::from_owner(data, NcOpenOptions::default())
+    }
+
+    /// Open a NetCDF file from the bytes of any owner (a `Vec<u8>`, an `Arc<[u8]>`, a
+    /// `bytes::Bytes`, ...) with custom options, without copying them.
+    #[cfg(feature = "netcdf4")]
+    pub fn from_owner<T>(owner: T, options: NcOpenOptions) -> Result<Self>
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        Self::from_storage_with_options(Arc::new(BytesStorage::from_owner(owner)), options)
     }
 
     /// Open a NetCDF file from a custom random-access storage backend.
