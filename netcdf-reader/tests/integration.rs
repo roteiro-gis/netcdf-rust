@@ -1515,3 +1515,35 @@ fn multidimensional_coordinate_variables_keep_every_dimension() {
         [2, 3]
     );
 }
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn reads_szip_compressed_variables() {
+    let path = required_fixture("netcdf4", "nc4_szip.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let ramp: Vec<i16> = (0..1024).collect();
+    for name in ["ramp", "ramp_big_endian"] {
+        let values = file.read_variable::<i16>(name).unwrap();
+        assert_eq!(values.iter().copied().collect::<Vec<_>>(), ramp, "{name}");
+    }
+
+    let scrambled = file.read_variable::<u32>("scrambled").unwrap();
+    let expected: Vec<u32> = (0..1024u32).map(|i| i.wrapping_mul(2654435761)).collect();
+    assert_eq!(scrambled.iter().copied().collect::<Vec<_>>(), expected);
+
+    let sparse = file.read_variable::<f64>("sparse").unwrap();
+    let expected: Vec<f64> = (0..1024)
+        .map(|i| if i % 97 == 0 { 1.5 } else { 0.0 })
+        .collect();
+    assert_eq!(sparse.iter().copied().collect::<Vec<_>>(), expected);
+
+    let padded = file.read_variable::<i8>("padded").unwrap();
+    let expected: Vec<i8> = (0..130).map(|i| (i % 2 + 10) as i8).collect();
+    assert_eq!(padded.iter().copied().collect::<Vec<_>>(), expected);
+
+    let grid = file.read_variable::<f32>("grid").unwrap();
+    assert_eq!(grid.shape(), [30, 40]);
+    let expected: Vec<f32> = (0..1200).map(|i| i as f32 * 0.25).collect();
+    assert_eq!(grid.iter().copied().collect::<Vec<_>>(), expected);
+}

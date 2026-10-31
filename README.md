@@ -36,11 +36,11 @@ addition to round-tripping through the sibling reader crates.
 | NetCDF-4 (HDF5-backed) | ✓ | ✓ |
 | Chunked layouts (incl. unlimited dims) | ✓ | ✓ |
 | Filters: deflate, shuffle, fletcher32 | ✓ | ✓ |
-| Filters: lz4, nbit, scaleoffset | ✓ | — |
+| Filters: lz4, nbit, scaleoffset, szip | ✓ | — |
 | Compound / enum / opaque / array / vlen / string datatypes | ✓ | ✓ |
 | Dimension scales (`DIMENSION_LIST` + `REFERENCE_LIST`) | ✓ | ✓ |
 | CF conventions (unpack, mask, `_Unsigned`, calendars) | ✓ | n/a |
-| szip filter, virtual datasets | — | — |
+| Virtual datasets | — | — |
 
 The minimum supported Rust version is 1.81. Reads are hardened against malformed
 input: bounds-checked cursors, cycle detection in B-tree/heap/object-header
@@ -170,7 +170,7 @@ let (_format, nc4_bytes) =
 - Superblock v0-v3, including files behind a user block, and object header v1/v2 with checksum verification
 - Compact, contiguous, and chunked layouts
 - All chunk index types: v1/v2 B-tree, single-chunk, implicit, Fixed Array, Extensible Array
-- Deflate, shuffle, Fletcher-32, N-Bit, ScaleOffset, and optional LZ4 filters
+- Deflate, shuffle, Fletcher-32, N-Bit, ScaleOffset, SZIP, and optional LZ4 filters
 - Custom filters via `FilterRegistry`
 - Fixed-length strings, HDF5 variable-length strings, and byte-vlen string datasets
 - Dense-link resolution, soft-link resolution, optional external-link resolution, committed datatypes, global heap strings, and object references
