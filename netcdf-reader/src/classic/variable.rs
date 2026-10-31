@@ -88,37 +88,13 @@ impl ClassicFile {
     /// The type parameter `T` must match the variable's NetCDF type. For example,
     /// use `f32` for NC_FLOAT variables and `f64` for NC_DOUBLE variables.
     pub fn read_variable<T: NcReadType>(&self, name: &str) -> Result<ArrayD<T>> {
-        let var = self.find_variable(name)?;
-
-        // Check type compatibility.
-        let expected = T::nc_type();
-        if var.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", expected),
-                actual: format!("{:?}", var.dtype),
-            });
-        }
-
-        if var.is_record_var {
-            let record_stride = compute_record_stride(&self.root_group.variables)?;
-            data::read_record_variable_from_storage(&self.storage, var, self.numrecs, record_stride)
-        } else {
-            data::read_non_record_variable_from_storage(&self.storage, var)
-        }
+        self.read_typed_variable(self.find_typed_variable::<T>(name)?)
     }
 
     /// Read a variable's data using Rayon for large classic byte ranges.
     #[cfg(feature = "rayon")]
     pub fn read_variable_parallel<T: NcReadType>(&self, name: &str) -> Result<ArrayD<T>> {
-        let var = self.find_variable(name)?;
-
-        let expected = T::nc_type();
-        if var.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", expected),
-                actual: format!("{:?}", var.dtype),
-            });
-        }
+        let var = self.find_typed_variable::<T>(name)?;
 
         if var.is_record_var {
             let record_stride = compute_record_stride(&self.root_group.variables)?;
@@ -135,15 +111,7 @@ impl ClassicFile {
 
     /// Read a variable's data into a caller-provided typed buffer.
     pub fn read_variable_into<T: NcReadType>(&self, name: &str, dst: &mut [T]) -> Result<()> {
-        let var = self.find_variable(name)?;
-
-        let expected = T::nc_type();
-        if var.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", expected),
-                actual: format!("{:?}", var.dtype),
-            });
-        }
+        let var = self.find_typed_variable::<T>(name)?;
 
         if var.is_record_var {
             let record_stride = compute_record_stride(&self.root_group.variables)?;
@@ -166,52 +134,24 @@ impl ClassicFile {
     pub fn read_variable_as_f64(&self, name: &str) -> Result<ArrayD<f64>> {
         let var = self.find_variable(name)?;
 
+        macro_rules! promoted {
+            ($ty:ty) => {{
+                let arr = self.read_typed_variable::<$ty>(var)?;
+                Ok(arr.mapv(|v| v as f64))
+            }};
+        }
+
         match var.dtype {
-            NcType::Byte => {
-                let arr = self.read_typed_variable::<i8>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::Short => {
-                let arr = self.read_typed_variable::<i16>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::Int => {
-                let arr = self.read_typed_variable::<i32>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::Float => {
-                let arr = self.read_typed_variable::<f32>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
+            NcType::Byte => promoted!(i8),
+            NcType::Short => promoted!(i16),
+            NcType::Int => promoted!(i32),
+            NcType::Float => promoted!(f32),
             NcType::Double => self.read_typed_variable::<f64>(var),
-            NcType::UByte => {
-                let arr = self.read_typed_variable::<u8>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::UShort => {
-                let arr = self.read_typed_variable::<u16>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::UInt => {
-                let arr = self.read_typed_variable::<u32>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::Int64 => {
-                let arr = self.read_typed_variable::<i64>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::UInt64 => {
-                let arr = self.read_typed_variable::<u64>(var)?;
-                Ok(arr.mapv(|v| v as f64))
-            }
-            NcType::Char => Err(Error::TypeMismatch {
-                expected: "numeric type".to_string(),
-                actual: "Char".to_string(),
-            }),
-            NcType::String => Err(Error::TypeMismatch {
-                expected: "numeric type".to_string(),
-                actual: "String".to_string(),
-            }),
+            NcType::UByte => promoted!(u8),
+            NcType::UShort => promoted!(u16),
+            NcType::UInt => promoted!(u32),
+            NcType::Int64 => promoted!(i64),
+            NcType::UInt64 => promoted!(u64),
             _ => Err(Error::TypeMismatch {
                 expected: "numeric type".to_string(),
                 actual: format!("{:?}", var.dtype),
@@ -262,14 +202,7 @@ impl ClassicFile {
         name: &str,
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<T>> {
-        let var = self.find_variable(name)?;
-        let expected = T::nc_type();
-        if var.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", expected),
-                actual: format!("{:?}", var.dtype),
-            });
-        }
+        let var = self.find_typed_variable::<T>(name)?;
         let resolved = resolve_classic_selection(
             var,
             selection,
@@ -298,14 +231,7 @@ impl ClassicFile {
         name: &str,
         selection: &crate::types::NcSliceInfo,
     ) -> Result<ArrayD<T>> {
-        let var = self.find_variable(name)?;
-        let expected = T::nc_type();
-        if var.dtype != expected {
-            return Err(Error::TypeMismatch {
-                expected: format!("{:?}", expected),
-                actual: format!("{:?}", var.dtype),
-            });
-        }
+        let var = self.find_typed_variable::<T>(name)?;
         let resolved = resolve_classic_selection(
             var,
             selection,
@@ -353,10 +279,6 @@ impl ClassicFile {
             NcType::UInt => slice_promoted!(u32),
             NcType::Int64 => slice_promoted!(i64),
             NcType::UInt64 => slice_promoted!(u64),
-            NcType::Char => Err(Error::TypeMismatch {
-                expected: "numeric type".to_string(),
-                actual: "Char".to_string(),
-            }),
             _ => Err(Error::TypeMismatch {
                 expected: "numeric type".to_string(),
                 actual: format!("{:?}", var.dtype),
@@ -371,6 +293,19 @@ impl ClassicFile {
             .ok_or_else(|| Error::VariableNotFound(name.to_string()))
     }
 
+    /// Internal: find a variable by name or path, checking it is stored as `T`.
+    fn find_typed_variable<T: NcReadType>(&self, name: &str) -> Result<&NcVariable> {
+        let var = self.find_variable(name)?;
+        let expected = T::nc_type();
+        if var.dtype != expected {
+            return Err(Error::TypeMismatch {
+                expected: format!("{:?}", expected),
+                actual: format!("{:?}", var.dtype),
+            });
+        }
+        Ok(var)
+    }
+
     /// Internal: read a variable with the correct record handling.
     fn read_typed_variable<T: NcReadType>(&self, var: &NcVariable) -> Result<ArrayD<T>> {
         if var.is_record_var {
@@ -382,7 +317,9 @@ impl ClassicFile {
     }
 }
 
-fn decode_char_variable_strings(var: &NcVariable, bytes: &[u8]) -> Result<Vec<String>> {
+/// Split the bytes of a char variable into strings: the last dimension is the string length,
+/// and the leading dimensions are flattened.
+pub(crate) fn decode_char_variable_strings(var: &NcVariable, bytes: &[u8]) -> Result<Vec<String>> {
     let shape = var.shape();
     if shape.len() <= 1 {
         return Ok(vec![decode_char_string(bytes)]);

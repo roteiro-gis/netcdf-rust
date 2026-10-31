@@ -244,18 +244,9 @@ pub fn read_non_record_variable<T: NcReadType>(
     let data_slice = &file_data[offset..end];
     let values = T::decode_bulk_be(data_slice, total_elements)?;
 
-    let shape: Vec<usize> = var
-        .shape()
-        .iter()
-        .map(|&s| crate::types::checked_usize_from_u64(s, "variable dimension"))
-        .collect::<Result<Vec<_>>>()?;
-    if shape.is_empty() {
-        // Scalar variable.
-        ArrayD::from_shape_vec(IxDyn(&[]), values)
-    } else {
-        ArrayD::from_shape_vec(IxDyn(&shape), values)
-    }
-    .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
+    let shape = checked_variable_shape(var)?;
+    ArrayD::from_shape_vec(IxDyn(&shape), values)
+        .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
 }
 
 /// Read the entire data for a non-record variable from range-backed storage.
@@ -427,31 +418,16 @@ pub fn read_record_variable<T: NcReadType>(
         ));
     }
 
-    let elem_size = T::element_size();
-    let base_offset =
-        crate::types::checked_usize_from_u64(var.data_offset, "record variable data offset")?;
-    let record_stride_usize = crate::types::checked_usize_from_u64(record_stride, "record stride")?;
-
     // Shape: the first dimension is the unlimited dimension, replaced by numrecs.
     let shape = checked_record_shape(var, numrecs)?;
-    let numrecs_usize = shape[0];
-
-    // Number of elements per record (product of all dims except the first).
     let elements_per_record = checked_record_elements_per_record(var)?;
-    let bytes_per_record = elements_per_record.checked_mul(elem_size).ok_or_else(|| {
+    let bytes_per_record = variable_data_bytes::<T>(var.name.as_str(), elements_per_record)?;
+    let total_elements = shape[0].checked_mul(elements_per_record).ok_or_else(|| {
         Error::InvalidData(format!(
-            "record variable '{}' bytes per record exceed platform usize",
+            "record variable '{}' element count exceeds platform usize",
             var.name
         ))
     })?;
-    let total_elements = numrecs_usize
-        .checked_mul(elements_per_record)
-        .ok_or_else(|| {
-            Error::InvalidData(format!(
-                "record variable '{}' element count exceeds platform usize",
-                var.name
-            ))
-        })?;
 
     // Validate that every record fits in the file before allocating, so a
     // crafted `numrecs` cannot force a huge up-front allocation.
@@ -463,38 +439,8 @@ pub fn read_record_variable<T: NcReadType>(
         file_data.len() as u64,
     )?;
 
-    let mut values = Vec::with_capacity(total_elements);
-
-    for rec in 0..numrecs_usize {
-        let rec_offset = base_offset
-            .checked_add(rec.checked_mul(record_stride_usize).ok_or_else(|| {
-                Error::InvalidData(format!(
-                    "record variable '{}' byte offset exceeds platform usize",
-                    var.name
-                ))
-            })?)
-            .ok_or_else(|| {
-                Error::InvalidData(format!(
-                    "record variable '{}' byte offset exceeds platform usize",
-                    var.name
-                ))
-            })?;
-        let rec_end = rec_offset.checked_add(bytes_per_record).ok_or_else(|| {
-            Error::InvalidData(format!(
-                "record variable '{}' record range exceeds platform usize",
-                var.name
-            ))
-        })?;
-        if rec_end > file_data.len() {
-            return Err(Error::InvalidData(format!(
-                "record {} for variable '{}' extends beyond file",
-                rec, var.name
-            )));
-        }
-        let rec_slice = &file_data[rec_offset..rec_end];
-        let rec_values = T::decode_bulk_be(rec_slice, elements_per_record)?;
-        values.extend(rec_values);
-    }
+    let mut values = vec![T::default(); total_elements];
+    read_record_variable_into(file_data, var, numrecs, record_stride, &mut values)?;
 
     ArrayD::from_shape_vec(IxDyn(&shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))
@@ -532,14 +478,9 @@ pub(crate) fn read_record_variable_from_storage<T: NcReadType>(
         bytes_per_record as u64,
         storage.len(),
     )?;
-    let mut values = Vec::with_capacity(total_elements);
 
-    for rec in 0..numrecs {
-        let rec_offset = record_byte_offset(var, rec, record_stride)?;
-        let rec_slice = storage.read_range(rec_offset, bytes_per_record)?;
-        let rec_values = T::decode_bulk_be(rec_slice.as_ref(), elements_per_record)?;
-        values.extend(rec_values);
-    }
+    let mut values = vec![T::default(); total_elements];
+    read_record_variable_into_from_storage(storage, var, numrecs, record_stride, &mut values)?;
 
     ArrayD::from_shape_vec(IxDyn(&shape), values)
         .map_err(|e| Error::InvalidData(format!("failed to create array: {}", e)))

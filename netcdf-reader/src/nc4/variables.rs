@@ -13,12 +13,8 @@ use hdf5_reader::group::Group;
 use crate::error::{Error, Result};
 use crate::types::{NcDimension, NcVariable};
 
-use super::attributes;
 use super::types::hdf5_to_nc_type;
-
-fn leaf_name(name: &str) -> &str {
-    name.rsplit('/').next().unwrap_or(name)
-}
+use super::{attributes, leaf_name};
 
 /// Extract variables from an HDF5 group.
 ///
@@ -240,16 +236,6 @@ fn resolve_coordinate_variable_dimensions(
 /// datasets. We parse the raw attribute data to extract these references.
 ///
 fn resolve_variable_dimensions(
-    ds: &hdf5_reader::Dataset,
-    group: &Group,
-    dimensions: &[NcDimension],
-    dim_addr_map: &HashMap<u64, NcDimension>,
-    metadata_mode: crate::NcMetadataMode,
-) -> Result<Vec<NcDimension>> {
-    resolve_variable_dimensions_with_mode(ds, group, dimensions, dim_addr_map, metadata_mode)
-}
-
-fn resolve_variable_dimensions_with_mode(
     ds: &hdf5_reader::Dataset,
     group: &Group,
     dimensions: &[NcDimension],
