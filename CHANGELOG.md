@@ -39,6 +39,9 @@
 
 ### Improved
 
+- reuse parsed dataset metadata and attribute storage across hard-link aliases,
+  so listing a group with many aliases does not reread its dense attribute
+  tables for every link (#135)
 - replace quadratic duplicate checks when listing dense HDF5 groups with
   a hash set, preserving aliases, external-file identities, and listing order (#132)
 - cache parsed global heap collections per file so repeated variable-length

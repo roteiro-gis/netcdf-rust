@@ -832,16 +832,36 @@ impl Group {
             return Ok(None);
         }
 
-        Dataset::from_parsed_header(
+        let context = &child.location.context;
+        let cached = context
+            .dataset_object_cache
+            .lock()
+            .get(&child.location.address)
+            .cloned();
+        if let Some(template) = cached {
+            let mut dataset = Dataset::from_template(context.clone(), template);
+            // An object's metadata is shared, while each link retains its own name.
+            dataset.name = child.name.clone();
+            return Ok(Some(dataset));
+        }
+
+        // Parse outside the cache lock: dense attributes perform storage
+        // reads, which can call back into user-provided storage backends.
+        let dataset = Dataset::from_parsed_header(
             crate::dataset::DatasetParseContext {
-                context: child.location.context.clone(),
+                context: context.clone(),
             },
             child.location.address,
             child.name.clone(),
             header.as_ref(),
         )
-        .map(Some)
-        .map_err(|err| err.with_context(self.child_context(child)))
+        .map_err(|err| err.with_context(self.child_context(child)))?;
+        context
+            .dataset_object_cache
+            .lock()
+            .entry(child.location.address)
+            .or_insert_with(|| dataset.template());
+        Ok(Some(dataset))
     }
 
     fn cached_child_header(
