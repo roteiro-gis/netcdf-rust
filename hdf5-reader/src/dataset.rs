@@ -1149,9 +1149,7 @@ impl Dataset {
                     strings.push(read_one_vlen_string_storage(
                         &raw,
                         offset,
-                        self.context.storage.as_ref(),
-                        self.offset_size(),
-                        self.length_size(),
+                        self.context.as_ref(),
                         *padding,
                         *encoding,
                     )?);
@@ -1189,13 +1187,7 @@ impl Dataset {
                 for i in 0..count {
                     let offset = i * ref_size;
                     let ref_bytes = &raw[offset..offset + ref_size];
-                    let value = resolve_vlen_bytes_storage(
-                        ref_bytes,
-                        self.context.storage.as_ref(),
-                        self.offset_size(),
-                        self.length_size(),
-                    )
-                    .unwrap_or_default();
+                    let value = resolve_vlen_bytes_storage(ref_bytes, self.context.as_ref())?;
                     strings.push(decode_string(&value, *padding, *encoding)?);
                 }
                 Ok(strings)
@@ -1531,12 +1523,7 @@ impl Dataset {
 
         let expected_bytes =
             checked_mul_usize(seq_len, base_element_size, "vlen sequence byte size")?;
-        let collection = crate::global_heap::GlobalHeapCollection::parse_at_storage(
-            self.context.storage.as_ref(),
-            heap_addr,
-            self.offset_size(),
-            self.length_size(),
-        )?;
+        let collection = self.context.global_heap(heap_addr)?;
         let object = collection.get_object(obj_index).ok_or_else(|| {
             Error::InvalidData(format!(
                 "dataset '{}' references missing vlen heap object {}",
@@ -3808,9 +3795,7 @@ fn attribute_from_message_storage(message: &AttributeMessage, context: &FileCont
             decoded_vlen_strings_storage(
                 &message.datatype,
                 &message.raw_data,
-                context.storage.as_ref(),
-                context.superblock.offset_size,
-                context.superblock.length_size,
+                context,
                 element_count,
             )
         });
@@ -3820,13 +3805,8 @@ fn attribute_from_message_storage(message: &AttributeMessage, context: &FileCont
             kind: VarLenKind::String,
             ..
         } if base.is_vlen_string_base() && matches!(message.dataspace.num_elements(), Ok(1)) => {
-            resolve_vlen_bytes_storage(
-                &message.raw_data,
-                context.storage.as_ref(),
-                context.superblock.offset_size,
-                context.superblock.length_size,
-            )
-            .unwrap_or_else(|| message.raw_data.clone())
+            resolve_vlen_bytes_storage(&message.raw_data, context)
+                .unwrap_or_else(|_| message.raw_data.clone())
         }
         _ => message.raw_data.clone(),
     };
@@ -4608,6 +4588,7 @@ mod tests {
             chunk_cache: Arc::new(ChunkCache::new(1024, 8)),
             header_cache: Arc::new(Mutex::new(HashMap::new())),
             old_groups: Default::default(),
+            global_heaps: Default::default(),
             dataset_path_cache: Arc::new(Mutex::new(HashMap::new())),
             filter_registry: Arc::new(FilterRegistry::default()),
             external_file_resolver: None,
