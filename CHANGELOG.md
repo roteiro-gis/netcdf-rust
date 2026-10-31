@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-10-31
+
 ### Breaking changes
 
 - replace `MaskParams::missing_value: Option<f64>` with
@@ -19,7 +21,7 @@
   these functions directly (#125)
 - add `NcAttrValue::UserDefined { dtype, values }` for decoded compound,
   opaque, and non-string vlen attributes. Update exhaustive matches on
-  `NcAttrValue`; values use the existing `NcValue` representation
+  `NcAttrValue`; values use the existing `NcValue` representation (#133)
 
 ### Added
 
@@ -57,13 +59,13 @@
   dimension scale is shorter (#120). Shorter variables expose this logical
   shape and pad unwritten records with fill values in full, sliced, buffer,
   string, user-defined, and parallel reads; child dimensions that shadow
-  ancestor names remain independent
+  ancestor names remain independent (#133)
 - honor CF `_Unsigned` in masked and unpacked reads, mask every value in a
   vector `missing_value` attribute, and compare masking attributes in the
   variable's stored type before unpacking (#122)
 - decode compound, opaque, and non-string vlen attributes on NetCDF-4
   groups and variables, including nested fields and heap-backed sequences.
-  Expose enum attributes as their underlying integer values (#123)
+  Expose enum attributes as their underlying integer values (#123, #133)
 - preserve every dimension of multi-dimensional coordinate variables using
   `_Netcdf4Coordinates`, instead of reporting them as one-dimensional (#125)
 - accept absolute and slash-normalized variable paths in classic NetCDF
