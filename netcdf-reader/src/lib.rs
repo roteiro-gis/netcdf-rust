@@ -55,7 +55,7 @@ pub use user_defined::{
 };
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 #[cfg(feature = "netcdf4")]
 use std::sync::Arc;
@@ -119,6 +119,28 @@ fn detect_format(data: &[u8]) -> Result<NcFormat> {
     Err(Error::InvalidMagic)
 }
 
+/// [`detect_format`], also finding HDF5 files behind a user block as netCDF-C does: the
+/// superblock can start at 512 bytes or any doubling of that. `read_magic_at` reads the 8 bytes
+/// at an offset of the `len`-byte file.
+fn detect_format_past_user_block(
+    prefix: &[u8],
+    len: u64,
+    mut read_magic_at: impl FnMut(u64) -> Result<[u8; 8]>,
+) -> Result<NcFormat> {
+    let format = detect_format(prefix);
+    if !matches!(format, Err(Error::InvalidMagic)) {
+        return format;
+    }
+
+    let offsets = std::iter::successors(Some(512u64), |offset| offset.checked_mul(2));
+    for offset in offsets.take_while(|&offset| offset.saturating_add(8) <= len) {
+        if read_magic_at(offset)? == HDF5_MAGIC {
+            return Ok(NcFormat::Nc4);
+        }
+    }
+    format
+}
+
 fn read_magic_prefix(reader: &mut impl Read) -> std::io::Result<([u8; 8], usize)> {
     let mut magic = [0u8; 8];
     let mut read_len = 0;
@@ -130,6 +152,12 @@ fn read_magic_prefix(reader: &mut impl Read) -> std::io::Result<([u8; 8], usize)
         read_len += n;
     }
     Ok((magic, read_len))
+}
+
+fn magic_bytes(bytes: &[u8]) -> [u8; 8] {
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&bytes[..8]);
+    magic
 }
 
 #[cfg(feature = "cf")]
@@ -193,7 +221,10 @@ impl NcFile {
     pub fn from_storage_with_options(storage: DynStorage, options: NcOpenOptions) -> Result<Self> {
         let magic_len = storage.len().min(HDF5_MAGIC.len() as u64) as usize;
         let magic = storage.read_range(0, magic_len)?;
-        let format = detect_format(magic.as_ref())?;
+        let format = detect_format_past_user_block(magic.as_ref(), storage.len(), |offset| {
+            let bytes = storage.read_range(offset, HDF5_MAGIC.len())?;
+            Ok(magic_bytes(bytes.as_ref()))
+        })?;
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
@@ -222,7 +253,9 @@ impl NcFile {
     ///
     /// NC4 options are applied when the payload is HDF5-backed.
     pub fn from_bytes_with_options(data: &[u8], options: NcOpenOptions) -> Result<Self> {
-        let format = detect_format(data)?;
+        let format = detect_format_past_user_block(data, data.len() as u64, |offset| {
+            Ok(magic_bytes(&data[offset as usize..]))
+        })?;
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
@@ -806,7 +839,13 @@ impl NcFile {
         let path = path.as_ref();
         let mut file = File::open(path)?;
         let (magic, n) = read_magic_prefix(&mut file)?;
-        let format = detect_format(&magic[..n])?;
+        let len = file.metadata()?.len();
+        let format = detect_format_past_user_block(&magic[..n], len, |offset| {
+            let mut bytes = [0u8; 8];
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut bytes)?;
+            Ok(bytes)
+        })?;
 
         match format {
             NcFormat::Classic | NcFormat::Offset64 | NcFormat::Cdf5 => {
@@ -906,6 +945,38 @@ mod tests {
     use std::sync::Arc;
     #[cfg(feature = "netcdf4")]
     use std::sync::Mutex;
+
+    fn detect_in_bytes(data: &[u8]) -> Result<NcFormat> {
+        let prefix = &data[..data.len().min(8)];
+        detect_format_past_user_block(prefix, data.len() as u64, |offset| {
+            Ok(magic_bytes(&data[offset as usize..]))
+        })
+    }
+
+    #[test]
+    fn detects_hdf5_past_a_user_block() {
+        for offset in [512, 1024, 4096] {
+            let mut data = vec![0u8; offset];
+            data.extend_from_slice(&HDF5_MAGIC);
+            assert_eq!(detect_in_bytes(&data).unwrap(), NcFormat::Nc4);
+        }
+    }
+
+    #[test]
+    fn user_block_search_only_checks_offsets_hdf5_allows() {
+        let mut data = vec![0u8; 700];
+        data.extend_from_slice(&HDF5_MAGIC);
+        assert!(matches!(detect_in_bytes(&data), Err(Error::InvalidMagic)));
+    }
+
+    #[test]
+    fn user_block_search_leaves_other_errors_alone() {
+        assert!(matches!(
+            detect_in_bytes(b"CDF\x09rest_of_file"),
+            Err(Error::UnsupportedVersion(9))
+        ));
+        assert!(matches!(detect_in_bytes(b"CD"), Err(Error::InvalidMagic)));
+    }
 
     #[test]
     fn detect_cdf1() {
