@@ -146,3 +146,27 @@ Selected median deltas from that run:
 - The large warm cached single-read results should be interpreted as
   machine-specific latency behavior, not as a general statement about internal
   parallelism.
+
+## Large-group metadata follow-up (2026-10-31)
+
+A separate macOS arm64 release-build run with Rust 1.92.0 measured the median
+of seven repetitions on files containing one fixed dimension of length two
+and the given number of unwritten `i16` variables. The operation was
+`NcFile::open` followed by the first `variables()` call. The baseline includes
+the nested v2 B-tree fix in #129; the final reader also includes the NetCDF-4
+compatibility changes in #133.
+
+| Variables | Before | After |
+| ---: | ---: | ---: |
+| 1,600 | 13.5 ms | 13.5 ms |
+| 3,200 | 33.0 ms | 27.8 ms |
+| 6,720 | 107.1 ms | 58.6 ms |
+| 20,000 | 945.7 ms | 182.6 ms |
+
+Opening alone took 0.07–0.15 ms. The cost was loading metadata: dense-link
+merging scanned all preceding children for every link. The hash set in #132
+removes that quadratic duplicate check while preserving aliases and file
+identity. HDF5 listing alone fell from 994 ms to 120 ms for 20,000 variables.
+With the compatibility changes included, a 2.98-fold increase in variables
+(6,720 to 20,000) produces a 3.12-fold increase in metadata time, compared
+with 8.83-fold before. These timings describe this fixture layout and machine.

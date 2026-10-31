@@ -38,7 +38,7 @@
 ### Improved
 
 - replace quadratic duplicate checks when listing dense HDF5 groups with
-  a hash set, preserving aliases, external-file identities, and listing order
+  a hash set, preserving aliases, external-file identities, and listing order (#132)
 - cache parsed global heap collections per file so repeated variable-length
   string and dimension-reference reads reuse them (#117)
 

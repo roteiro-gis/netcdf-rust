@@ -53,6 +53,17 @@ struct ChildEntry {
     creation_order: Option<u64>,
 }
 
+impl ChildEntry {
+    /// Links with the same identity are one child, whichever storage holds them.
+    fn identity(&self) -> (String, u64, *const FileContext) {
+        (
+            self.name.clone(),
+            self.location.address,
+            Arc::as_ptr(&self.location.context),
+        )
+    }
+}
+
 #[derive(Clone)]
 struct ObjectLocation {
     context: Arc<FileContext>,
@@ -461,18 +472,9 @@ impl Group {
             // Dense-link storage can coexist with compact links, so merge both.
             if let Some(ref li) = link_info {
                 if !Cursor::is_undefined_offset(li.fractal_heap_address, self.offset_size()) {
-                    // Include the file context: external links can resolve to the
-                    // same address in different files. Preserve aliases by name.
-                    let identity = |child: &ChildEntry| {
-                        (
-                            child.name.clone(),
-                            child.location.address,
-                            Arc::as_ptr(&child.location.context),
-                        )
-                    };
-                    let mut seen: HashSet<_> = children.iter().map(identity).collect();
+                    let mut seen: HashSet<_> = children.iter().map(ChildEntry::identity).collect();
                     for child in self.resolve_dense_links_storage(li, walk)? {
-                        if seen.insert(identity(&child)) {
+                        if seen.insert(child.identity()) {
                             children.push(child);
                         }
                     }

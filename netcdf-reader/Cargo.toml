@@ -46,7 +46,3 @@ optional = true
 [[bench]]
 name = "compare_georust"
 harness = false
-
-[[example]]
-name = "metadata_scaling"
-required-features = ["netcdf4"]

@@ -34,17 +34,7 @@ impl ClassicFile {
         let file = File::open(path)?;
         // SAFETY: read-only mapping; caller must not modify the file concurrently.
         let mmap = unsafe { Mmap::map(&file)? };
-        let is_streaming = header::has_streaming_numrecs(&mmap, format);
-        let header = header::parse_header(&mmap, format)?;
-        let storage = ClassicStorage::from_mmap(mmap);
-        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
-
-        Ok(ClassicFile {
-            format,
-            root_group,
-            storage,
-            numrecs,
-        })
+        Self::from_mmap(mmap, format)
     }
 
     /// Open a classic NetCDF file from in-memory bytes.
@@ -52,44 +42,31 @@ impl ClassicFile {
         let is_streaming = header::has_streaming_numrecs(bytes, format);
         let header = header::parse_header(bytes, format)?;
         let storage = ClassicStorage::from_bytes(bytes.to_vec());
-        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
-
-        Ok(ClassicFile {
-            format,
-            root_group,
-            storage,
-            numrecs,
-        })
+        Self::from_parsed(header, is_streaming, storage, format)
     }
 
     /// Open a classic NetCDF file from an owned byte vector without copying it.
     pub fn from_vec(bytes: Vec<u8>, format: NcFormat) -> Result<Self> {
         let is_streaming = header::has_streaming_numrecs(&bytes, format);
         let header = header::parse_header(&bytes, format)?;
-        let storage = ClassicStorage::from_bytes(bytes);
-        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
-
-        Ok(ClassicFile {
+        Self::from_parsed(
+            header,
+            is_streaming,
+            ClassicStorage::from_bytes(bytes),
             format,
-            root_group,
-            storage,
-            numrecs,
-        })
+        )
     }
 
     /// Open a classic NetCDF file from an existing memory map (avoids double mmap).
     pub fn from_mmap(mmap: Mmap, format: NcFormat) -> Result<Self> {
         let is_streaming = header::has_streaming_numrecs(&mmap, format);
         let header = header::parse_header(&mmap, format)?;
-        let storage = ClassicStorage::from_mmap(mmap);
-        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
-
-        Ok(ClassicFile {
+        Self::from_parsed(
+            header,
+            is_streaming,
+            ClassicStorage::from_mmap(mmap),
             format,
-            root_group,
-            storage,
-            numrecs,
-        })
+        )
     }
 
     /// Open a classic NetCDF file from a random-access storage backend.
@@ -100,8 +77,16 @@ impl ClassicFile {
     ) -> Result<Self> {
         let storage = ClassicStorage::from_range(storage);
         let (header, is_streaming) = parse_header_from_storage(&storage, format)?;
-        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
+        Self::from_parsed(header, is_streaming, storage, format)
+    }
 
+    fn from_parsed(
+        header: header::ClassicHeader,
+        is_streaming: bool,
+        storage: ClassicStorage,
+        format: NcFormat,
+    ) -> Result<Self> {
+        let (root_group, numrecs) = finalize_header(header, storage.len(), is_streaming)?;
         Ok(ClassicFile {
             format,
             root_group,
