@@ -27,14 +27,25 @@ fn leaf_name(name: &str) -> &str {
 ///
 /// `dim_addr_map` maps dimension-scale dataset addresses to their `NcDimension`,
 /// used to resolve `DIMENSION_LIST` object references.
+///
+/// `dim_id_map` maps `_Netcdf4Dimid` values to their `NcDimension`, used to resolve
+/// the `_Netcdf4Coordinates` of multi-dimensional coordinate variables.
 pub fn extract_variables(
     group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
+    dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcVariable>> {
     let datasets = group.datasets()?;
-    extract_variables_from_datasets(&datasets, group, dimensions, dim_addr_map, metadata_mode)
+    extract_variables_from_datasets(
+        &datasets,
+        group,
+        dimensions,
+        dim_addr_map,
+        dim_id_map,
+        metadata_mode,
+    )
 }
 
 pub fn extract_variables_from_datasets(
@@ -42,14 +53,20 @@ pub fn extract_variables_from_datasets(
     group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
+    dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Vec<NcVariable>> {
     let mut variables = Vec::new();
 
     for ds in datasets {
-        if let Some(variable) =
-            extract_variable(ds, group, dimensions, dim_addr_map, metadata_mode)?
-        {
+        if let Some(variable) = extract_variable(
+            ds,
+            group,
+            dimensions,
+            dim_addr_map,
+            dim_id_map,
+            metadata_mode,
+        )? {
             variables.push(variable);
         }
     }
@@ -62,6 +79,7 @@ pub fn extract_variable(
     group: &Group,
     dimensions: &[NcDimension],
     dim_addr_map: &HashMap<u64, NcDimension>,
+    dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<Option<NcVariable>> {
     let strict = metadata_mode == crate::NcMetadataMode::Strict;
@@ -95,7 +113,13 @@ pub fn extract_variable(
         Err(_) => return Ok(None),
     };
 
-    let var_dims = if is_dim_scale {
+    let var_dims = if is_dim_scale && ds.ndim() > 1 {
+        match resolve_multidimensional_coordinate_dimensions(ds, dim_id_map) {
+            Ok(dims) => dims,
+            Err(_) if !strict => resolve_variable_dimensions_by_size(ds, dimensions),
+            Err(err) => return Err(err),
+        }
+    } else if is_dim_scale {
         resolve_coordinate_variable_dimensions(ds, dim_addr_map, metadata_mode)?
     } else {
         resolve_variable_dimensions(ds, group, dimensions, dim_addr_map, metadata_mode)?
@@ -133,6 +157,53 @@ fn is_dimension_only_scale(ds: &hdf5_reader::Dataset, strict: bool) -> Result<bo
         },
         Err(_) => Ok(false),
     }
+}
+
+/// Resolve a coordinate variable with several dimensions, such as `time(time, strlen)`.
+///
+/// netCDF-C makes any variable named after its first dimension that dimension's scale, and a
+/// dimension scale can't carry `DIMENSION_LIST`, so it lists the ids of its dimensions in
+/// `_Netcdf4Coordinates` instead.
+fn resolve_multidimensional_coordinate_dimensions(
+    ds: &hdf5_reader::Dataset,
+    dim_id_map: &HashMap<i64, NcDimension>,
+) -> Result<Vec<NcDimension>> {
+    let ids = ds
+        .attribute("_Netcdf4Coordinates")
+        .and_then(|attr| attr.read_1d::<i32>())
+        .map_err(|err| {
+            Error::InvalidData(format!(
+                "coordinate variable '{}' has no usable _Netcdf4Coordinates: {err}",
+                ds.name()
+            ))
+        })?;
+    if ids.len() != ds.ndim() {
+        return Err(Error::InvalidData(format!(
+            "coordinate variable '{}' has {} dimensions but _Netcdf4Coordinates lists {}",
+            ds.name(),
+            ds.ndim(),
+            ids.len()
+        )));
+    }
+
+    let max_dims = ds.max_dims();
+    ids.iter()
+        .zip(ds.shape())
+        .enumerate()
+        .map(|(axis, (&id, &size))| {
+            let dim = dim_id_map.get(&i64::from(id)).ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "coordinate variable '{}' references unknown dimension id {id}",
+                    ds.name()
+                ))
+            })?;
+            Ok(NcDimension {
+                name: dim.name.clone(),
+                size,
+                is_unlimited: max_dims.and_then(|max_dims| max_dims.get(axis)) == Some(&u64::MAX),
+            })
+        })
+        .collect()
 }
 
 fn resolve_coordinate_variable_dimensions(

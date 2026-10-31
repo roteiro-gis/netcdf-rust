@@ -1241,6 +1241,22 @@ def generate_netcdf4_fixtures(base_dir):
         longest[:6] = np.arange(12, dtype="f4").reshape(6, 2)
         shortest[:2] = np.arange(4, dtype="f4").reshape(2, 2)
 
+    # ---- nc4_multidim_coordinates.nc ----
+    # Tests: variables named after their first dimension but with more dimensions. netCDF-C
+    # makes them dimension scales, whose dimensions are listed in _Netcdf4Coordinates.
+    path = os.path.join(nc4_dir, "nc4_multidim_coordinates.nc")
+    print(f"  Generating {path}")
+    with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
+        ds.createDimension("time", 2)
+        ds.createDimension("strlen", 4)
+        ds.createDimension("x", 3)
+        time = ds.createVariable("time", "S1", ("time", "strlen"))
+        time[:] = np.array([list("2020"), list("2021")], dtype="S1")
+        group = ds.createGroup("nested")
+        group.createDimension("y", 2)
+        y = group.createVariable("y", "f4", ("y", "x"))
+        y[:] = np.arange(6, dtype="f4").reshape(2, 3)
+
 
 SECTION_GENERATORS = {
     "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),
