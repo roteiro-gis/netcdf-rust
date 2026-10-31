@@ -364,12 +364,10 @@ impl ClassicFile {
         }
     }
 
-    /// Internal: find a variable by name.
+    /// Internal: find a variable by name or path, as [`crate::NcFile::variable`] does.
     fn find_variable(&self, name: &str) -> Result<&NcVariable> {
         self.root_group
-            .variables
-            .iter()
-            .find(|v| v.name == name)
+            .variable(name)
             .ok_or_else(|| Error::VariableNotFound(name.to_string()))
     }
 
