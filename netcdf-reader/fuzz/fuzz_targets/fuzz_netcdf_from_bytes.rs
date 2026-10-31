@@ -6,14 +6,22 @@
 //! variable with a small bounded slice must also stay panic-free.
 
 use libfuzzer_sys::fuzz_target;
-use netcdf_reader::{NcFile, NcSliceInfo, NcSliceInfoElem};
+use netcdf_reader::{NcFile, NcOpenOptions, NcSliceInfo, NcSliceInfoElem};
 
 /// Cap per-read work so a valid-but-huge declared shape cannot make the fuzzer
 /// time out on legitimate (non-buggy) large allocations.
 const MAX_SLICE_LEN: u64 = 64;
 
+/// A few bytes can declare a sparse NetCDF-4 variable of any size, whose read is a legitimate
+/// allocation. ASan aborts on a request that large rather than letting it fail, so refuse it first.
+const MAX_READ_BYTES: usize = 256 * 1024 * 1024;
+
 fuzz_target!(|data: &[u8]| {
-    let Ok(file) = NcFile::from_bytes(data) else {
+    let options = NcOpenOptions {
+        max_read_bytes: MAX_READ_BYTES,
+        ..Default::default()
+    };
+    let Ok(file) = NcFile::from_bytes_with_options(data, options) else {
         return;
     };
 
