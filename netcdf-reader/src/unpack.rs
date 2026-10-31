@@ -4,10 +4,69 @@
 //!   `actual_value = stored_value * scale_factor + add_offset`
 //!
 //! Defaults: `scale_factor = 1.0`, `add_offset = 0.0`.
+//!
+//! The `_Unsigned` attribute marks integers stored in the type of the opposite signedness,
+//! usually because the classic format had no unsigned types. [`SignParams`] recovers their
+//! values, which comes before masking and unpacking.
 
 use ndarray::ArrayD;
 
-use crate::types::NcVariable;
+use crate::types::{NcType, NcVariable};
+
+/// How to reinterpret integers whose `_Unsigned` attribute contradicts their stored type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SignParams {
+    modulus: f64,
+    to_unsigned: bool,
+}
+
+impl SignParams {
+    /// Returns `None` unless the variable is an integer whose `_Unsigned` attribute says its
+    /// signedness differs from the stored type.
+    pub fn from_variable(var: &NcVariable) -> Option<Self> {
+        let unsigned = var.attribute("_Unsigned")?.value.as_string()?;
+        let unsigned = if unsigned.eq_ignore_ascii_case("true") {
+            true
+        } else if unsigned.eq_ignore_ascii_case("false") {
+            false
+        } else {
+            return None;
+        };
+
+        let (bits, stored_unsigned) = match var.dtype {
+            NcType::Byte => (8, false),
+            NcType::Short => (16, false),
+            NcType::Int => (32, false),
+            NcType::Int64 => (64, false),
+            NcType::UByte => (8, true),
+            NcType::UShort => (16, true),
+            NcType::UInt => (32, true),
+            NcType::UInt64 => (64, true),
+            _ => return None,
+        };
+
+        (unsigned != stored_unsigned).then_some(SignParams {
+            modulus: 2f64.powi(bits),
+            to_unsigned: unsigned,
+        })
+    }
+
+    /// The value of one stored integer under the signedness `_Unsigned` declares.
+    pub fn reinterpret(&self, value: f64) -> f64 {
+        if self.to_unsigned && value < 0.0 {
+            value + self.modulus
+        } else if !self.to_unsigned && value >= self.modulus / 2.0 {
+            value - self.modulus
+        } else {
+            value
+        }
+    }
+
+    /// Reinterpret every value in `data`.
+    pub fn apply(&self, data: &mut ArrayD<f64>) {
+        data.mapv_inplace(|value| self.reinterpret(value));
+    }
+}
 
 /// Parameters for unpacking packed variable data.
 #[derive(Debug, Clone, Copy)]
@@ -51,16 +110,73 @@ mod tests {
     use ndarray::arr1;
 
     fn make_var(attrs: Vec<NcAttribute>) -> NcVariable {
+        typed_var(NcType::Int, attrs)
+    }
+
+    fn typed_var(dtype: NcType, attributes: Vec<NcAttribute>) -> NcVariable {
         NcVariable {
             name: "test".into(),
             dimensions: vec![],
-            dtype: NcType::Int,
-            attributes: attrs,
+            dtype,
+            attributes,
             data_offset: 0,
             _data_size: 0,
             is_record_var: false,
             record_size: 0,
         }
+    }
+
+    fn unsigned_attr(value: &str) -> Vec<NcAttribute> {
+        vec![NcAttribute {
+            name: "_Unsigned".into(),
+            value: NcAttrValue::Chars(value.into()),
+        }]
+    }
+
+    #[test]
+    fn unsigned_true_recovers_values_of_signed_storage() {
+        let cases = [
+            (NcType::Byte, -1.0, 255.0),
+            (NcType::Short, -32768.0, 32768.0),
+            (NcType::Int, -1.0, 4294967295.0),
+            (NcType::Short, 5.0, 5.0),
+        ];
+        for (dtype, stored, expected) in cases {
+            let var = typed_var(dtype, unsigned_attr("true"));
+            let params = SignParams::from_variable(&var).unwrap();
+            assert_eq!(params.reinterpret(stored), expected);
+        }
+    }
+
+    #[test]
+    fn unsigned_false_recovers_values_of_unsigned_storage() {
+        let var = typed_var(NcType::UShort, unsigned_attr("False"));
+        let params = SignParams::from_variable(&var).unwrap();
+        assert_eq!(params.reinterpret(65535.0), -1.0);
+        assert_eq!(params.reinterpret(32768.0), -32768.0);
+        assert_eq!(params.reinterpret(32767.0), 32767.0);
+    }
+
+    #[test]
+    fn sign_params_need_a_contradiction_with_the_stored_type() {
+        for (dtype, value) in [
+            (NcType::Short, "false"),
+            (NcType::UShort, "true"),
+            (NcType::Float, "true"),
+            (NcType::Short, "maybe"),
+        ] {
+            assert!(SignParams::from_variable(&typed_var(dtype, unsigned_attr(value))).is_none());
+        }
+        assert!(SignParams::from_variable(&typed_var(NcType::Short, vec![])).is_none());
+    }
+
+    #[test]
+    fn reinterpreting_leaves_nan_alone() {
+        let var = typed_var(NcType::Short, unsigned_attr("true"));
+        assert!(SignParams::from_variable(&var)
+            .unwrap()
+            .reinterpret(f64::NAN)
+            .is_nan());
     }
 
     #[test]

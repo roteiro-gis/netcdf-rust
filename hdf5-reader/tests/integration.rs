@@ -576,6 +576,17 @@ fn is_resource_limit(err: &hdf5_reader::error::Error) -> bool {
 }
 
 #[test]
+fn sparse_huge_dataset_read_respects_limit() {
+    let data = include_bytes!("../fuzz/corpus/fuzz_hdf5_open/sparse_huge_dataset.h5");
+    let options = hdf5_reader::OpenOptions::default().with_max_read_bytes(256 * 1024 * 1024);
+    let file = hdf5_reader::Hdf5File::from_bytes_with_options(data, options).unwrap();
+    let datasets = file.root_group().unwrap().datasets().unwrap();
+    assert_eq!(datasets.len(), 1);
+    let err = datasets[0].read_array::<f64>().unwrap_err();
+    assert!(is_resource_limit(&err), "{err}");
+}
+
+#[test]
 fn reads_larger_than_the_read_limit_are_refused() {
     // 10x20 float32 in 5x10 chunks: 800 bytes, 80 bytes per row.
     let path = skip_if_missing!("simple_chunked_deflate.h5");

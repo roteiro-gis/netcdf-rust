@@ -39,7 +39,7 @@ addition to round-tripping through the sibling reader crates.
 | Filters: lz4, nbit, scaleoffset | ✓ | — |
 | Compound / enum / opaque / array / vlen / string datatypes | ✓ | ✓ |
 | Dimension scales (`DIMENSION_LIST` + `REFERENCE_LIST`) | ✓ | ✓ |
-| CF conventions (unpack, mask, calendars) | ✓ | n/a |
+| CF conventions (unpack, mask, `_Unsigned`, calendars) | ✓ | n/a |
 | szip filter, virtual datasets | — | — |
 
 The minimum supported Rust version is 1.81. Reads are hardened against malformed
