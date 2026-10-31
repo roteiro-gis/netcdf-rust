@@ -45,6 +45,24 @@ pub fn extract_dimensions_from_datasets(
     datasets: &[hdf5_reader::Dataset],
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<(Vec<NcDimension>, HashMap<u64, NcDimension>)> {
+    let index = index_dimensions(datasets, metadata_mode)?;
+    Ok((index.dimensions, index.by_address))
+}
+
+/// The dimensions declared by a group's datasets, and how metadata can refer to them.
+pub(crate) struct DimensionIndex {
+    /// Sorted by `_Netcdf4Dimid` if available.
+    pub(crate) dimensions: Vec<NcDimension>,
+    /// By the object-header address of the dimension scale, for `DIMENSION_LIST`.
+    pub(crate) by_address: HashMap<u64, NcDimension>,
+    /// By `_Netcdf4Dimid`, for `_Netcdf4Coordinates`.
+    pub(crate) by_id: HashMap<i64, NcDimension>,
+}
+
+pub(crate) fn index_dimensions(
+    datasets: &[hdf5_reader::Dataset],
+    metadata_mode: crate::NcMetadataMode,
+) -> Result<DimensionIndex> {
     let mut dims: Vec<(Option<i64>, NcDimension, u64)> = Vec::new();
 
     for ds in datasets {
@@ -56,12 +74,18 @@ pub fn extract_dimensions_from_datasets(
     // Sort by _Netcdf4Dimid if available, otherwise preserve order
     dims.sort_by_key(|(id, _, _)| id.unwrap_or(i64::MAX));
 
-    let addr_map: HashMap<u64, NcDimension> =
-        dims.iter().map(|(_, d, addr)| (*addr, d.clone())).collect();
+    let by_address = dims.iter().map(|(_, d, addr)| (*addr, d.clone())).collect();
+    let by_id = dims
+        .iter()
+        .filter_map(|(id, d, _)| id.map(|id| (id, d.clone())))
+        .collect();
+    let dimensions = dims.into_iter().map(|(_, d, _)| d).collect();
 
-    let dim_list: Vec<NcDimension> = dims.into_iter().map(|(_, d, _)| d).collect();
-
-    Ok((dim_list, addr_map))
+    Ok(DimensionIndex {
+        dimensions,
+        by_address,
+        by_id,
+    })
 }
 
 fn extract_dimension_entry(

@@ -1460,3 +1460,33 @@ fn lossy_metadata_reports_the_same_unlimited_lengths() {
     assert_eq!(file.dimension("time").unwrap().size, 6);
     assert_eq!(file.variable("shortest").unwrap().shape(), [2, 2]);
 }
+
+#[cfg(feature = "netcdf4")]
+#[test]
+fn multidimensional_coordinate_variables_keep_every_dimension() {
+    let path = required_fixture("netcdf4", "nc4_multidim_coordinates.nc");
+    let file = netcdf_reader::NcFile::open(&path).unwrap();
+
+    let time = file.variable("time").unwrap();
+    let names: Vec<&str> = time.dimensions().iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["time", "strlen"]);
+    assert_eq!(time.shape(), [2, 4]);
+    assert_eq!(
+        file.read_variable_as_strings("time").unwrap(),
+        ["2020", "2021"]
+    );
+
+    // The second dimension is declared in the parent group.
+    let nested = file.variable("nested/y").unwrap();
+    let names: Vec<&str> = nested
+        .dimensions()
+        .iter()
+        .map(|d| d.name.as_str())
+        .collect();
+    assert_eq!(names, ["y", "x"]);
+    assert_eq!(nested.shape(), [2, 3]);
+    assert_eq!(
+        file.read_variable::<f32>("nested/y").unwrap().shape(),
+        [2, 3]
+    );
+}

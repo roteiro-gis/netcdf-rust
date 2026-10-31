@@ -118,13 +118,14 @@ pub fn build_group_at_path(
     let mut group = root;
     let mut inherited_dimensions = Vec::new();
     let mut inherited_dim_addr_map = HashMap::new();
+    let mut inherited_dim_id_map = HashMap::new();
 
     for component in normalized.split('/').filter(|part| !part.is_empty()) {
         let datasets = group.datasets()?;
-        let (local_dimensions, local_dim_addr_map) =
-            dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
-        inherited_dimensions = visible_dimensions(&local_dimensions, &inherited_dimensions);
-        inherited_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, &inherited_dim_addr_map);
+        let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
+        inherited_dimensions = visible_dimensions(&index.dimensions, &inherited_dimensions);
+        inherited_dim_addr_map = visible_dim_addr_map(index.by_address, &inherited_dim_addr_map);
+        inherited_dim_id_map.extend(index.by_id);
         group = group
             .group(component)
             .map_err(|_| Error::GroupNotFound(path.to_string()))?;
@@ -142,6 +143,7 @@ pub fn build_group_at_path(
             &group_name,
             &inherited_dimensions,
             &inherited_dim_addr_map,
+            &inherited_dim_id_map,
             metadata_mode,
         )
     } else {
@@ -150,6 +152,7 @@ pub fn build_group_at_path(
             &group_name,
             &inherited_dimensions,
             &inherited_dim_addr_map,
+            &inherited_dim_id_map,
             metadata_mode,
         )
     }
@@ -197,6 +200,7 @@ fn build_group_recursive(
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
+    inherited_dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<NcGroup> {
     let (hdf5_children, datasets) = hdf5_group.members()?;
@@ -204,10 +208,11 @@ fn build_group_recursive(
     // Extract dimensions declared locally in this group, then combine them
     // with dimensions inherited from ancestor groups for lookups and variable
     // reconstruction.
-    let (local_dimensions, local_dim_addr_map) =
-        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
-    let mut visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
-    let mut visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
+    let mut visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
+    let mut visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
+    let mut visible_dim_id_map = inherited_dim_id_map.clone();
+    visible_dim_id_map.extend(index.by_id);
     widen_unlimited_dimensions(
         &datasets,
         hdf5_group,
@@ -221,6 +226,7 @@ fn build_group_recursive(
         hdf5_group,
         &visible_dimensions,
         &visible_dim_addr_map,
+        &visible_dim_id_map,
         metadata_mode,
     )?;
 
@@ -236,6 +242,7 @@ fn build_group_recursive(
             &child_name,
             &visible_dimensions,
             &visible_dim_addr_map,
+            &visible_dim_id_map,
             metadata_mode,
         )?;
         child_groups.push(nc_child);
@@ -255,13 +262,15 @@ fn build_group_metadata(
     name: &str,
     inherited_dimensions: &[NcDimension],
     inherited_dim_addr_map: &HashMap<u64, NcDimension>,
+    inherited_dim_id_map: &HashMap<i64, NcDimension>,
     metadata_mode: crate::NcMetadataMode,
 ) -> Result<NcGroup> {
     let datasets = hdf5_group.datasets()?;
-    let (local_dimensions, local_dim_addr_map) =
-        dimensions::extract_dimensions_from_datasets(&datasets, metadata_mode)?;
-    let mut visible_dimensions = visible_dimensions(&local_dimensions, inherited_dimensions);
-    let mut visible_dim_addr_map = visible_dim_addr_map(local_dim_addr_map, inherited_dim_addr_map);
+    let index = dimensions::index_dimensions(&datasets, metadata_mode)?;
+    let mut visible_dimensions = visible_dimensions(&index.dimensions, inherited_dimensions);
+    let mut visible_dim_addr_map = visible_dim_addr_map(index.by_address, inherited_dim_addr_map);
+    let mut visible_dim_id_map = inherited_dim_id_map.clone();
+    visible_dim_id_map.extend(index.by_id);
     widen_unlimited_dimensions(
         &datasets,
         hdf5_group,
@@ -273,6 +282,7 @@ fn build_group_metadata(
         hdf5_group,
         &visible_dimensions,
         &visible_dim_addr_map,
+        &visible_dim_id_map,
         metadata_mode,
     )?;
     let attributes = attributes::extract_group_attributes(hdf5_group, metadata_mode)?;
