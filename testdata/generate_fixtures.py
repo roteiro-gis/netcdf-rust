@@ -1252,6 +1252,38 @@ def generate_netcdf4_fixtures(base_dir):
     assert created == ["y", "x", "time", "Hs", "Tp", "Dir", "Te"], created
     assert stored != created, "fixture no longer exercises storage != creation order"
 
+    # ---- nc4_szip.nc ----
+    # Tests: the SZIP filter with each element width, both coding methods, both byte orders, and
+    # scanlines that aren't a whole number of blocks (130 pixels in blocks of 8).
+    path = os.path.join(nc4_dir, "nc4_szip.nc")
+    print(f"  Generating {path}")
+    with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
+        ds.createDimension("x", 1024)
+        ds.createDimension("short", 130)
+        ds.createDimension("rows", 30)
+        ds.createDimension("cols", 40)
+        index = np.arange(1024, dtype="u8")
+        szip_variables = [
+            ("ramp", "i2", ("x",), "nn", 8, index.astype("i2"), "little"),
+            ("ramp_big_endian", "i2", ("x",), "nn", 8, index.astype("i2"), "big"),
+            ("scrambled", "u4", ("x",), "nn", 16, (index * 2654435761) & 0xFFFFFFFF, "little"),
+            ("sparse", "f8", ("x",), "ec", 32, (index % 97 == 0) * 1.5, "little"),
+            ("padded", "i1", ("short",), "nn", 8, np.arange(130) % 2 + 10, "little"),
+            ("grid", "f4", ("rows", "cols"), "nn", 8, np.arange(1200).reshape(30, 40) * 0.25, "little"),
+        ]
+        for name, dtype, dims, coding, block, values, endian in szip_variables:
+            variable = ds.createVariable(
+                name,
+                dtype,
+                dims,
+                compression="szip",
+                szip_coding=coding,
+                szip_pixels_per_block=block,
+                chunksizes=(10, 40) if len(dims) == 2 else None,
+                endian=endian,
+            )
+            variable[...] = values
+
     # ---- nc4_user_typed_attributes.nc ----
     # Tests: attributes of user-defined types. An enum variable's _FillValue has the enum type,
     # and NcAttrValue has no form for the compound attribute h5py adds alongside it.

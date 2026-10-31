@@ -5,6 +5,7 @@ pub mod lz4;
 pub mod nbit;
 pub mod scaleoffset;
 pub mod shuffle;
+pub mod szip;
 
 use std::collections::HashMap;
 
@@ -49,6 +50,7 @@ impl FilterRegistry {
         registry.register_builtin(FILTER_DEFLATE);
         registry.register_builtin(FILTER_SHUFFLE);
         registry.register_builtin(FILTER_FLETCHER32);
+        registry.register_builtin(FILTER_SZIP);
         registry.register_builtin(FILTER_NBIT);
         registry.register_builtin(FILTER_SCALEOFFSET);
         #[cfg(feature = "lz4")]
@@ -230,7 +232,7 @@ fn apply_builtin_filter_with_limit(
         FILTER_DEFLATE => deflate::decompress_with_limit(data, limit),
         FILTER_SHUFFLE => Ok(shuffle::unshuffle(data, element_size)),
         FILTER_FLETCHER32 => fletcher32::verify_and_strip(data),
-        FILTER_SZIP => Err(Error::UnsupportedFilter("szip".into())),
+        FILTER_SZIP => szip::decompress_with_limit(data, &filter.client_data, limit),
         FILTER_NBIT => nbit::decompress_with_limit(data, &filter.client_data, limit),
         FILTER_SCALEOFFSET => scaleoffset::decompress_with_limit(data, &filter.client_data, limit),
         #[cfg(feature = "lz4")]
