@@ -526,3 +526,22 @@ fn cdf5_only_data_reports_format_capacity_exceeded() {
     // The same schema succeeds as CDF-5.
     assert!(builder.to_vec(NcWriteOptions::cdf5()).is_ok());
 }
+
+#[test]
+fn classic_reads_accept_the_paths_metadata_lookups_do() {
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 2).unwrap();
+    let values = builder.add_variable::<f32>("values", &[x]).unwrap();
+    builder.write_variable(values, &[1.0_f32, 2.0]).unwrap();
+    let (_, bytes) = builder.to_vec(NcWriteOptions::default()).unwrap();
+    let file = NcFile::from_bytes(&bytes).unwrap();
+
+    assert!(file.variable("/values").is_ok());
+    let read = file.read_variable::<f32>("/values").unwrap();
+    assert_eq!(read.iter().copied().collect::<Vec<_>>(), [1.0, 2.0]);
+    assert!(file.read_variable_as_f64("/values").is_ok());
+    assert_eq!(file.iter_slices::<f32>("/values", 0).unwrap().count(), 2);
+
+    assert!(file.read_variable::<f32>("/missing").is_err());
+    assert!(file.read_variable::<f32>("group/values").is_err());
+}
