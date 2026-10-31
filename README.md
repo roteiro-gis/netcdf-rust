@@ -215,10 +215,10 @@ Minimum supported Rust version: 1.81.
 
 ```toml
 [dependencies]
-netcdf-reader = "0.10.1"           # CDF-1/2/5 + NetCDF-4 (default)
-netcdf-reader = { version = "0.10.1", default-features = false }  # CDF-1/2/5 only
-netcdf-writer = "0.10.1"           # Classic + NetCDF-4 writer (default)
-hdf5-writer = "0.10.1"             # Raw HDF5 writer
+netcdf-reader = "0.11.0"           # CDF-1/2/5 + NetCDF-4 (default)
+netcdf-reader = { version = "0.11.0", default-features = false }  # CDF-1/2/5 only
+netcdf-writer = "0.11.0"           # Classic + NetCDF-4 writer (default)
+hdf5-writer = "0.11.0"             # Raw HDF5 writer
 ```
 
 | Flag | Default | Description |

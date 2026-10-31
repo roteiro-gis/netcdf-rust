@@ -2,24 +2,27 @@
 
 ## Unreleased
 
+## 0.11.0 - 2026-10-30
+
 ### Added
 
 - open HDF5 files from shared or borrowed-owner bytes without copying them:
   `Hdf5File::from_shared_bytes` (`Arc<[u8]>`) and `Hdf5File::from_owner` (any
   `AsRef<[u8]> + Send + Sync` owner), `BytesStorage::from_shared` and
   `BytesStorage::from_owner`, and `StorageBuffer::from_shared` and
-  `StorageBuffer::from_shared_owner` for custom storage backends
+  `StorageBuffer::from_shared_owner` for custom storage backends (#114)
+- add `OpenOptions::max_read_bytes`, a limit on the decoded bytes one dataset
+  read may allocate, which is unlimited by default, and
+  `OpenOptions::max_object_header_bytes`, a limit on the bytes of one object
+  header across its continuation chunks, which defaults to 64 MiB. Both refuse
+  with `Error::ResourceLimit` before reading or allocating (#113)
 
 ### Improved
 
 - `Hdf5File::from_vec`, `BytesStorage::new` and `StorageBuffer::from_vec` no
   longer copy their bytes into a new `Arc<[u8]>`, so an in-memory open needs no
-  second buffer and each positional `FileStorage` read is copied once, not twice
-- add `OpenOptions::max_read_bytes`, a limit on the decoded bytes one dataset
-  read may allocate, which is unlimited by default, and
-  `OpenOptions::max_object_header_bytes`, a limit on the bytes of one object
-  header across its continuation chunks, which defaults to 64 MiB. Both refuse
-  with `Error::ResourceLimit` before reading or allocating
+  second buffer and each positional `FileStorage` read is copied once, not
+  twice (#114)
 
 ### Fixed
 
@@ -27,9 +30,9 @@
   time, bitfield, opaque, compound, and reference) and array datatypes with a
   zero-sized dimension, as libhdf5 does. A zero-width element made every
   byte-length check pass, so a large dataset read back as no bytes, or a typed
-  read aborted trying to allocate terabytes for its output
+  read aborted trying to allocate terabytes for its output (#113)
 - report numeric and reference datatypes wider than 255 bytes as unsupported
-  instead of truncating their size (256 bytes read as 0)
+  instead of truncating their size (256 bytes read as 0) (#113)
 
 ## 0.10.1 - 2026-10-28
 
