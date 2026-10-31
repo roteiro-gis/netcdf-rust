@@ -1226,6 +1226,21 @@ def generate_netcdf4_fixtures(base_dir):
     assert created == ["y", "x", "time", "Hs", "Tp", "Dir", "Te"], created
     assert stored != created, "fixture no longer exercises storage != creation order"
 
+    # ---- nc4_uneven_unlimited.nc ----
+    # Tests: variables that share an unlimited dimension but hold different record counts.
+    # Only the datasets written to are extended, so the coordinate is shorter than `longest`.
+    path = os.path.join(nc4_dir, "nc4_uneven_unlimited.nc")
+    print(f"  Generating {path}")
+    with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
+        ds.createDimension("time", None)
+        ds.createDimension("x", 2)
+        time = ds.createVariable("time", "f8", ("time",))
+        longest = ds.createVariable("longest", "f4", ("time", "x"))
+        shortest = ds.createVariable("shortest", "f4", ("time", "x"))
+        time[:3] = [0.0, 1.0, 2.0]
+        longest[:6] = np.arange(12, dtype="f4").reshape(6, 2)
+        shortest[:2] = np.arange(4, dtype="f4").reshape(2, 2)
+
 
 SECTION_GENERATORS = {
     "hdf5": ("HDF5 fixtures", "h5py", generate_hdf5_fixtures),
