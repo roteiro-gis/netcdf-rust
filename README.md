@@ -100,14 +100,13 @@ for slice in file.iter_slices::<f32>("temperature", 0)? {
     println!("  step shape: {:?}", data.shape());
 }
 
-// In-memory open with custom NC4 cache/filter options
+// In-memory open with custom NC4 cache and read limits
 let bytes = std::fs::read("era5.nc")?;
 let file = NcFile::from_bytes_with_options(&bytes, netcdf_reader::NcOpenOptions {
     chunk_cache_bytes: 8 * 1024 * 1024,
     chunk_cache_slots: 257,
-    metadata_mode: netcdf_reader::NcMetadataMode::Strict,
-    #[cfg(feature = "netcdf4")]
-    filter_registry: None,
+    max_read_bytes: 1024 * 1024 * 1024,
+    ..Default::default()
 })?;
 ```
 

@@ -530,6 +530,63 @@ fn parallel_created_nc4_fixture_reads_like_ordinary_nc4_file() {
 
 #[cfg(feature = "netcdf4")]
 #[test]
+fn hdf5_limits_apply_through_every_nc_open_path() {
+    use netcdf_reader::{BytesStorage, Error, NcFile, NcOpenOptions};
+    use std::sync::Arc;
+
+    fn is_resource_limit(err: Error) -> bool {
+        err.to_string().contains("limit")
+    }
+
+    let path = required_fixture("netcdf4", "nc4_compressed.nc");
+    let bytes = std::fs::read(&path).unwrap();
+    type Open = fn(&std::path::Path, &[u8], NcOpenOptions) -> Result<NcFile, Error>;
+    let opens: [(&str, Open); 3] = [
+        ("open", |path, _, options| {
+            NcFile::open_with_options(path, options)
+        }),
+        ("from_bytes", |_, bytes, options| {
+            NcFile::from_bytes_with_options(bytes, options)
+        }),
+        ("from_storage", |_, bytes, options| {
+            let storage = Arc::new(BytesStorage::new(bytes.to_vec()));
+            NcFile::from_storage_with_options(storage, options)
+        }),
+    ];
+
+    for (name, open) in opens {
+        let options = NcOpenOptions {
+            max_read_bytes: 8,
+            ..Default::default()
+        };
+        let file = open(&path, &bytes, options).unwrap();
+        let variable = file.variables().unwrap()[0].name().to_string();
+        let err = file.read_variable_as_f64(&variable).unwrap_err();
+        assert!(is_resource_limit(err), "{name}: read limit");
+
+        let options = NcOpenOptions {
+            max_chunk_bytes: 1,
+            ..Default::default()
+        };
+        let file = open(&path, &bytes, options).unwrap();
+        let err = file.read_variable_as_f64(&variable).unwrap_err();
+        assert!(is_resource_limit(err), "{name}: chunk limit");
+
+        let options = NcOpenOptions {
+            max_object_header_bytes: 1,
+            ..Default::default()
+        };
+        let refused = open(&path, &bytes, options)
+            .and_then(|file| file.variables().map(|variables| variables.len()));
+        assert!(
+            is_resource_limit(refused.unwrap_err()),
+            "{name}: object header limit"
+        );
+    }
+}
+
+#[cfg(feature = "netcdf4")]
+#[test]
 fn nc4_from_bytes_with_options() {
     let path = skip_if_missing!("netcdf4", "nc4_basic.nc");
     let bytes = std::fs::read(&path).unwrap();

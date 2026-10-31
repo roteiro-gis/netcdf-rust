@@ -791,6 +791,36 @@ pub struct NcOpenOptions {
     /// Resolver for HDF5 external links (NC4 only).
     #[cfg(feature = "netcdf4")]
     pub external_link_resolver: Option<Arc<dyn hdf5_reader::ExternalLinkResolver>>,
+    /// Largest decoded chunk a read may allocate (NC4 only). Default:
+    /// [`hdf5_reader::DEFAULT_MAX_CHUNK_BYTES`]; see
+    /// [`hdf5_reader::OpenOptions::max_chunk_bytes`].
+    #[cfg(feature = "netcdf4")]
+    pub max_chunk_bytes: usize,
+    /// Largest decoded selection one read call may allocate (NC4 only). Default: unlimited; see
+    /// [`hdf5_reader::OpenOptions::max_read_bytes`].
+    #[cfg(feature = "netcdf4")]
+    pub max_read_bytes: usize,
+    /// Largest object header the reader will parse (NC4 only). Default:
+    /// [`hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES`]; see
+    /// [`hdf5_reader::OpenOptions::max_object_header_bytes`].
+    #[cfg(feature = "netcdf4")]
+    pub max_object_header_bytes: usize,
+}
+
+#[cfg(feature = "netcdf4")]
+impl From<NcOpenOptions> for hdf5_reader::OpenOptions {
+    fn from(options: NcOpenOptions) -> Self {
+        hdf5_reader::OpenOptions {
+            chunk_cache_bytes: options.chunk_cache_bytes,
+            chunk_cache_slots: options.chunk_cache_slots,
+            filter_registry: options.filter_registry,
+            external_file_resolver: options.external_file_resolver,
+            external_link_resolver: options.external_link_resolver,
+            max_chunk_bytes: options.max_chunk_bytes,
+            max_read_bytes: options.max_read_bytes,
+            max_object_header_bytes: options.max_object_header_bytes,
+        }
+    }
 }
 
 impl Default for NcOpenOptions {
@@ -805,6 +835,12 @@ impl Default for NcOpenOptions {
             external_file_resolver: None,
             #[cfg(feature = "netcdf4")]
             external_link_resolver: None,
+            #[cfg(feature = "netcdf4")]
+            max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
+            #[cfg(feature = "netcdf4")]
+            max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
+            #[cfg(feature = "netcdf4")]
+            max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
         }
     }
 }
@@ -837,21 +873,7 @@ impl NcFile {
             NcFormat::Nc4 | NcFormat::Nc4Classic => {
                 #[cfg(feature = "netcdf4")]
                 {
-                    let metadata_mode = options.metadata_mode;
-                    let hdf5 = hdf5_reader::Hdf5File::open_with_options(
-                        path,
-                        hdf5_reader::OpenOptions {
-                            chunk_cache_bytes: options.chunk_cache_bytes,
-                            chunk_cache_slots: options.chunk_cache_slots,
-                            filter_registry: options.filter_registry,
-                            external_file_resolver: options.external_file_resolver,
-                            external_link_resolver: options.external_link_resolver,
-                            max_chunk_bytes: hdf5_reader::DEFAULT_MAX_CHUNK_BYTES,
-                            max_read_bytes: hdf5_reader::DEFAULT_MAX_READ_BYTES,
-                            max_object_header_bytes: hdf5_reader::DEFAULT_MAX_OBJECT_HEADER_BYTES,
-                        },
-                    )?;
-                    let nc4 = nc4::Nc4File::from_hdf5(hdf5, metadata_mode)?;
+                    let nc4 = nc4::Nc4File::open_with_options(path, options)?;
                     let actual_format = if nc4.is_classic_model() {
                         NcFormat::Nc4Classic
                     } else {
