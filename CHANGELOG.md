@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- read enum member names and values correctly in HDF5 datatype message
+  versions 1 and 2 by skipping each name's 8-byte padding (#136)
+
 ## 0.12.0 - 2026-10-31
 
 ### Breaking changes

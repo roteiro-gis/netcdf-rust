@@ -84,7 +84,7 @@ fn parse_datatype_description_at_depth(
         5 => parse_opaque(cursor, class_flags, size)?,
         6 => parse_compound(cursor, class_flags, size, version, depth)?,
         7 => parse_reference(class_flags, size)?,
-        8 => parse_enum(cursor, class_flags, size, depth)?,
+        8 => parse_enum(cursor, class_flags, size, version, depth)?,
         9 => parse_varlen(cursor, class_flags, size, depth)?,
         10 => parse_array(cursor, size, version, depth)?,
         c => return Err(Error::UnsupportedDatatypeClass(c)),
@@ -358,7 +358,13 @@ fn parse_reference(flags: u32, size: u32) -> Result<Datatype> {
 // Class 8: Enum
 // ---------------------------------------------------------------------------
 
-fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32, depth: usize) -> Result<Datatype> {
+fn parse_enum(
+    cursor: &mut Cursor<'_>,
+    flags: u32,
+    size: u32,
+    version: u8,
+    depth: usize,
+) -> Result<Datatype> {
     let n_members = (flags & 0xFFFF) as usize;
 
     // Base type
@@ -367,7 +373,15 @@ fn parse_enum(cursor: &mut Cursor<'_>, flags: u32, size: u32, depth: usize) -> R
     // Member names (null-terminated)
     let mut names = Vec::with_capacity(n_members);
     for _ in 0..n_members {
+        let name_start = cursor.position();
         names.push(cursor.read_null_terminated_string()?);
+        if version < 3 {
+            // V1/V2 names include padding to a multiple of eight bytes,
+            // relative to each name's start and including the null terminator.
+            // V3 names have no padding.
+            let used = (cursor.position() - name_start) as usize;
+            cursor.skip(used.next_multiple_of(8) - used)?;
+        }
     }
 
     // Member values (each is `size` bytes, matching the base type size)
@@ -934,6 +948,89 @@ mod tests {
                 assert_eq!(members[1].value, vec![0x01]);
             }
             other => panic!("expected Enum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_enum_member_names_across_versions() {
+        let expected = [
+            ("bare", 2),
+            ("urban", 3),
+            ("vegetation", 1),
+            ("water", 0),
+            ("abcdefg", 4),
+            ("abcdefgh", 5),
+        ];
+        for version in [1, 2, 3] {
+            // Descriptions may also be nested at an unaligned buffer position.
+            for prefix_len in [0, 3] {
+                let mut data = vec![0; prefix_len];
+                data.extend_from_slice(&class_word(8, version, 6).to_le_bytes());
+                data.extend_from_slice(&1u32.to_le_bytes());
+                data.extend_from_slice(&class_word(0, 1, 0).to_le_bytes());
+                data.extend_from_slice(&1u32.to_le_bytes());
+                data.extend_from_slice(&[0, 0, 8, 0]);
+
+                // The u8 base description is 12 bytes, so the first name is
+                // already off the buffer's 8-byte grid even without a prefix.
+                if version < 3 {
+                    data.extend_from_slice(b"bare\0\0\0\0urban\0\0\0");
+                    data.extend_from_slice(b"vegetation\0\0\0\0\0\0water\0\0\0");
+                    // Include names whose terminator ends on or crosses an
+                    // 8-byte boundary.
+                    data.extend_from_slice(b"abcdefg\0abcdefgh\0\0\0\0\0\0\0\0");
+                } else {
+                    data.extend_from_slice(b"bare\0urban\0vegetation\0water\0abcdefg\0abcdefgh\0");
+                }
+                data.extend_from_slice(&[2, 3, 1, 0, 4, 5]);
+                let description_end = data.len();
+                data.push(0xAB); // The next field must remain untouched.
+
+                let mut cursor = Cursor::new(&data);
+                cursor.skip(prefix_len).unwrap();
+                let (datatype, size) = parse_datatype_description(&mut cursor).unwrap();
+                assert_eq!(size, 1);
+                assert_eq!(
+                    datatype,
+                    Datatype::Enum {
+                        base: Box::new(Datatype::FixedPoint {
+                            size: 1,
+                            signed: false,
+                            byte_order: ByteOrder::LittleEndian,
+                        }),
+                        members: expected
+                            .iter()
+                            .map(|&(name, value)| EnumMember {
+                                name: name.into(),
+                                value: vec![value],
+                            })
+                            .collect(),
+                    },
+                    "version {version}, prefix {prefix_len}"
+                );
+                assert_eq!(cursor.position() as usize, description_end);
+                assert_eq!(cursor.read_u8().unwrap(), 0xAB);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_enum_rejects_truncated_name_padding() {
+        for version in [1, 2] {
+            let mut data = Vec::new();
+            data.extend_from_slice(&class_word(8, version, 1).to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&class_word(0, 1, 0).to_le_bytes());
+            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(&[0, 0, 8, 0]);
+            // A name and value fit, but the required name padding is missing.
+            data.extend_from_slice(b"x\0\x01");
+
+            let mut cursor = Cursor::new(&data);
+            assert!(matches!(
+                parse_datatype_description(&mut cursor),
+                Err(Error::UnexpectedEof { .. })
+            ));
         }
     }
 

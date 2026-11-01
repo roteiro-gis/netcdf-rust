@@ -377,6 +377,45 @@ fn compound_v1_with_float_members() {
 }
 
 #[test]
+fn enum_member_names_and_values() {
+    for name in ["enum_earliest.h5", "enum_latest.h5"] {
+        let path = skip_if_missing!(name);
+        let file = hdf5_reader::Hdf5File::open(&path).unwrap();
+        let ds = file.dataset("/classification").unwrap();
+        assert_eq!(ds.shape(), &[4, 4]);
+        match ds.dtype() {
+            hdf5_reader::Datatype::Enum { base, members } => {
+                assert_eq!(
+                    base.as_ref(),
+                    &hdf5_reader::Datatype::FixedPoint {
+                        size: 1,
+                        signed: false,
+                        byte_order: hdf5_reader::ByteOrder::LittleEndian,
+                    }
+                );
+                let members: Vec<_> = members
+                    .iter()
+                    .map(|member| (member.name.as_str(), member.value.as_slice()))
+                    .collect();
+                assert_eq!(
+                    members,
+                    [
+                        ("bare", &[2][..]),
+                        ("urban", &[3]),
+                        ("vegetation", &[1]),
+                        ("water", &[0])
+                    ],
+                    "{name}"
+                );
+            }
+            other => panic!("expected an enum datatype, got {other:?}"),
+        }
+        let data = ds.read_raw_bytes().unwrap();
+        assert_eq!(&*data, &[0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]);
+    }
+}
+
+#[test]
 fn old_fill_value_message_fills_unwritten_chunks() {
     let path = skip_if_missing!("fill_value_old_message.h5");
     let file = hdf5_reader::Hdf5File::open(&path).unwrap();
