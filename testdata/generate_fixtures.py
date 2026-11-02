@@ -92,6 +92,18 @@ def generate_hdf5_fixtures(base_dir):
         )
         f.create_dataset("records", data=data)
 
+    # ---- 6a. enum_earliest.h5 and enum_latest.h5 ----
+    # Tests: padded v1 enum names and unpadded v3+ enum names (issue #136).
+    kind = h5py.enum_dtype(
+        {"water": 0, "vegetation": 1, "bare": 2, "urban": 3}, basetype="u1"
+    )
+    for libver in ("earliest", "latest"):
+        path = os.path.join(hdf5_dir, f"enum_{libver}.h5")
+        print(f"  Generating {path}")
+        with h5py.File(path, "w", libver=libver) as f:
+            data = (np.arange(16, dtype="u1") % 4).reshape(4, 4)
+            f.create_dataset("classification", data=data, dtype=kind)
+
     # ---- 6b. sohm_shared_attrs.h5 ----
     # Tests: shared object header messages (SOHM). Identical attributes on a
     # group and a dataset are stored once in the shared-message table and
