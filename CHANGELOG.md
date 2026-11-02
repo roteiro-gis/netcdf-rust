@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.12.1 - 2026-11-01
+
 ### Fixed
 
 - read enum member names and values correctly in HDF5 datatype message
