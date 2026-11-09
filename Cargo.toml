@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 version = "0.12.1"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/roteiro-gis/netcdf-rust"
 homepage = "https://github.com/roteiro-gis/netcdf-rust"

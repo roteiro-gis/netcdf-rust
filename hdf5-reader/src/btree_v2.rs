@@ -472,7 +472,7 @@ fn record_matches_chunks(
     chunk_dims: &[u32],
     chunks: ChunkQuery<'_>,
 ) -> bool {
-    record_chunk_offsets(record).map_or(true, |offsets| chunks.matches(offsets, chunk_dims))
+    record_chunk_offsets(record).is_none_or(|offsets| chunks.matches(offsets, chunk_dims))
 }
 
 /// Whether child `child_index` of an internal node, whose records lie between
@@ -537,9 +537,9 @@ fn child_may_match_link_name_hash(
     };
 
     let lower_matches = child_index == 0
-        || link_name_hash(&records[child_index - 1]).map_or(true, |hash| target_hash >= hash);
+        || link_name_hash(&records[child_index - 1]).is_none_or(|hash| target_hash >= hash);
     let upper_matches = child_index == records.len()
-        || link_name_hash(&records[child_index]).map_or(true, |hash| target_hash <= hash);
+        || link_name_hash(&records[child_index]).is_none_or(|hash| target_hash <= hash);
     lower_matches && upper_matches
 }
 

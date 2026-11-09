@@ -47,21 +47,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup toolchain install 1.81.0 --profile minimal --no-self-update
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
       - uses: Swatinem/rust-cache@v2
 
       - name: Check workspace
-        run: rustup run 1.81.0 cargo check --workspace --all-features --locked
+        run: rustup run 1.85.0 cargo check --workspace --all-features --locked
 
       # Run the library unit tests on the MSRV toolchain for the crates that
       # have no dev-dependencies, so no transitive test-only crate can pull the
-      # MSRV floor above 1.81. Every crate's library is still compile-checked on
+      # MSRV floor above 1.85. Every crate's library is still compile-checked on
       # the MSRV toolchain by the workspace check above; only the unit-test
       # execution is limited here, because the reader/writer crates' test-only
       # dependencies (proptest, tempfile, criterion, the C libnetcdf) pull in
-      # transitive crates that require a newer Rust edition than 1.81.
+      # transitive crates that require a newer Rust edition than 1.85.
       - name: Test core crates on MSRV
-        run: rustup run 1.81.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
+        run: rustup run 1.85.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
 
   no-default-features:
     name: Test without default features

@@ -99,7 +99,7 @@ impl Attribute {
     /// Refuse a declared element count the stored payload cannot hold.
     fn check_payload(&self, n: usize, elem_size: usize) -> Result<()> {
         let needed = n.checked_mul(elem_size);
-        if n > 0 && (elem_size == 0 || needed.map_or(true, |bytes| bytes > self.raw_data.len())) {
+        if n > 0 && (elem_size == 0 || needed.is_none_or(|bytes| bytes > self.raw_data.len())) {
             return Err(Error::InvalidData(format!(
                 "attribute '{}' declares {n} elements of {elem_size} bytes but holds {} bytes",
                 self.name,

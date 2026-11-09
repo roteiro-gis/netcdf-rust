@@ -42,7 +42,7 @@ addition to round-tripping through the sibling reader crates.
 | CF conventions (unpack, mask, `_Unsigned`, calendars) | ✓ | n/a |
 | Virtual datasets | — | — |
 
-The minimum supported Rust version is 1.81. Reads are hardened against malformed
+The minimum supported Rust version is 1.85. Reads are hardened against malformed
 input: bounds-checked cursors, cycle detection in B-tree/heap/object-header
 traversals, recursion-depth limits, and file-size-bounded allocation. The reader
 crates are exercised by a corpus/property/fuzz suite in addition to
@@ -211,7 +211,7 @@ This project reads files. It does not provide distributed parallel I/O APIs.
 
 ## Feature flags
 
-Minimum supported Rust version: 1.81.
+Minimum supported Rust version: 1.85.
 
 ```toml
 [dependencies]
