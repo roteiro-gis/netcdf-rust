@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- update hdf5-reader's optional lz4_flex dependency to 0.14
+
 ## 0.12.1 - 2026-11-01
 
 ### Fixed
