@@ -329,7 +329,7 @@ fn collect_recursive(
         for (i, child_addr) in node.children.iter().enumerate() {
             let include = match &node.keys[i] {
                 BTreeV1Key::RawData { offsets, .. } => {
-                    context.chunk_bounds.map_or(true, |(first, last)| {
+                    context.chunk_bounds.is_none_or(|(first, last)| {
                         offsets
                             .iter()
                             .zip(context.chunk_dims.iter())
@@ -424,7 +424,7 @@ fn collect_recursive_storage(
         for (i, child_addr) in node.children.iter().enumerate() {
             let include = match &node.keys[i] {
                 BTreeV1Key::RawData { offsets, .. } => {
-                    context.chunk_bounds.map_or(true, |(first, last)| {
+                    context.chunk_bounds.is_none_or(|(first, last)| {
                         offsets
                             .iter()
                             .zip(context.chunk_dims.iter())

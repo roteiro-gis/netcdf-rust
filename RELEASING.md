@@ -40,8 +40,8 @@ cargo test -p netcdf-writer --no-default-features --locked
 # no dev-dependencies. The other crates are only compile-checked on MSRV
 # because their test-only dependencies (proptest, tempfile, criterion, the C
 # libnetcdf) pull in transitive crates that require a newer Rust edition.
-rustup run 1.81.0 cargo check --workspace --all-features --locked
-rustup run 1.81.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
+rustup run 1.85.0 cargo check --workspace --all-features --locked
+rustup run 1.85.0 cargo test -p hdf5-core -p netcdf-core --lib --locked
 # Writer output conformance against the reference C libraries (needs Python
 # with netCDF4 + h5py).
 scripts/validate-writer-output.sh

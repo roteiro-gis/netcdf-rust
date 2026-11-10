@@ -1009,10 +1009,7 @@ impl FractalHeap {
         // Validate FHIB signature
         let addr = usize::try_from(indirect_address)
             .map_err(|_| Error::OffsetOutOfBounds(indirect_address))?;
-        if addr
-            .checked_add(4)
-            .map_or(true, |end| end > file_data.len())
-        {
+        if addr.checked_add(4).is_none_or(|end| end > file_data.len()) {
             return Err(Error::OffsetOutOfBounds(indirect_address));
         }
         if file_data[addr..addr + 4] != FHIB_SIGNATURE {
@@ -1078,7 +1075,7 @@ impl FractalHeap {
                             .map_err(|_| Error::OffsetOutOfBounds(entry_pos))?;
                         if entry_pos_usize
                             .checked_add(entry_len)
-                            .map_or(true, |end| end > file_data.len())
+                            .is_none_or(|end| end > file_data.len())
                         {
                             return Err(Error::OffsetOutOfBounds(entry_pos));
                         }
@@ -1146,7 +1143,7 @@ impl FractalHeap {
                             .map_err(|_| Error::OffsetOutOfBounds(entry_pos))?;
                         if entry_pos_usize
                             .checked_add(usize::from(offset_size))
-                            .map_or(true, |end| end > file_data.len())
+                            .is_none_or(|end| end > file_data.len())
                         {
                             return Err(Error::OffsetOutOfBounds(entry_pos));
                         }

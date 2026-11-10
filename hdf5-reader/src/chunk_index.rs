@@ -38,7 +38,7 @@ impl ChunkQuery<'_> {
         chunk_overlaps_bounds(offsets, chunk_dims, self.bounds)
             && self
                 .set
-                .map_or(true, |set| set.contains_offsets(offsets, chunk_dims))
+                .is_none_or(|set| set.contains_offsets(offsets, chunk_dims))
     }
 
     /// Whether a B-tree child whose keys lie between `low` and `high` may
@@ -50,7 +50,7 @@ impl ChunkQuery<'_> {
         chunk_dims: &[u32],
     ) -> bool {
         self.set
-            .map_or(true, |set| set.may_contain_between(low, high, chunk_dims))
+            .is_none_or(|set| set.may_contain_between(low, high, chunk_dims))
     }
 }
 
