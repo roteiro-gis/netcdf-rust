@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.13.0 - 2026-11-11
+
 ### Changed
 
 - update hdf5-reader's lru dependency to 0.19 to fix RUSTSEC-2026-0253
@@ -9,7 +11,6 @@
   in lru 0.18.2 and later)
 - raise the minimum supported Rust version from 1.81 to 1.85 for every crate
   in the workspace to match the current default/all-features dependency graph
-
 - update hdf5-reader's optional lz4_flex dependency to 0.14
 
 ## 0.12.1 - 2026-11-01
