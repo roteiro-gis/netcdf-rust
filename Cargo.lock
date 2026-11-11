@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-core"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "thiserror",
 ]
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-reader"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "flate2",
  "hdf5-core",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-writer"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "flate2",
  "hdf5-core",
@@ -686,14 +686,14 @@ dependencies = [
 
 [[package]]
 name = "netcdf-core"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "netcdf-reader"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "netcdf-writer"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "hdf5-writer",
  "netcdf-core",
