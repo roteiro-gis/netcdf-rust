@@ -2727,7 +2727,16 @@ fn encode_hard_link_message(name: &str, address: u64) -> Result<Vec<u8>> {
 fn encode_attribute_message(attribute: &PlannedAttribute, heap: HeapLayout<'_>) -> Result<Vec<u8>> {
     let name_bytes = attribute.name.as_bytes();
     let datatype = encode_datatype_message(&attribute.datatype)?;
-    let dataspace = encode_dataspace_message(&attribute.shape, None)?;
+    // An empty fixed string uses an H5S_NULL dataspace, as netCDF-C does for
+    // zero-length NC_CHAR attributes.
+    let dataspace = if attribute.shape == [0]
+        && attribute.raw_data(heap).is_empty()
+        && matches!(attribute.datatype, Datatype::String { .. })
+    {
+        vec![2, 0, 0, 2]
+    } else {
+        encode_dataspace_message(&attribute.shape, None)?
+    };
     let raw_data = attribute.raw_data(heap);
     if name_bytes.len() + 1 > u16::MAX as usize
         || datatype.len() > u16::MAX as usize
