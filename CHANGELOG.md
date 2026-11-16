@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- write NetCDF-4 NC_CHAR attributes without an extra trailing NUL byte, and
+  represent empty text with a null dataspace (#141)
+
 ## 0.13.0 - 2026-11-11
 
 ### Changed

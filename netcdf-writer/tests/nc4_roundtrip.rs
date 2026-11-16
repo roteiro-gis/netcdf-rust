@@ -1,10 +1,63 @@
 #![cfg(feature = "netcdf4")]
 
+use hdf5_reader::Hdf5File;
 use netcdf_reader::{NcFile, NcFormat};
 use netcdf_writer::{
     NcAttrValue, NcCompoundField, NcEnumMember, NcFileBuilder, NcIntegerValue, NcSliceInfo,
     NcSliceInfoElem, NcType, NcWriteFormat, NcWriteOptions, NC_FILL_INT,
 };
+
+#[test]
+fn nc4_char_attributes_have_exact_bytes_and_empty_text_has_null_space() {
+    let mut builder = NcFileBuilder::new();
+    let x = builder.add_dimension("x", 1).unwrap();
+    let variable = builder.add_variable::<i32>("data", &[x]).unwrap();
+    builder.write_variable(variable, &[1]).unwrap();
+    builder
+        .add_attribute("version", NcAttrValue::Chars("1.0.0".into()))
+        .unwrap();
+    builder
+        .add_attribute("empty", NcAttrValue::Chars(String::new()))
+        .unwrap();
+    builder
+        .add_variable_attribute(variable, "units", NcAttrValue::Chars("µm".into()))
+        .unwrap();
+    let (_, bytes) = builder
+        .to_vec(NcWriteOptions {
+            format: NcWriteFormat::Nc4,
+        })
+        .unwrap();
+
+    let h5 = Hdf5File::from_bytes(&bytes).unwrap();
+    let root = h5.root_group().unwrap();
+    let attrs = root.raw_attributes().unwrap();
+    let version = attrs
+        .iter()
+        .find(|attr| attr.name() == "version")
+        .unwrap()
+        .message();
+    assert_eq!(version.raw_data, b"1.0.0");
+    let empty = attrs
+        .iter()
+        .find(|attr| attr.name() == "empty")
+        .unwrap()
+        .message();
+    assert!(empty.raw_data.is_empty());
+    assert_eq!(
+        empty.dataspace.dataspace_type,
+        hdf5_reader::messages::dataspace::DataspaceType::Null
+    );
+    let units = h5.dataset("data").unwrap().raw_attributes().unwrap();
+    let units = units
+        .iter()
+        .find(|attr| attr.name() == "units")
+        .unwrap()
+        .message();
+    assert_eq!(units.raw_data, "µm".as_bytes());
+
+    let nc = NcFile::from_bytes(&bytes).unwrap();
+    assert_eq!(nc.dimension("x").unwrap().size, 1);
+}
 
 #[test]
 fn writes_nc4_coordinate_variable() {

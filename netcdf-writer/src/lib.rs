@@ -2545,7 +2545,30 @@ fn convert_classic_be_data_to_hdf5_le(dtype: &NcType, data: &[u8]) -> Result<Vec
 #[cfg(feature = "netcdf4")]
 fn nc_attr_to_hdf5(attribute: &NcAttribute) -> Result<H5AttributeBuilder> {
     match &attribute.value {
-        NcAttrValue::Chars(value) => Ok(H5AttributeBuilder::fixed_string(&attribute.name, value)),
+        NcAttrValue::Chars(value) => {
+            let bytes = value.as_bytes();
+            let size = u32::try_from(bytes.len().max(1)).map_err(|_| {
+                Error::InvalidDefinition(format!("attribute '{}' text is too long", attribute.name))
+            })?;
+            Ok(H5AttributeBuilder::new(
+                &attribute.name,
+                H5Datatype::String {
+                    size: H5StringSize::Fixed(size),
+                    encoding: if value.is_ascii() {
+                        H5StringEncoding::Ascii
+                    } else {
+                        H5StringEncoding::Utf8
+                    },
+                    padding: H5StringPadding::NullPad,
+                },
+                if bytes.is_empty() {
+                    vec![0]
+                } else {
+                    Vec::new()
+                },
+                bytes,
+            ))
+        }
         NcAttrValue::Bytes(values) => hdf5_numeric_attr(&attribute.name, NcType::Byte, values),
         NcAttrValue::UBytes(values) => hdf5_numeric_attr(&attribute.name, NcType::UByte, values),
         NcAttrValue::Shorts(values) => hdf5_numeric_attr(&attribute.name, NcType::Short, values),

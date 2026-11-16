@@ -738,6 +738,7 @@ dependencies = [
 name = "netcdf-writer"
 version = "0.13.0"
 dependencies = [
+ "hdf5-reader",
  "hdf5-writer",
  "netcdf-core",
  "netcdf-reader",
